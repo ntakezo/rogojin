@@ -100,11 +100,12 @@ type recordedSave struct {
 // states it returns an error for, simulating a store outage at a specific
 // checkpoint.
 type fakeStore struct {
-	mu          sync.Mutex
-	saves       []recordedSave
-	terminal    workflows.Status
-	terminalSet bool
-	saveErr     func(state workflows.State) error
+	mu             sync.Mutex
+	saves          []recordedSave
+	terminal       workflows.Status
+	terminalSet    bool
+	terminalOutput []byte
+	saveErr        func(state workflows.State) error
 }
 
 func (f *fakeStore) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
@@ -117,11 +118,13 @@ func (f *fakeStore) SaveCheckpoint(ctx context.Context, id, status, state string
 	return nil
 }
 
-func (f *fakeStore) MarkTerminal(ctx context.Context, id, outcome string) error {
+func (f *fakeStore) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.terminal = workflows.Status(outcome)
 	f.terminalSet = true
+	// append to a nil slice preserves nil, so "no output" stays distinguishable.
+	f.terminalOutput = append([]byte(nil), output...)
 	return nil
 }
 
@@ -616,5 +619,129 @@ func TestCheckpointFailureAbortsRun(t *testing.T) {
 	}
 	if !reflect.DeepEqual(resumedLog, []workflows.State{s1, s2, s3}) {
 		t.Fatalf("resumed states = %v, want [s1 s2 s3]", resumedLog)
+	}
+}
+
+// outputWorkflow builds single-state Outputter instances so output tests can
+// assert what the engine harvests. failRun makes the lone state error before
+// completing; outErr makes Output itself fail.
+type outputWorkflow struct {
+	output  []byte
+	outErr  error
+	failRun bool
+}
+
+func (w outputWorkflow) ID() string                    { return "output" }
+func (w outputWorkflow) ValidateInput(input any) error { return nil }
+func (w outputWorkflow) NewInstance(input any, deps workflows.Deps) (workflows.Instance, error) {
+	return &outputCtx{w: w}, nil
+}
+
+type outputCtx struct {
+	w outputWorkflow
+}
+
+func (c *outputCtx) Graph() workflows.Graph {
+	return workflows.NewGraph(s1, workflows.States{
+		s1: func(ctx context.Context) (*workflows.State, error) {
+			if c.w.failRun {
+				return nil, errors.New("run failed")
+			}
+			return nil, nil
+		},
+	})
+}
+
+func (c *outputCtx) Output() ([]byte, error) { return c.w.output, c.w.outErr }
+
+// TestHarvestsOutputOnCleanCompletion verifies the engine captures an Outputter
+// instance's result on a clean run, exposes it, and persists it with the
+// terminal stamp — so a finished task can hand its output back to the caller and
+// a recovered one can read it durably.
+func TestHarvestsOutputOnCleanCompletion(t *testing.T) {
+	store := &fakeStore{}
+	want := []byte(`{"orderID":"order-1"}`)
+	e := newEngine(outputWorkflow{output: want}, workflows.Deps{TaskID: "task-1"}, store)
+
+	if err := e.Execute(context.Background(), nil); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if string(e.Output()) != string(want) {
+		t.Fatalf("engine output = %q, want %q", e.Output(), want)
+	}
+	if string(store.terminalOutput) != string(want) {
+		t.Fatalf("persisted output = %q, want %q", store.terminalOutput, want)
+	}
+	if store.terminal != workflows.StatusDone {
+		t.Fatalf("terminal = %q, want done", store.terminal)
+	}
+}
+
+// TestNoOutputCapabilityYieldsNil verifies a workflow that does not implement
+// Outputter completes cleanly with no output, so output stays strictly opt-in
+// and the terminal stamp persists nil rather than fabricating a result.
+func TestNoOutputCapabilityYieldsNil(t *testing.T) {
+	var log []workflows.State
+	store := &fakeStore{}
+	e := newEngine(&testWorkflow{log: &log}, workflows.Deps{TaskID: "task-1"}, store)
+
+	if err := e.Execute(context.Background(), nil); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if e.Output() != nil {
+		t.Fatalf("output = %q, want nil for a non-Outputter workflow", e.Output())
+	}
+	if store.terminalOutput != nil {
+		t.Fatalf("persisted output = %q, want nil", store.terminalOutput)
+	}
+}
+
+// TestErroredRunHarvestsNoOutput verifies a run that errors before completing
+// does not harvest output even though the instance can produce one, because
+// output belongs only to clean completion.
+func TestErroredRunHarvestsNoOutput(t *testing.T) {
+	store := &fakeStore{}
+	e := newEngine(outputWorkflow{output: []byte("x"), failRun: true}, workflows.Deps{TaskID: "task-1"}, store)
+
+	if err := e.Execute(context.Background(), nil); err == nil {
+		t.Fatal("Execute: want run error, got nil")
+	}
+	if e.Output() != nil {
+		t.Fatalf("output = %q, want nil on error", e.Output())
+	}
+	if store.terminalOutput != nil {
+		t.Fatalf("persisted output = %q, want nil on error", store.terminalOutput)
+	}
+}
+
+// TestOutputErrorAbortsRun verifies an Output failure aborts the run with the
+// error rather than reporting a clean completion, because a result that cannot
+// be produced is a failure, not an empty success (Rule 12 — fail loud).
+func TestOutputErrorAbortsRun(t *testing.T) {
+	store := &fakeStore{}
+	e := newEngine(outputWorkflow{outErr: errors.New("marshal failed")}, workflows.Deps{TaskID: "task-1"}, store)
+
+	err := e.Execute(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "marshal failed") {
+		t.Fatalf("Execute err = %v, want output failure surfaced", err)
+	}
+}
+
+// TestStartReturnsWorkflowOutput verifies Start hands the caller the workflow's
+// output on clean completion — the whole point of the output capability, exposed
+// at the task boundary the consumer actually calls.
+func TestStartReturnsWorkflowOutput(t *testing.T) {
+	want := []byte(`{"orderID":"order-1"}`)
+	task, err := createTask(outputWorkflow{output: want}, nil, nil, &fakeStore{})
+	if err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+
+	got, err := task.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("Start output = %q, want %q", got, want)
 	}
 }

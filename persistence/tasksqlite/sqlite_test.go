@@ -2,6 +2,7 @@ package tasksqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -106,7 +107,7 @@ func TestMarkTerminalKeepsStateAndSnapshot(t *testing.T) {
 	if err := repo.SaveCheckpoint(ctx, "t1", "running", "submit", []byte("snap")); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
-	if err := repo.MarkTerminal(ctx, "t1", "done"); err != nil {
+	if err := repo.MarkTerminal(ctx, "t1", "done", nil); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 
@@ -116,6 +117,30 @@ func TestMarkTerminalKeepsStateAndSnapshot(t *testing.T) {
 	}
 	if rec.State != "submit" || string(rec.Snapshot) != "snap" {
 		t.Fatalf("terminal wiped state/snapshot: got %+v", rec)
+	}
+}
+
+// TestMarkTerminalPersistsOutput verifies the workflow's output is stored with the
+// terminal stamp and survives recovery, because delivering output from Start is
+// only half the contract — a finished task's result must also be durably readable.
+func TestMarkTerminalPersistsOutput(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	out := []byte(`{"orderID":"order-1"}`)
+	if err := repo.MarkTerminal(ctx, "t1", "done", out); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+
+	rec, err := repo.RecoverTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if string(rec.Output) != string(out) {
+		t.Fatalf("output = %q, want %q", rec.Output, out)
 	}
 }
 
@@ -142,7 +167,7 @@ func TestRecoverAll(t *testing.T) {
 	if err := repo.CreateTask(ctx, "t2", "wf2"); err != nil {
 		t.Fatalf("CreateTask t2: %v", err)
 	}
-	if err := repo.MarkTerminal(ctx, "t2", "done"); err != nil {
+	if err := repo.MarkTerminal(ctx, "t2", "done", nil); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 
@@ -223,5 +248,64 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	}
 	if rec.Status != "suspended" || rec.State != "wait" || string(rec.Snapshot) != "snap" {
 		t.Fatalf("checkpoint did not survive reopen: %+v", rec)
+	}
+}
+
+// TestMigratesLegacyDatabaseAddingOutput verifies opening a pre-output database
+// (the original tasks schema, with no output column and no recorded version)
+// migrates it in place: the output column is added and existing task rows survive
+// untouched, because a version upgrade must never drop a consumer's durable tasks.
+func TestMigratesLegacyDatabaseAddingOutput(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "legacy.db")
+
+	// Hand-build the old schema (no output column, user_version stays 0) with a row,
+	// exactly as a database created before the output migration would look.
+	raw, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE tasks (
+		id          TEXT PRIMARY KEY,
+		workflow_id TEXT NOT NULL,
+		state       TEXT NOT NULL DEFAULT '',
+		status      TEXT NOT NULL DEFAULT '',
+		snapshot    BLOB
+	)`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO tasks (id, workflow_id, state, status, snapshot)
+		VALUES ('t1', 'wf1', 'submit', 'running', 'snap')`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	raw.Close()
+
+	// Opening through NewSQLite must migrate the existing file in place.
+	repo, err := NewSQLite(dsn)
+	if err != nil {
+		t.Fatalf("NewSQLite on legacy db: %v", err)
+	}
+	t.Cleanup(func() { repo.Close() })
+
+	// The legacy row survives the migration, now reporting a nil output.
+	rec, err := repo.RecoverTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if rec.WorkflowID != "wf1" || rec.State != "submit" || rec.Status != "running" || string(rec.Snapshot) != "snap" {
+		t.Fatalf("legacy row not preserved across migration: %+v", rec)
+	}
+	if rec.Output != nil {
+		t.Fatalf("legacy row output = %q, want nil", rec.Output)
+	}
+
+	// The newly added output column is writable end to end.
+	out := []byte(`{"orderID":"order-1"}`)
+	if err := repo.MarkTerminal(ctx, "t1", "done", out); err != nil {
+		t.Fatalf("MarkTerminal after migration: %v", err)
+	}
+	rec, _ = repo.RecoverTask(ctx, "t1")
+	if string(rec.Output) != string(out) {
+		t.Fatalf("output after migration = %q, want %q", rec.Output, out)
 	}
 }

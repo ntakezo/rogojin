@@ -42,6 +42,7 @@ func (c *Context) SubmitCheckout(ctx context.Context) (*workflows.State, error) 
 	if body.Status != "confirmed" {
 		return nil, fmt.Errorf("checkout: order %q not confirmed: status %q", body.OrderID, body.Status)
 	}
+	c.running.order = body
 
 	return nil, nil
 }

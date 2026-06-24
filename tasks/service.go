@@ -20,6 +20,9 @@ type Record struct {
 	State      string
 	Snapshot   []byte
 	Status     string
+	// Output is the workflow's result, persisted when the run completes cleanly;
+	// nil for tasks that have not finished or produce no output.
+	Output []byte
 }
 
 // Repository is the persistence port the consumer implements: a dumb store of
@@ -28,7 +31,7 @@ type Record struct {
 type Repository interface {
 	CreateTask(ctx context.Context, id string, workflowID string) error
 	SaveCheckpoint(ctx context.Context, id string, status string, state string, snapshot []byte) error
-	MarkTerminal(ctx context.Context, id string, outcome string) error
+	MarkTerminal(ctx context.Context, id string, outcome string, output []byte) error
 	RecoverTask(ctx context.Context, id string) (Record, error)
 	RecoverAll(ctx context.Context) ([]Record, error)
 	DeleteTask(ctx context.Context, id string) error

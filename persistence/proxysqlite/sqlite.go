@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/ntakezo/rogojin/persistence/internal/sqlitemigrate"
 	"github.com/ntakezo/rogojin/proxies"
 )
 
@@ -33,19 +34,26 @@ func NewSQLite(dsn string) (*SQLite, error) {
 	return &SQLite{db: db}, nil
 }
 
-// ensureSchema creates the proxies table if it does not already exist.
+// ensureSchema brings the database up to the latest schema version, applying any
+// migrations it has not yet seen.
 func ensureSchema(db *sql.DB) error {
-	const schema = `CREATE TABLE IF NOT EXISTS proxies (
-		id        TEXT PRIMARY KEY,
-		url       TEXT NOT NULL DEFAULT '',
-		owner_id  TEXT NOT NULL DEFAULT '',
-		successes INTEGER NOT NULL DEFAULT 0,
-		failures  INTEGER NOT NULL DEFAULT 0
-	)`
-	if _, err := db.Exec(schema); err != nil {
-		return fmt.Errorf("ensure schema: %w", err)
-	}
-	return nil
+	return sqlitemigrate.Run(db, migrations)
+}
+
+// migrations is the ordered schema history of the proxies store. Append new steps
+// to the end; never edit or reorder shipped ones, since PRAGMA user_version pins
+// how many have already run on existing databases.
+var migrations = []sqlitemigrate.Migration{
+	{
+		Name: "create proxies table",
+		SQL: `CREATE TABLE IF NOT EXISTS proxies (
+			id        TEXT PRIMARY KEY,
+			url       TEXT NOT NULL DEFAULT '',
+			owner_id  TEXT NOT NULL DEFAULT '',
+			successes INTEGER NOT NULL DEFAULT 0,
+			failures  INTEGER NOT NULL DEFAULT 0
+		)`,
+	},
 }
 
 // Close closes the underlying database.
