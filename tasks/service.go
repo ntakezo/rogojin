@@ -27,7 +27,8 @@ type Record struct {
 
 // Repository is the persistence port the consumer implements: a dumb store of
 // task records with no liveness logic (the service infers running tasks via
-// IsRunning).
+// IsRunning). A nil Repository is allowed and selects purely in-memory
+// operation — see NewService.
 type Repository interface {
 	CreateTask(ctx context.Context, id string, workflowID string) error
 	SaveCheckpoint(ctx context.Context, id string, status string, state string, snapshot []byte) error
@@ -70,7 +71,10 @@ type service struct {
 }
 
 // NewService returns a Service that persists tasks in repository and injects
-// bus into each task's workflow instance.
+// bus into each task's workflow instance. A nil repository selects purely
+// in-memory operation: tasks run without checkpoints or durable terminal
+// stamps, and there is nothing to recover after a restart. Use it when
+// durability and crash recovery are not needed.
 func NewService(repository Repository, bus comms.Bus) Service {
 	return &service{
 		repository:       repository,
@@ -117,8 +121,12 @@ func (s *service) CreateTask(ctx context.Context, workflowID string, input any) 
 		return nil, fmt.Errorf("failed to create task: %w", err)
 	}
 
-	if err := s.repository.CreateTask(ctx, task.ID(), workflowID); err != nil {
-		return nil, fmt.Errorf("failed to create task in repository: %w", err)
+	// A nil repository is purely in-memory: skip persistence and keep the task
+	// only in the registry.
+	if s.repository != nil {
+		if err := s.repository.CreateTask(ctx, task.ID(), workflowID); err != nil {
+			return nil, fmt.Errorf("failed to create task in repository: %w", err)
+		}
 	}
 
 	s.taskRegistry[task.ID()] = task
@@ -142,6 +150,12 @@ func (s *service) RecoverTask(ctx context.Context, id string) (Task, error) {
 		return existing, nil
 	}
 
+	// A nil repository has nothing durable to rehydrate from; fail loudly rather
+	// than dereference it or hand back a zero task.
+	if s.repository == nil {
+		return nil, errors.New("cannot recover task: no repository configured")
+	}
+
 	record, err := s.repository.RecoverTask(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to recover task: %w", err)
@@ -157,6 +171,12 @@ func (s *service) RecoverTask(ctx context.Context, id string) (Task, error) {
 }
 
 func (s *service) RecoverAll(ctx context.Context) ([]Task, error) {
+	// A nil repository persists nothing, so there is nothing to recover; a
+	// startup recovery sweep stays a safe no-op in in-memory mode.
+	if s.repository == nil {
+		return nil, nil
+	}
+
 	records, err := s.repository.RecoverAll(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to recover tasks: %w", err)
@@ -201,5 +221,8 @@ func (s *service) DeleteTask(ctx context.Context, id string) error {
 	}
 
 	delete(s.taskRegistry, id)
+	if s.repository == nil {
+		return nil
+	}
 	return s.repository.DeleteTask(ctx, id)
 }
