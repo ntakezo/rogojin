@@ -7,6 +7,7 @@ import (
 	"net/url"
 
 	http "github.com/bogdanfinn/fhttp"
+	"github.com/ntakezo/rogojin/_examples/workflows/example/checkout/requests"
 	"github.com/ntakezo/rogojin/_examples/workflows/example/common"
 	"github.com/ntakezo/rogojin/comms"
 	"github.com/ntakezo/rogojin/proxies"
@@ -40,6 +41,7 @@ type RunningContext struct {
 	variantID   string
 	csrfToken   string
 	cartID      string
+	order       requests.SubmitCheckoutResponse
 }
 
 // Context is the receiver shared across every state. static holds user input by
@@ -113,6 +115,13 @@ type snapshot struct {
 	VariantID   string        `json:"variantID"`
 	CSRFToken   string        `json:"csrfToken"`
 	CartID      string        `json:"cartID"`
+}
+
+// Output returns the placed order as JSON, the task's final result. It is set by
+// SubmitCheckout, the terminal state, and read by the engine on clean completion;
+// before then the order is its zero value.
+func (c *Context) Output() ([]byte, error) {
+	return json.Marshal(c.running.order)
 }
 
 // Snapshot serializes the durable context to JSON for checkpointing. It must be

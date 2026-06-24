@@ -53,10 +53,11 @@ func main() {
 	}
 	fmt.Printf("created task %s (status %q) against %s\n", task.ID(), task.Status(), site.URL)
 
-	if err := task.Start(ctx); err != nil {
+	output, err := task.Start(ctx)
+	if err != nil {
 		log.Fatalf("start task: %v", err)
 	}
-	fmt.Printf("task %s finished with status %q\n", task.ID(), task.Status())
+	fmt.Printf("task %s finished with status %q, output %s\n", task.ID(), task.Status(), output)
 }
 
 // newForwardProxy serves a minimal HTTP forward proxy so the workflow's traffic
@@ -171,11 +172,11 @@ func (r *memRepo) SaveCheckpoint(ctx context.Context, id, status, state string, 
 	return nil
 }
 
-func (r *memRepo) MarkTerminal(ctx context.Context, id, outcome string) error {
+func (r *memRepo) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rec := r.records[id]
-	rec.Status = outcome
+	rec.Status, rec.Output = outcome, output
 	r.records[id] = rec
 	return nil
 }
