@@ -14,10 +14,12 @@ import (
 // A Task is a long-running process executing one workflow's graph.
 type Task interface {
 	ID() string
-	// Start executes the task synchronously until completion, error, or kill.
-	// A recovered task resumes from its persisted checkpoint instead of the
-	// graph's initial state.
-	Start(ctx context.Context) error
+	// Start executes the task synchronously until completion, error, or kill,
+	// returning the workflow's output on clean completion. The output is nil if
+	// the workflow produces none, or if the run errors or is killed. A recovered
+	// task resumes from its persisted checkpoint instead of the graph's initial
+	// state.
+	Start(ctx context.Context) ([]byte, error)
 	// Suspend signals the task to park before processing the next state.
 	// It is a no-op unless the task is running.
 	Suspend() error
@@ -78,11 +80,17 @@ func (t *task) ID() string {
 	return t.id
 }
 
-func (t *task) Start(ctx context.Context) error {
+func (t *task) Start(ctx context.Context) ([]byte, error) {
 	if t.recovered {
-		return t.engine.Rehydrate(ctx, t.snapshot, t.resumeAt)
+		if err := t.engine.Rehydrate(ctx, t.snapshot, t.resumeAt); err != nil {
+			return nil, err
+		}
+		return t.engine.Output(), nil
 	}
-	return t.engine.Execute(ctx, t.input)
+	if err := t.engine.Execute(ctx, t.input); err != nil {
+		return nil, err
+	}
+	return t.engine.Output(), nil
 }
 
 func (t *task) IsRunning() bool {

@@ -78,6 +78,15 @@ type Teardowner interface {
 	Teardown(ctx context.Context, status Status, runErr error) error
 }
 
+// Outputter is the opt-in result capability: the inverse of input injection via
+// NewInstance. Output marshals the instance's final result to an opaque blob,
+// which the engine returns from the task's Start and persists on the terminal
+// stamp — but only when a run completes cleanly. A run that is killed or errors
+// produces no output. Instances that yield no result simply do not implement it.
+type Outputter interface {
+	Output() ([]byte, error)
+}
+
 // PersistableWorkflow rebuilds a full instance from a snapshot — the inverse
 // of Snapshotter. Only workflows that support recovery implement it.
 type PersistableWorkflow interface {

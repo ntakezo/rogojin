@@ -21,6 +21,7 @@ type engine struct {
 	cond   *sync.Cond
 	state  workflows.Status
 	cancel context.CancelFunc
+	output []byte
 }
 
 func newEngine(workflow workflows.Workflow, deps workflows.Deps, repo Repository) *engine {
@@ -112,6 +113,11 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 		}
 
 		if next == nil {
+			// clean completion: harvest the instance's output so the run can
+			// return it and finish can persist it with the terminal stamp.
+			if herr := e.harvest(instance); herr != nil {
+				return herr
+			}
 			return nil
 		}
 
@@ -153,6 +159,33 @@ func (e *engine) checkpoint(ctx context.Context, status workflows.Status, state 
 		return err
 	}
 	return e.repo.SaveCheckpoint(ctx, e.deps.TaskID, string(status), string(state), blob)
+}
+
+// harvest captures the instance's result on clean completion via the optional
+// Outputter capability, so the run can return it and finish can persist it. It
+// is a no-op for instances that produce no output. An Output failure aborts the
+// run: a result that cannot be produced is a failure, not an empty success.
+func (e *engine) harvest(instance workflows.Instance) error {
+	out, ok := instance.(workflows.Outputter)
+	if !ok {
+		return nil
+	}
+	blob, err := out.Output()
+	if err != nil {
+		return fmt.Errorf("harvest output: %w", err)
+	}
+	e.mu.Lock()
+	e.output = blob
+	e.mu.Unlock()
+	return nil
+}
+
+// Output returns the result harvested on clean completion, or nil if the run did
+// not complete cleanly or the workflow produces no output.
+func (e *engine) Output() []byte {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.output
 }
 
 // Status reports the engine's current lifecycle status.
@@ -212,10 +245,11 @@ func (e *engine) finish() {
 		e.state = workflows.StatusDone
 	}
 	outcome := e.state
+	output := e.output
 	e.mu.Unlock()
 
 	if e.repo == nil {
 		return
 	}
-	_ = e.repo.MarkTerminal(context.Background(), e.deps.TaskID, string(outcome))
+	_ = e.repo.MarkTerminal(context.Background(), e.deps.TaskID, string(outcome), output)
 }
