@@ -148,7 +148,7 @@ type Workflow interface {
 
 ### Tasks: the runtime
 
-`tasks.NewService(repo, bus)` gives you the task service. Register workflows once, then create tasks from registered workflow IDs:
+`tasks.NewService(repo, bus)` gives you the task service. Pass a nil `repo` for purely in-memory tasks — they run without checkpoints or recovery. Register workflows once, then create tasks from registered workflow IDs:
 
 ```go
 task, _ := svc.CreateTask(ctx, "scrape", input)
