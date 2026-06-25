@@ -1,0 +1,60 @@
+// Package {{.Package}} is a generated rogojin workflow. The module here
+// validates input and builds per-task instances; the actual automation lives in
+// the states subpackage, where each state is a method you edit.
+package {{.Package}}
+
+import (
+	"fmt"
+
+	"{{.ModulePath}}/{{.Package}}/states"
+{{- if .Proxy}}
+	"github.com/ntakezo/rogojin/proxies"
+{{- end}}
+	"github.com/ntakezo/rogojin/workflows"
+)
+
+// Name is the ID the workflow registers under and tasks are created from.
+const Name = "{{.Name}}"
+
+// workflow is the registered module. It is built once and shared across tasks;
+// per-task state lives on the instance it builds in NewInstance.
+type workflow struct {
+{{- if .Proxy}}
+	proxies *proxies.Manager
+{{- end}}
+}
+
+// New builds the workflow module.
+func New({{if .Proxy}}manager *proxies.Manager{{end}}) workflows.Workflow {
+	return workflow{
+{{- if .Proxy}}
+		proxies: manager,
+{{- end}}
+	}
+}
+
+func (w workflow) ID() string { return Name }
+
+// ValidateInput ensures the caller passed a states.Input.
+func (w workflow) ValidateInput(input any) error {
+	if _, ok := input.(states.Input); !ok {
+		return fmt.Errorf("{{.Name}}: expected states.Input, got %T", input)
+	}
+	return nil
+}
+
+// NewInstance builds a fresh, per-task instance bound to input and deps.
+func (w workflow) NewInstance(input any, deps workflows.Deps) (workflows.Instance, error) {
+	in, ok := input.(states.Input)
+	if !ok {
+		return nil, fmt.Errorf("{{.Name}}: expected states.Input, got %T", input)
+	}
+	return states.NewContext(in, deps{{if .Proxy}}, w.proxies{{end}}), nil
+}
+{{if .Durable}}
+// RestoreInstance rebuilds an instance from a snapshot so a task can resume
+// after a crash, restart, or suspend.
+func (w workflow) RestoreInstance(deps workflows.Deps, snapshot []byte) (workflows.Instance, error) {
+	return states.RestoreContext(deps, snapshot{{if .Proxy}}, w.proxies{{end}})
+}
+{{end}}

@@ -1,0 +1,20 @@
+package states
+
+import "github.com/ntakezo/rogojin/workflows"
+
+// Each state's name lives next to the others; the handler for each is a method
+// on Context, wired below.
+const (
+	fetch   workflows.State = "fetch"
+	process workflows.State = "process"
+)
+
+// Graph wires the states into a workflow graph bound to this context. Each
+// handler is a method value closing over c, so state flows through the receiver
+// rather than a threaded argument.
+func (c *Context) Graph() workflows.Graph {
+	return workflows.NewGraph(fetch, workflows.States{
+		fetch:   c.Fetch,
+		process: c.Process,
+	})
+}

@@ -1,0 +1,19 @@
+package states
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ntakezo/rogojin/workflows"
+)
+
+// Process handles the fetched body and completes the task by returning a nil
+// next state. Replace the body with your own terminal logic, or return
+// workflows.Next(someState) to advance to another state instead.
+func (c *Context) Process(ctx context.Context) (*workflows.State, error) {
+	fmt.Printf("fetched %d bytes from %s\n", len(c.r.body), c.input.URL)
+{{- if .Output}}
+	c.r.result = Result{URL: c.input.URL, Bytes: len(c.r.body)}
+{{- end}}
+	return nil, nil
+}

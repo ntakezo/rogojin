@@ -5,7 +5,7 @@ Rogojin is a Go framework for building durable, resumable automation workflows a
 ## Why Rogojin
 
 - **Durable by default.** Every state transition is checkpointed. Kill the process mid-run and recover the task at the next unprocessed state, with its accumulated context intact. If a checkpoint cannot be written, the run stops _before_ the next state executes — work is never performed without its resume point persisted first.
-- **Workflows are plain Go.** A state is just a method: `func(ctx context.Context) (*workflows.State, error)`. Return the next state to advance, `nil` to complete. No DSL, no code generation.
+- **Workflows are plain Go.** A state is just a method: `func(ctx context.Context) (*workflows.State, error)`. Return the next state to advance, `nil` to complete. No DSL, nothing generated at runtime.
 - **Lifecycle control.** Start, suspend, resume, and kill tasks at state boundaries. A suspended task persists durably and recovers paused, exactly where it stopped.
 - **Proxy management included.** Lease proxies per task with pluggable selection (round-robin, or Thompson-sampling that learns which proxies succeed), per-proxy concurrency caps, and durable task-to-proxy locks for sticky sessions.
 - **Bring your own storage.** Persistence is a small interface (a dumb byte store). SQLite implementations ship in the box; swap in anything else by implementing the repository.
@@ -121,6 +121,33 @@ func main() {
 	}
 }
 ```
+
+### Scaffolding a workflow
+
+To start from a runnable skeleton instead of a blank file, install the `rogojin` CLI and generate one from inside your module:
+
+```sh
+go install github.com/ntakezo/rogojin/cmd/rogojin@latest
+rogojin new checkout
+go run ./checkout/cmd/run
+```
+
+`rogojin new <name>` emits a full workflow package — the module, a `states` subpackage with durability hooks and proxy leasing, and a runnable `cmd/run` wiring it onto a SQLite-backed task service. Subtract what you don't need:
+
+```sh
+rogojin new scrape --no-proxy --no-durable        # plain fetch, no proxies or recovery
+rogojin new probe  --no-task-persistence           # in-memory tasks, no SQLite
+```
+
+| Flag                     | Effect                                                        |
+| ------------------------ | ------------------------------------------------------------ |
+| `--no-durable`           | omit the `Snapshot`/`Restore` recovery hooks                 |
+| `--no-output`            | omit the `Output` result hook                                |
+| `--no-proxy`             | omit per-task proxy leasing                                   |
+| `--no-task-persistence`  | run tasks in memory (nil repo) instead of SQLite             |
+| `--no-proxy-persistence` | use an in-memory proxy pool instead of SQLite                |
+
+The imports resolve against your module's path, and the generator refuses to overwrite existing files.
 
 For a complete workflow — proxy leasing, durable snapshots, recovery, and inter-task coordination against a real (canned) site — see [`_examples/workflows/example`](./_examples/workflows/example):
 
@@ -242,6 +269,7 @@ SQLite implementations are provided (`persistence/tasksqlite`, `persistence/prox
 | `comms`       | Inter-task pub/sub: the `Bus` port, in-memory implementation, typed topics.           |
 | `proxies`     | Proxy pool manager: leasing, selection strategies, locks, deletion policy.            |
 | `persistence` | SQLite adapters for the `tasks` and `proxies` repository ports.                       |
+| `cmd/rogojin` | The `rogojin new` CLI: scaffolds a runnable workflow package from templates.          |
 | `_examples`   | A runnable end-to-end checkout workflow against a canned site.                        |
 
 ## Versioning

@@ -1,0 +1,135 @@
+// Command run wires the {{.Name}} workflow onto a task service and runs one
+// task end to end. It is a starting point — edit the input, swap the
+// persistence, and add proxies to taste.
+package main
+
+import (
+	"context"
+	"log"
+{{- if .Proxy}}{{if not .ProxyPersist}}
+	"sync"
+{{- end}}{{end}}
+
+	"github.com/ntakezo/rogojin/comms"
+{{- if and .Proxy .ProxyPersist}}
+	"github.com/ntakezo/rogojin/persistence/proxysqlite"
+{{- end}}
+{{- if .TaskPersist}}
+	"github.com/ntakezo/rogojin/persistence/tasksqlite"
+{{- end}}
+{{- if .Proxy}}
+	"github.com/ntakezo/rogojin/proxies"
+{{- end}}
+	"github.com/ntakezo/rogojin/tasks"
+	"{{.ModulePath}}/{{.Package}}"
+	"{{.ModulePath}}/{{.Package}}/states"
+)
+
+func main() {
+	ctx := context.Background()
+
+{{- if .TaskPersist}}
+	repo, err := tasksqlite.NewSQLite("{{.Package}}.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer repo.Close()
+	svc := tasks.NewService(repo, comms.NewBus())
+{{- else}}
+	// A nil task repository runs tasks purely in memory: no checkpoints, no
+	// recovery. Swap in tasksqlite (or your own Repository) for durability.
+	svc := tasks.NewService(nil, comms.NewBus())
+{{- end}}
+
+{{- if .Proxy}}
+
+{{- if .ProxyPersist}}
+	proxyRepo, err := proxysqlite.NewSQLite("{{.Package}}-proxies.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer proxyRepo.Close()
+{{- else}}
+	// An in-memory proxy pool to get started. Seed it with real proxies, or
+	// swap in proxysqlite for a durable pool.
+	proxyRepo := newMemProxyRepo(
+		proxies.Proxy{ID: "proxy-1", URL: "http://127.0.0.1:8080"},
+	)
+{{- end}}
+	manager, err := proxies.NewManager(ctx, proxyRepo, proxies.NewRoundRobin(), proxies.Exclusive(), nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New(manager)); err != nil {
+		log.Fatal(err)
+	}
+{{- else}}
+	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New()); err != nil {
+		log.Fatal(err)
+	}
+{{- end}}
+
+	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://example.com"})
+	if err != nil {
+		log.Fatal(err)
+	}
+{{- if .Output}}
+	output, err := task.Start(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("task %s finished with status %q, output %s", task.ID(), task.Status(), output)
+{{- else}}
+	if _, err := task.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("task %s finished with status %q", task.ID(), task.Status())
+{{- end}}
+}
+{{if and .Proxy (not .ProxyPersist)}}
+// memProxyRepo is a minimal in-memory proxies.Repository: a dumb store of the
+// seeded pool. The Manager owns all live lease state, so this only holds records.
+type memProxyRepo struct {
+	mu      sync.Mutex
+	records map[string]proxies.Proxy
+	order   []string
+}
+
+func newMemProxyRepo(seed ...proxies.Proxy) *memProxyRepo {
+	r := &memProxyRepo{records: make(map[string]proxies.Proxy)}
+	for _, p := range seed {
+		r.records[p.ID] = p
+		r.order = append(r.order, p.ID)
+	}
+	return r
+}
+
+func (r *memProxyRepo) List(ctx context.Context) ([]proxies.Proxy, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]proxies.Proxy, 0, len(r.order))
+	for _, id := range r.order {
+		if p, ok := r.records[id]; ok {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+func (r *memProxyRepo) Save(ctx context.Context, p proxies.Proxy) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.records[p.ID]; !ok {
+		r.order = append(r.order, p.ID)
+	}
+	r.records[p.ID] = p
+	return nil
+}
+
+func (r *memProxyRepo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.records, id)
+	return nil
+}
+{{end}}
