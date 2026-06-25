@@ -55,7 +55,7 @@ func TestNilRepositoryRecoverAllIsEmpty(t *testing.T) {
 
 // TestNilRepositoryRecoverTaskErrors verifies recovering a specific task fails
 // loudly with a nil repository: there is nothing durable to rehydrate from, and
-// silently returning a zero task would hide that (Rule 12 — fail loud).
+// silently returning a zero task would hide that.
 func TestNilRepositoryRecoverTaskErrors(t *testing.T) {
 	svc := NewService(nil, comms.NewBus())
 

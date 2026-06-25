@@ -716,7 +716,7 @@ func TestErroredRunHarvestsNoOutput(t *testing.T) {
 
 // TestOutputErrorAbortsRun verifies an Output failure aborts the run with the
 // error rather than reporting a clean completion, because a result that cannot
-// be produced is a failure, not an empty success (Rule 12 — fail loud).
+// be produced is a failure, not an empty success.
 func TestOutputErrorAbortsRun(t *testing.T) {
 	store := &fakeStore{}
 	e := newEngine(outputWorkflow{outErr: errors.New("marshal failed")}, workflows.Deps{TaskID: "task-1"}, store)
