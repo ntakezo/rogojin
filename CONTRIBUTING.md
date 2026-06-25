@@ -48,6 +48,14 @@ The [README](./README.md) explains the architecture; the package doc comments (`
 
 Small, focused PRs are reviewed quickly. If your change grew beyond one concern, split it.
 
+## Changing the scaffolder
+
+The `rogojin new` CLI (`cmd/rogojin`) renders a runnable workflow from the templates in `internal/scaffold/templates`. Those templates **reproduce framework surface** — the `workflows.Workflow` and `Instance` interfaces, the opt-in capabilities (`Snapshotter`, `Outputter`, `Teardowner`), and the wiring in `main` (`tasks.NewService`, `proxies.NewManager`, the SQLite constructors). This makes the scaffolder a maintenance surface that many feature changes touch indirectly:
+
+- **If you change surface the templates reproduce, update the templates in the same PR.** Renaming a type, adding an interface method, or changing a constructor signature will leave the generated code stale. `TestGeneratedCodeCompiles` renders every flag combination and runs `go vet` against the real packages, so a change that breaks the templates fails CI — but it only catches *compile* breakage. Conceptual drift (the example adopts a better pattern the templates don't) is not caught; keep the templates and `_examples` in step.
+- **A new opt-in capability gets a `--no-` flag, not unconditional code.** The existing flags (`--no-durable`, `--no-output`, `--no-proxy`, and the two persistence flags) each gate one feature so a generated tree never carries code it cannot use. Match that: gate the feature behind a flag, add it to the `validCombos` matrix in the test, and reject any incoherent combination in `Options.Validate` rather than emit dead wiring.
+- **Keep generated code hand-written quality.** `Render` runs every file through `go/format`, so template conditionals can be coarse without leaving whitespace scars — write the templates for readability and let the format pass clean up.
+
 ## Versioning and releases
 
 Rogojin follows [Semantic Versioning](https://semver.org); see the [README's versioning section](./README.md#versioning). Maintainers cut releases by tagging `main` — contributors never need to touch version numbers.

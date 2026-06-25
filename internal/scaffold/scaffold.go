@@ -1,7 +1,13 @@
 // Package scaffold renders a runnable rogojin workflow package from a small set
-// of embedded templates. The four feature flags on Options gate the durability
-// hooks, proxy leasing, and the persistence wiring in the generated main, so a
-// generated tree always compiles and never carries code it cannot use.
+// of embedded templates. The feature flags on Options gate the durability hooks,
+// the output hook, proxy leasing, and the persistence wiring in the generated
+// main, so a generated tree always compiles and never carries code it cannot use.
+//
+// The templates reproduce framework surface (the workflows interfaces, the opt-in
+// capabilities, the service and manager constructors), so they drift when that
+// surface changes. TestGeneratedCodeCompiles renders every flag combination and
+// vets it against the real packages to catch compile-level drift; see the
+// scaffolder section of CONTRIBUTING.md for the maintenance contract.
 package scaffold
 
 import (
