@@ -10,7 +10,7 @@ import (
 	"fmt"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/ntakezo/rogojin/persistence/internal/sqlitemigrate"
+	"github.com/ntakezo/rogojin/persistence/sqlitemigrate"
 	"github.com/ntakezo/rogojin/tasks"
 )
 

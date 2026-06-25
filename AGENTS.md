@@ -4,6 +4,10 @@
 
 Follow conventions in CONVENTIONS.md
 
+## Comments
+
+In addition to the CONVENTIONS.md comments section, you get **0-2 lines max** to comment.
+
 ## Export Policy
 
 Litmus test for exporting vs importing; Would you fix a bug in this exported symbol for a stranger, and never rename it without a major version bump? If no, lowercase it or move it to /internal.
