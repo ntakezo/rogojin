@@ -1,0 +1,139 @@
+package states
+
+import (
+{{- if .Proxy}}
+	"context"
+{{- end}}
+{{- if or .Output .Durable}}
+	"encoding/json"
+{{- end}}
+{{- if .Proxy}}
+	"fmt"
+	"net/http"
+	"net/url"
+{{- end}}
+
+	"github.com/ntakezo/rogojin/comms"
+{{- if .Proxy}}
+	"github.com/ntakezo/rogojin/proxies"
+{{- end}}
+	"github.com/ntakezo/rogojin/workflows"
+)
+
+// Input is the immutable per-task input the caller supplies at CreateTask. Add
+// the fields your workflow needs; they are held by value and never mutated.
+type Input struct {
+	URL string
+}
+
+{{- if .Output}}
+// Result is the workflow's output, set by the terminal state and marshaled by
+// Output on clean completion. Shape it to whatever your workflow produces.
+type Result struct {
+	URL   string `json:"url"`
+	Bytes int    `json:"bytes"`
+}
+{{- end}}
+
+// running is the mutable state the workflow accumulates as it advances through
+// states, plus its side effects. It is a pointer on Context so handlers mutate
+// one shared copy.
+type running struct {
+{{- if .Proxy}}
+	proxies *proxies.Manager
+	taskID  string
+	lease   *proxies.Lease
+	client  *http.Client
+{{- end}}
+	bus comms.Bus
+
+	body string
+{{- if .Output}}
+	result Result
+{{- end}}
+}
+
+// Context is the receiver shared across every state. input is immutable per
+// task; r carries the evolving state and side effects.
+type Context struct {
+	input Input
+	r     *running
+}
+
+// NewContext builds a fresh context for one task.
+func NewContext(input Input, deps workflows.Deps{{if .Proxy}}, manager *proxies.Manager{{end}}) *Context {
+	return &Context{
+		input: input,
+		r: &running{
+{{- if .Proxy}}
+			proxies: manager,
+			taskID:  deps.TaskID,
+{{- end}}
+			bus: deps.Bus,
+		},
+	}
+}
+{{if .Output}}
+// Output marshals the workflow's result to JSON. The engine reads it only on
+// clean completion; a run that is killed or errors produces none.
+func (c *Context) Output() ([]byte, error) {
+	return json.Marshal(c.r.result)
+}
+{{end}}
+{{- if .Proxy}}
+// client leases a proxy and builds the HTTP client on first use, so a recovered
+// task acquires its own lease wherever in the graph it resumes.
+func (c *Context) client(ctx context.Context) (*http.Client, error) {
+	if c.r.client != nil {
+		return c.r.client, nil
+	}
+	lease, err := c.r.proxies.Acquire(ctx, c.r.taskID)
+	if err != nil {
+		return nil, fmt.Errorf("acquire proxy: %w", err)
+	}
+	proxyURL, err := url.Parse(lease.Proxy().URL)
+	if err != nil {
+		lease.Release(false)
+		return nil, fmt.Errorf("parse proxy url: %w", err)
+	}
+	c.r.lease = lease
+	c.r.client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	return c.r.client, nil
+}
+
+// Teardown releases the task's proxy lease exactly once when the run exits,
+// reporting success on the absence of a run error.
+func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
+	if c.r.lease == nil {
+		return nil
+	}
+	return c.r.lease.Release(runErr == nil)
+}
+{{end}}
+{{- if .Durable}}
+// snapshot is the JSON shape persisted for recovery: the immutable input plus
+// the durable running fields. Side effects (lease, client, bus) are rebuilt on
+// restore, never serialized.
+type snapshot struct {
+	Input Input  `json:"input"`
+	Body  string `json:"body"`
+}
+
+// Snapshot serializes the durable context. The engine calls it before entering
+// each state, so it must be valid as the entry of the state it is taken before.
+func (c *Context) Snapshot() ([]byte, error) {
+	return json.Marshal(snapshot{Input: c.input, Body: c.r.body})
+}
+
+// RestoreContext rebuilds a context from a JSON snapshot; the lease and client
+// are re-acquired lazily on first use.
+func RestoreContext(deps workflows.Deps, blob []byte{{if .Proxy}}, manager *proxies.Manager{{end}}) (*Context, error) {
+	var s snapshot
+	if err := json.Unmarshal(blob, &s); err != nil {
+		return nil, err
+	}
+	c := NewContext(s.Input, deps{{if .Proxy}}, manager{{end}})
+	c.r.body = s.Body
+	return c, nil
+}
+{{- end}}
