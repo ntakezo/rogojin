@@ -113,7 +113,7 @@ func TestRunRollsBackFailedMigration(t *testing.T) {
 
 // TestRunRejectsNewerDatabase verifies a database stamped beyond the known
 // migrations is refused rather than silently operated on, because older code must
-// not run against a schema from a future version (Rule 12 — fail loud).
+// not run against a schema from a future version.
 func TestRunRejectsNewerDatabase(t *testing.T) {
 	db := openDB(t)
 	if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
