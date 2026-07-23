@@ -2,8 +2,6 @@
 
 # Rogojin — durable web automation workflows
 
-<p><img title="rogojin logo" src="assets/rogojin.jpg" width="240"></p>
-
 [![Go Reference](https://pkg.go.dev/badge/github.com/ntakezo/rogojin.svg)](https://pkg.go.dev/github.com/ntakezo/rogojin)
 [![GitHub License](https://img.shields.io/github/license/ntakezo/rogojin)](./LICENSE)
 
