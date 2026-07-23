@@ -19,14 +19,6 @@ abbreviations are lowercase unless appended to another word, in which case full 
 
 inline unless very large. top of file.
 
-## Pointers
+## Export Policy
 
-don't explicitly use them unless you need them. only ingest/return them if you're okay with the consumer modifying them at their own discretion. return copy otherwise if needed.
-
-## Context
-
-dont store values in contexts.
-
-use contexts where cancellation logic is applicable and preferable.
-
-use TODO() when necessary.
+Litmus test for exporting vs importing; Would you fix a bug in this exported symbol for a stranger, and never rename it without a major version bump? If no, lowercase it or move it to /internal.
