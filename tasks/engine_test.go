@@ -505,10 +505,9 @@ func TestTeardownRunsOnCompletion(t *testing.T) {
 	}
 }
 
-// TestTeardownRunsOnHandlerError verifies a failed run still tears down and
-// receives the run error, because resources must not leak on failure and the
-// error is what distinguishes failure from clean completion (the engine stamps
-// non-killed exits done either way).
+// TestTeardownRunsOnHandlerError verifies a failed run still tears down,
+// receives the run error, and observes the failed status — resources must not
+// leak on failure, and teardown must be able to tell failure from completion.
 func TestTeardownRunsOnHandlerError(t *testing.T) {
 	rec := &teardownRecorder{}
 	engine := newEngine(&teardownWorkflow{rec: rec, failAt: s2}, workflows.Deps{TaskID: "task-1"}, nil)
@@ -525,8 +524,30 @@ func TestTeardownRunsOnHandlerError(t *testing.T) {
 	if runErr == nil || !strings.Contains(runErr.Error(), "handler failed") {
 		t.Fatalf("teardown runErr = %v, want the handler failure", runErr)
 	}
-	if status != workflows.StatusDone {
-		t.Fatalf("teardown status = %q, want done (engine stamps non-killed exits done)", status)
+	if status != workflows.StatusFailed {
+		t.Fatalf("teardown status = %q, want failed", status)
+	}
+}
+
+// TestHandlerErrorStampsFailed verifies an errored run is durably stamped
+// failed, not done — a consumer reading the store after a restart must be able
+// to tell a run that broke from one that finished, and a failed task must stay
+// recoverable from its last checkpoint rather than look complete.
+func TestHandlerErrorStampsFailed(t *testing.T) {
+	store := &fakeStore{}
+	e := newEngine(outputWorkflow{failRun: true}, workflows.Deps{TaskID: "task-1"}, store)
+
+	if err := e.Execute(context.Background(), nil); err == nil {
+		t.Fatal("Execute: want run error, got nil")
+	}
+	if e.Status() != workflows.StatusFailed {
+		t.Fatalf("status = %q, want failed", e.Status())
+	}
+	if !store.terminalSet || store.terminal != workflows.StatusFailed {
+		t.Fatalf("stamped outcome = %q (set=%v), want failed", store.terminal, store.terminalSet)
+	}
+	if store.terminal.Terminal() {
+		t.Fatal("failed must not be terminal: the task is still recoverable")
 	}
 }
 
@@ -604,6 +625,10 @@ func TestCheckpointFailureAbortsRun(t *testing.T) {
 	}
 	if !reflect.DeepEqual(log, []workflows.State{s1}) {
 		t.Fatalf("states = %v, want [s1] (aborted before s2's handler)", log)
+	}
+	// The aborted run must stamp failed, not done: the task is unfinished.
+	if store.terminal != workflows.StatusFailed {
+		t.Fatalf("stamped outcome = %q, want failed", store.terminal)
 	}
 
 	// The last good checkpoint (s2's resume point was never saved, s1's was)
