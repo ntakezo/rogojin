@@ -163,3 +163,53 @@ func TestTopicRoundTrip(t *testing.T) {
 		t.Errorf("got %q, want https://x", got.URL)
 	}
 }
+
+// TestWithBufferControlsCapacity verifies the buffer option sizes each
+// subscriber's feed: coordination topics whose consumers block on a single
+// message need a capacity chosen for their burstiness, not a fixed default.
+func TestWithBufferControlsCapacity(t *testing.T) {
+	b := NewBus(WithBuffer(1))
+	ctx := context.Background()
+
+	sub, _ := b.Subscribe(ctx, "topic")
+	defer sub.Close()
+
+	b.Publish(ctx, "topic", "first")
+	b.Publish(ctx, "topic", "second") // buffer of 1 is full: dropped
+
+	if got := recv(t, sub.C()); got != "first" {
+		t.Fatalf("got %v, want first", got)
+	}
+	assertEmpty(t, sub.C())
+}
+
+// TestDropHandlerReportsDrops verifies a dropped publish is observable: silent
+// loss on a coordination bus leaves a blocked task hanging with no signal
+// anywhere that its wake-up vanished.
+func TestDropHandlerReportsDrops(t *testing.T) {
+	type drop struct {
+		topic   string
+		payload any
+	}
+	var drops []drop
+	b := NewBus(WithBuffer(1), WithDropHandler(func(topic string, payload any) {
+		drops = append(drops, drop{topic, payload})
+	}))
+	ctx := context.Background()
+
+	sub, _ := b.Subscribe(ctx, "topic")
+	defer sub.Close()
+
+	b.Publish(ctx, "topic", "kept")
+	b.Publish(ctx, "topic", "lost")
+
+	if len(drops) != 1 || drops[0].topic != "topic" || drops[0].payload != "lost" {
+		t.Fatalf("drops = %v, want exactly the lost payload on its topic", drops)
+	}
+	// A publish with buffer room drops nothing.
+	recv(t, sub.C())
+	b.Publish(ctx, "topic", "kept-2")
+	if len(drops) != 1 {
+		t.Fatalf("drops = %v, want no new drops after the buffer freed", drops)
+	}
+}
