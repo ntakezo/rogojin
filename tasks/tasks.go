@@ -4,12 +4,19 @@ package tasks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/ntakezo/rogojin/comms"
 	"github.com/ntakezo/rogojin/workflows"
 )
+
+// ErrNoCheckpoint is returned by Start on a recovered task that was created but
+// never checkpointed. Task input is not persisted — durability begins at the
+// first checkpoint — so there is nothing to resume from; the task can only be
+// deleted and re-created.
+var ErrNoCheckpoint = errors.New("task has no checkpoint to resume from")
 
 // A Task is a long-running process executing one workflow's graph.
 type Task interface {
@@ -84,6 +91,9 @@ func (t *task) ID() string {
 func (t *task) Start(ctx context.Context) ([]byte, error) {
 	var err error
 	if t.recovered {
+		if t.recoveredStatus == workflows.StatusNotStarted {
+			return nil, fmt.Errorf("task %s: %w", t.id, ErrNoCheckpoint)
+		}
 		err = t.engine.Rehydrate(ctx, t.snapshot, t.resumeAt)
 	} else {
 		err = t.engine.Execute(ctx, t.input)
