@@ -64,10 +64,6 @@ func runNew(args []string) error {
 		return fmt.Errorf("usage: rogojin new <name> [flags]")
 	}
 
-	if *noProxy && *noProxyPersist {
-		return fmt.Errorf("--no-proxy-persistence is meaningless with --no-proxy: there is no proxy pool to store")
-	}
-
 	opts := scaffold.Options{
 		Name:         name,
 		Package:      scaffold.PackageName(name),
@@ -77,10 +73,9 @@ func runNew(args []string) error {
 		TaskPersist:  !*noTaskPersist,
 		ProxyPersist: !*noProxyPersist,
 	}
-	// ProxyPersist is only meaningful with a proxy pool. When --no-proxy is set
-	// without an explicit --no-proxy-persistence, normalize it off rather than
-	// reject; an explicit pairing of the two is still a conflict Validate flags.
-	if !opts.Proxy && !*noProxyPersist {
+	// Proxy persistence is meaningless without a proxy pool, so --no-proxy
+	// normalizes it off — stated explicitly alongside it or not.
+	if !opts.Proxy {
 		opts.ProxyPersist = false
 	}
 
