@@ -14,4 +14,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - run: go vet ./...
       - run: go test -race ./...
+      # _examples is its own module in an underscore directory, so the root
+      # go commands skip it; build it explicitly or the example rots silently.
+      - run: go build ./... && go vet ./...
+        working-directory: _examples
