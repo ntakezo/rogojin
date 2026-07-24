@@ -62,7 +62,12 @@ func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows
 func (e *engine) run(ctx context.Context, instance workflows.Instance, start *workflows.State, suspended bool) (err error) {
 	e.mu.Lock()
 	if e.state != workflows.StatusNotStarted {
+		// a kill latched before the first Start wins: the task never runs.
+		killed := e.state == workflows.StatusKilled
 		e.mu.Unlock()
+		if killed {
+			return context.Canceled
+		}
 		return nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -233,12 +238,16 @@ func (e *engine) Resume() error {
 	return nil
 }
 
-// Kill cancels the engine immediately, interrupting the in-flight state.
-// No-op unless running or suspended.
+// Kill cancels the engine immediately, interrupting the in-flight state. A
+// kill before Start latches so a later Start refuses to run. No-op once
+// terminal.
 func (e *engine) Kill() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.state == workflows.StatusRunning || e.state == workflows.StatusSuspended {
+	switch e.state {
+	case workflows.StatusNotStarted:
+		e.state = workflows.StatusKilled
+	case workflows.StatusRunning, workflows.StatusSuspended:
 		e.state = workflows.StatusKilled
 		e.cancel()
 		e.cond.Signal() // wake a suspended loop so it observes the kill
