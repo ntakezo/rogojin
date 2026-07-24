@@ -683,6 +683,30 @@ func TestTeardownRunsOnKill(t *testing.T) {
 	}
 }
 
+// TestKillBeforeStartLatches verifies a kill delivered before Start is not
+// lost: the race between an operator's kill and a scheduler's Start must
+// resolve to the kill, or the task runs right after being told to die.
+func TestKillBeforeStartLatches(t *testing.T) {
+	var log []workflows.State
+	task, err := createTask(&testWorkflow{log: &log}, nil, nil, &fakeStore{})
+	if err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+
+	if err := task.Kill(); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if _, err := task.Start(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start after kill: err = %v, want context.Canceled", err)
+	}
+	if len(log) != 0 {
+		t.Fatalf("states ran after a pre-start kill: %v", log)
+	}
+	if task.Status() != workflows.StatusKilled {
+		t.Fatalf("status = %q, want killed", task.Status())
+	}
+}
+
 // TestTeardownErrorSurfaced verifies a teardown failure is returned to the
 // caller rather than swallowed, because a leaked resource must be visible.
 func TestTeardownErrorSurfaced(t *testing.T) {
