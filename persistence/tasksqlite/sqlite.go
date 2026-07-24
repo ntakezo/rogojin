@@ -14,8 +14,8 @@ import (
 	"github.com/ntakezo/rogojin/tasks"
 )
 
-// ErrNotFound is returned by RecoverTask when no record exists for the id, so the
-// service can tell a missing task apart from a store failure.
+// ErrNotFound is returned when no record exists for the id, so the service can
+// tell a missing task apart from a store failure.
 var ErrNotFound = errors.New("task not found")
 
 // SQLite is a durable tasks.Repository backed by a single SQLite database file.
@@ -79,24 +79,40 @@ func (s *SQLite) CreateTask(ctx context.Context, id, workflowID string) error {
 	return nil
 }
 
-// SaveCheckpoint overwrites the task's last-checkpointed status, state, and snapshot.
+// SaveCheckpoint overwrites the task's last-checkpointed status, state, and
+// snapshot. It fails with ErrNotFound if no record exists: a checkpoint that
+// lands nowhere must not report durability the store does not have.
 func (s *SQLite) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE tasks SET status = ?, state = ?, snapshot = ? WHERE id = ?`,
 		status, state, snapshot, id)
 	if err != nil {
 		return fmt.Errorf("save checkpoint %s: %w", id, err)
 	}
-	return nil
+	return errRowMissing("save checkpoint", id, res)
 }
 
 // MarkTerminal stamps the terminal outcome and the run's output, leaving state
 // and snapshot intact as a valid resume entry. output is nil for runs that
-// produce no result or did not complete cleanly.
+// produce no result or did not complete cleanly. It fails with ErrNotFound if
+// no record exists.
 func (s *SQLite) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = ?, output = ? WHERE id = ?`, outcome, output, id)
+	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = ?, output = ? WHERE id = ?`, outcome, output, id)
 	if err != nil {
 		return fmt.Errorf("mark terminal %s: %w", id, err)
+	}
+	return errRowMissing("mark terminal", id, res)
+}
+
+// errRowMissing turns an update that matched no row into ErrNotFound, so a
+// write to a deleted task fails loud instead of silently landing nowhere.
+func errRowMissing(op, id string, res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", op, id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%s %s: %w", op, id, ErrNotFound)
 	}
 	return nil
 }
