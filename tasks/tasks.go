@@ -18,6 +18,12 @@ import (
 // deleted and re-created.
 var ErrNoCheckpoint = errors.New("task has no checkpoint to resume from")
 
+// ErrAlreadyTerminal is returned by Start on a task recovered with a terminal
+// outcome (done or killed): its run is over, and re-executing the final state
+// would duplicate side effects. A failed task is not terminal and may be
+// retried from its last checkpoint.
+var ErrAlreadyTerminal = errors.New("task already reached a terminal outcome")
+
 // A Task is a long-running process executing one workflow's graph.
 type Task interface {
 	ID() string
@@ -94,6 +100,9 @@ func (t *task) Start(ctx context.Context) ([]byte, error) {
 	if t.recovered {
 		if t.recoveredStatus == workflows.StatusNotStarted {
 			return nil, fmt.Errorf("task %s: %w", t.id, ErrNoCheckpoint)
+		}
+		if t.recoveredStatus.Terminal() {
+			return nil, fmt.Errorf("task %s is %s: %w", t.id, t.recoveredStatus, ErrAlreadyTerminal)
 		}
 		err = t.engine.Rehydrate(ctx, t.snapshot, t.resumeAt, t.recoveredStatus == workflows.StatusSuspended)
 	} else {

@@ -459,6 +459,51 @@ func TestRecoveredSuspendedTaskStartsPaused(t *testing.T) {
 	}
 }
 
+// TestRecoveredTerminalTaskRefusesStart verifies a task recovered with a
+// terminal outcome cannot be started again: MarkTerminal leaves state and
+// snapshot in place, so a permissive Start would silently re-execute the final
+// state — duplicating real-world side effects — and overwrite the stamp.
+func TestRecoveredTerminalTaskRefusesStart(t *testing.T) {
+	snapshot, err := json.Marshal(testSnapshot{Visited: 2})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	for _, status := range []workflows.Status{workflows.StatusDone, workflows.StatusKilled} {
+		var log []workflows.State
+		task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s3, status, nil, &fakeStore{})
+
+		if _, err := task.Start(context.Background()); !errors.Is(err, ErrAlreadyTerminal) {
+			t.Fatalf("Start on recovered %q task: err = %v, want ErrAlreadyTerminal", status, err)
+		}
+		if len(log) != 0 {
+			t.Fatalf("recovered %q task ran states: %v", status, log)
+		}
+	}
+}
+
+// TestRecoveredFailedTaskRetries verifies a failed task is not terminal: it
+// recovers and retries from its last checkpoint, which is the whole point of
+// stamping failure separately from completion.
+func TestRecoveredFailedTaskRetries(t *testing.T) {
+	snapshot, err := json.Marshal(testSnapshot{Visited: 1})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	var log []workflows.State
+	store := &fakeStore{}
+	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusFailed, nil, store)
+
+	if _, err := task.Start(context.Background()); err != nil {
+		t.Fatalf("Start on recovered failed task: %v", err)
+	}
+	if !reflect.DeepEqual(log, []workflows.State{s2, s3}) {
+		t.Fatalf("states = %v, want [s2 s3] (retried from the checkpoint)", log)
+	}
+	if store.terminal != workflows.StatusDone {
+		t.Fatalf("terminal = %q, want done after a successful retry", store.terminal)
+	}
+}
+
 // teardownRecorder captures Teardown invocations so tests can assert when and
 // with what the engine called it. result is what Teardown returns.
 type teardownRecorder struct {
