@@ -26,7 +26,8 @@ type Task interface {
 	// the workflow produces none, or if the run errors or is killed. A run whose
 	// terminal stamp fails to persist returns its output alongside the error.
 	// A recovered task resumes from its persisted checkpoint instead of the
-	// graph's initial state.
+	// graph's initial state; one recovered from a suspended checkpoint starts
+	// parked there until Resume or Kill.
 	Start(ctx context.Context) ([]byte, error)
 	// Suspend signals the task to park before processing the next state.
 	// It is a no-op unless the task is running.
@@ -94,7 +95,7 @@ func (t *task) Start(ctx context.Context) ([]byte, error) {
 		if t.recoveredStatus == workflows.StatusNotStarted {
 			return nil, fmt.Errorf("task %s: %w", t.id, ErrNoCheckpoint)
 		}
-		err = t.engine.Rehydrate(ctx, t.snapshot, t.resumeAt)
+		err = t.engine.Rehydrate(ctx, t.snapshot, t.resumeAt, t.recoveredStatus == workflows.StatusSuspended)
 	} else {
 		err = t.engine.Execute(ctx, t.input)
 	}

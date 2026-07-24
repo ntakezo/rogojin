@@ -37,12 +37,13 @@ func (e *engine) Execute(ctx context.Context, input any) error {
 	if err != nil {
 		return err
 	}
-	return e.run(ctx, instance, nil)
+	return e.run(ctx, instance, nil, false)
 }
 
-// Rehydrate rebuilds an instance from a snapshot and runs it from start.
-// It is a no-op if the engine has already started.
-func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows.State) error {
+// Rehydrate rebuilds an instance from a snapshot and runs it from start. With
+// suspended set it parks before start instead, honoring a persisted suspend
+// until Resume or Kill. It is a no-op if the engine has already started.
+func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows.State, suspended bool) error {
 	pw, ok := e.workflow.(workflows.PersistableWorkflow)
 	if !ok {
 		return fmt.Errorf("workflow %s is not persistable", e.workflow.ID())
@@ -51,13 +52,14 @@ func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows
 	if err != nil {
 		return err
 	}
-	return e.run(ctx, instance, &start)
+	return e.run(ctx, instance, &start, suspended)
 }
 
 // run drives the instance from start (or the graph's initial state when start
 // is nil) until completion, error, or kill, stamping the durable terminal
-// outcome on exit.
-func (e *engine) run(ctx context.Context, instance workflows.Instance, start *workflows.State) (err error) {
+// outcome on exit. With suspended set it begins parked at start, so a recovered
+// suspend resumes paused exactly where it left off.
+func (e *engine) run(ctx context.Context, instance workflows.Instance, start *workflows.State, suspended bool) (err error) {
 	e.mu.Lock()
 	if e.state != workflows.StatusNotStarted {
 		e.mu.Unlock()
@@ -65,7 +67,11 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
-	e.state = workflows.StatusRunning
+	if suspended {
+		e.state = workflows.StatusSuspended
+	} else {
+		e.state = workflows.StatusRunning
+	}
 	e.mu.Unlock()
 
 	defer cancel()
