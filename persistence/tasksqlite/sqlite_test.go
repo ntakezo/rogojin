@@ -309,3 +309,19 @@ func TestMigratesLegacyDatabaseAddingOutput(t *testing.T) {
 		t.Fatalf("output after migration = %q, want %q", rec.Output, out)
 	}
 }
+
+// TestWritesToMissingTaskFailLoud verifies a checkpoint or terminal stamp for
+// an id with no record fails with ErrNotFound instead of silently updating
+// zero rows — the engine would otherwise believe progress is durable when
+// nothing was written.
+func TestWritesToMissingTaskFailLoud(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	if err := repo.SaveCheckpoint(ctx, "ghost", "running", "s1", nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SaveCheckpoint on missing task: err = %v, want ErrNotFound", err)
+	}
+	if err := repo.MarkTerminal(ctx, "ghost", "done", nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("MarkTerminal on missing task: err = %v, want ErrNotFound", err)
+	}
+}
