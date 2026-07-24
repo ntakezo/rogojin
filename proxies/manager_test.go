@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -587,5 +588,80 @@ func TestDeleteLockedProxyWithoutPolicy(t *testing.T) {
 	}
 	if !repo.has("p1") {
 		t.Fatal("p1 deleted despite missing policy")
+	}
+}
+
+// gateRepo wraps fakeRepo to park exactly one armed Save until the gate opens,
+// so a test can force a specific interleaving of concurrent saves.
+type gateRepo struct {
+	*fakeRepo
+	arm     atomic.Bool
+	entered chan struct{}
+	gate    chan struct{}
+}
+
+func (r *gateRepo) Save(ctx context.Context, p Proxy) error {
+	if r.arm.CompareAndSwap(true, false) {
+		close(r.entered)
+		<-r.gate
+	}
+	return r.fakeRepo.Save(ctx, p)
+}
+
+// TestReleaseCannotResurrectStaleLock verifies Release persists atomically with
+// its in-memory update. A Release whose save raced ahead of a concurrent
+// Unlock's could land last with the stale owner still set, so a restart would
+// load a durable lock no live task holds — the proxy would be leased to a
+// ghost forever.
+func TestReleaseCannotResurrectStaleLock(t *testing.T) {
+	repo := &gateRepo{
+		fakeRepo: newFakeRepo(Proxy{ID: "p1", URL: "http://p1"}),
+		entered:  make(chan struct{}),
+		gate:     make(chan struct{}),
+	}
+	m := newTestManager(t, repo, Exclusive(), nil)
+	ctx := context.Background()
+
+	lease, err := m.Lock(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	// Arm the gate so Release's save parks mid-flight, then race an Unlock.
+	repo.arm.Store(true)
+	releaseDone := make(chan error, 1)
+	go func() { releaseDone <- lease.Release(true) }()
+	<-repo.entered
+
+	unlockDone := make(chan error, 1)
+	go func() { unlockDone <- m.Unlock(ctx, "t1") }()
+
+	// Give a racy Unlock time to finish before the parked save lands; a correct
+	// Release holds the manager lock across its save, so Unlock cannot pass it.
+	var unlockErr error
+	unlockFinished := false
+	select {
+	case unlockErr = <-unlockDone:
+		unlockFinished = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(repo.gate)
+
+	if err := <-releaseDone; err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if !unlockFinished {
+		unlockErr = <-unlockDone
+	}
+	if unlockErr != nil {
+		t.Fatalf("Unlock: %v", unlockErr)
+	}
+
+	stored := repo.get(t, "p1")
+	if stored.OwnerID != "" {
+		t.Fatalf("stored owner = %q, want unlocked: a stale Release save must not resurrect the lock", stored.OwnerID)
+	}
+	if stored.Successes != 1 {
+		t.Fatalf("stored successes = %d, want 1: the release outcome must survive the unlock", stored.Successes)
 	}
 }

@@ -263,11 +263,14 @@ func (l *Lease) Release(success bool) error {
 	return err
 }
 
-// release updates stats, frees the holder slot, wakes waiters, then persists
-// the stats with a background context so they land even when the caller's
-// context is gone.
+// release updates stats, frees the holder slot, wakes waiters, and persists the
+// updated record before dropping the lock — a save made outside it could land
+// after a concurrent Unlock's and resurrect the stale owner durably. The save
+// uses a background context so it lands even when the caller's context is gone.
 func (m *Manager) release(id string, success bool) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	p, ok := m.pool[id]
 	if ok {
 		if success {
@@ -281,7 +284,6 @@ func (m *Manager) release(id string, success bool) error {
 		m.holders[id]--
 	}
 	m.cond.Broadcast()
-	m.mu.Unlock()
 
 	if !ok {
 		return nil // proxy was deleted while leased; nothing to persist
