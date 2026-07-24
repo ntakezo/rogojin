@@ -42,6 +42,7 @@ type Task interface {
 	// unless the task is suspended.
 	Resume() error
 	// Kill stops the task as soon as possible, cancelling the in-flight state.
+	// A kill before Start latches: Start then refuses with context.Canceled.
 	Kill() error
 	// IsRunning reports whether the task is started and not yet terminal.
 	IsRunning() bool
