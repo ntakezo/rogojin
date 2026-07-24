@@ -76,7 +76,7 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 			err = errors.Join(err, td.Teardown(context.Background(), e.Status(), err))
 		}
 	}()
-	defer e.finish()
+	defer func() { e.finish(err) }()
 
 	graph := instance.Graph()
 	snapshotter, canSnapshot := instance.(workflows.Snapshotter)
@@ -236,13 +236,18 @@ func (e *engine) Kill() error {
 	return nil
 }
 
-// finish moves a non-killed engine to done and stamps the durable terminal
-// outcome. The record is never deleted here; removal is consumer-driven. The
+// finish stamps the run's durable outcome: killed stays killed, an errored run
+// is stamped failed (still recoverable from its last checkpoint), a clean one
+// done. The record is never deleted here; removal is consumer-driven. The
 // stamp uses a background context so it lands even after a kill's cancellation.
-func (e *engine) finish() {
+func (e *engine) finish(runErr error) {
 	e.mu.Lock()
 	if e.state != workflows.StatusKilled {
-		e.state = workflows.StatusDone
+		if runErr != nil {
+			e.state = workflows.StatusFailed
+		} else {
+			e.state = workflows.StatusDone
+		}
 	}
 	outcome := e.state
 	output := e.output
