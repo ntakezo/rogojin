@@ -16,9 +16,10 @@ type Task interface {
 	ID() string
 	// Start executes the task synchronously until completion, error, or kill,
 	// returning the workflow's output on clean completion. The output is nil if
-	// the workflow produces none, or if the run errors or is killed. A recovered
-	// task resumes from its persisted checkpoint instead of the graph's initial
-	// state.
+	// the workflow produces none, or if the run errors or is killed. A run whose
+	// terminal stamp fails to persist returns its output alongside the error.
+	// A recovered task resumes from its persisted checkpoint instead of the
+	// graph's initial state.
 	Start(ctx context.Context) ([]byte, error)
 	// Suspend signals the task to park before processing the next state.
 	// It is a no-op unless the task is running.
@@ -81,16 +82,16 @@ func (t *task) ID() string {
 }
 
 func (t *task) Start(ctx context.Context) ([]byte, error) {
+	var err error
 	if t.recovered {
-		if err := t.engine.Rehydrate(ctx, t.snapshot, t.resumeAt); err != nil {
-			return nil, err
-		}
-		return t.engine.Output(), nil
+		err = t.engine.Rehydrate(ctx, t.snapshot, t.resumeAt)
+	} else {
+		err = t.engine.Execute(ctx, t.input)
 	}
-	if err := t.engine.Execute(ctx, t.input); err != nil {
-		return nil, err
-	}
-	return t.engine.Output(), nil
+	// Output is harvested only on clean completion, so error exits still yield
+	// nil — except a failed terminal stamp, where the result exists and is
+	// returned alongside the error.
+	return t.engine.Output(), err
 }
 
 func (t *task) IsRunning() bool {

@@ -69,6 +69,10 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 	e.mu.Unlock()
 
 	defer cancel()
+	// A stamp failure joins the returned error only after teardown runs, so
+	// teardown sees the workflow's own error, not the persistence failure.
+	var stampErr error
+	defer func() { err = errors.Join(err, stampErr) }()
 	// teardown runs after finish (defers are LIFO) so it observes the stamped
 	// terminal status, and on every exit path so acquired resources never leak.
 	defer func() {
@@ -76,7 +80,7 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 			err = errors.Join(err, td.Teardown(context.Background(), e.Status(), err))
 		}
 	}()
-	defer func() { e.finish(err) }()
+	defer func() { stampErr = e.finish(err) }()
 
 	graph := instance.Graph()
 	snapshotter, canSnapshot := instance.(workflows.Snapshotter)
@@ -239,8 +243,10 @@ func (e *engine) Kill() error {
 // finish stamps the run's durable outcome: killed stays killed, an errored run
 // is stamped failed (still recoverable from its last checkpoint), a clean one
 // done. The record is never deleted here; removal is consumer-driven. The
-// stamp uses a background context so it lands even after a kill's cancellation.
-func (e *engine) finish(runErr error) {
+// stamp uses a background context so it lands even after a kill's cancellation;
+// a stamp failure is returned so the run surfaces it rather than silently
+// reporting a durable outcome that never landed.
+func (e *engine) finish(runErr error) error {
 	e.mu.Lock()
 	if e.state != workflows.StatusKilled {
 		if runErr != nil {
@@ -254,7 +260,10 @@ func (e *engine) finish(runErr error) {
 	e.mu.Unlock()
 
 	if e.repo == nil {
-		return
+		return nil
 	}
-	_ = e.repo.MarkTerminal(context.Background(), e.deps.TaskID, string(outcome), output)
+	if err := e.repo.MarkTerminal(context.Background(), e.deps.TaskID, string(outcome), output); err != nil {
+		return fmt.Errorf("mark terminal: %w", err)
+	}
+	return nil
 }

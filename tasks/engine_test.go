@@ -106,6 +106,9 @@ type fakeStore struct {
 	terminalSet    bool
 	terminalOutput []byte
 	saveErr        func(state workflows.State) error
+	// terminalErr, when set, fails MarkTerminal without recording the stamp,
+	// simulating a store outage at the terminal write.
+	terminalErr error
 }
 
 func (f *fakeStore) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
@@ -121,6 +124,9 @@ func (f *fakeStore) SaveCheckpoint(ctx context.Context, id, status, state string
 func (f *fakeStore) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.terminalErr != nil {
+		return f.terminalErr
+	}
 	f.terminal = workflows.Status(outcome)
 	f.terminalSet = true
 	// append to a nil slice preserves nil, so "no output" stays distinguishable.
@@ -749,6 +755,31 @@ func TestOutputErrorAbortsRun(t *testing.T) {
 	err := e.Execute(context.Background(), nil)
 	if err == nil || !strings.Contains(err.Error(), "marshal failed") {
 		t.Fatalf("Execute err = %v, want output failure surfaced", err)
+	}
+}
+
+// TestTerminalStampFailureSurfaced verifies a run whose terminal stamp cannot
+// be persisted returns the failure instead of swallowing it — otherwise the
+// caller reports success while the store still says running, and a restart
+// would re-execute completed work. The harvested output is still handed back:
+// the workflow itself finished.
+func TestTerminalStampFailureSurfaced(t *testing.T) {
+	want := []byte(`{"orderID":"order-1"}`)
+	store := &fakeStore{terminalErr: errors.New("store down")}
+	task, err := createTask(outputWorkflow{output: want}, nil, nil, store)
+	if err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+
+	got, err := task.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "store down") {
+		t.Fatalf("Start err = %v, want the stamp failure surfaced", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("Start output = %q, want %q alongside the error", got, want)
+	}
+	if task.Status() != workflows.StatusDone {
+		t.Fatalf("status = %q, want done (the workflow itself completed)", task.Status())
 	}
 }
 
