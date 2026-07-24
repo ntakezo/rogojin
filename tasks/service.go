@@ -45,7 +45,8 @@ type Service interface {
 	// CreateTask validates input and returns a new unstarted Task of the workflow.
 	CreateTask(ctx context.Context, workflowID string, input any) (Task, error)
 	// RecoverTask rehydrates a persisted task and returns it unstarted, or the
-	// live task if it is already running.
+	// live task if it is already running. A task that never checkpointed is
+	// returned but cannot be started; its Start fails with ErrNoCheckpoint.
 	RecoverTask(ctx context.Context, id string) (Task, error)
 	// RecoverAll rehydrates every persisted task and returns them unstarted,
 	// terminal ones included. The caller decides what to Start.
