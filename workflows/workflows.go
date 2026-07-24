@@ -103,10 +103,14 @@ const (
 	StatusRunning    Status = "running"
 	StatusSuspended  Status = "suspended"
 	StatusKilled     Status = "killed"
-	StatusDone       Status = "done"
+	// StatusFailed stamps a run that exited with an error. It is not terminal:
+	// the last good checkpoint stands, so the task can be recovered and retried.
+	StatusFailed Status = "failed"
+	StatusDone   Status = "done"
 )
 
-// Terminal reports whether the status is an end-of-life outcome (done or killed).
+// Terminal reports whether the status is an end-of-life outcome (done or
+// killed). A failed run is not terminal; it remains recoverable.
 func (s Status) Terminal() bool {
 	return s == StatusDone || s == StatusKilled
 }
