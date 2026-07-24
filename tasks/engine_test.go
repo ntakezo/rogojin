@@ -247,7 +247,7 @@ func TestRehydrateResumesFromStartState(t *testing.T) {
 	recoverStore := &fakeStore{}
 	engine := newEngine(recovered, workflows.Deps{TaskID: "task-1"}, recoverStore)
 
-	if err := engine.Rehydrate(context.Background(), snapshot, s2); err != nil {
+	if err := engine.Rehydrate(context.Background(), snapshot, s2, false); err != nil {
 		t.Fatalf("Rehydrate: %v", err)
 	}
 
@@ -273,7 +273,7 @@ func TestRehydrateNonPersistableWorkflowErrors(t *testing.T) {
 	var log []workflows.State
 	engine := newEngine(bareWorkflow{log: &log}, workflows.Deps{TaskID: "task-1"}, &fakeStore{})
 
-	err := engine.Rehydrate(context.Background(), []byte(`{}`), s2)
+	err := engine.Rehydrate(context.Background(), []byte(`{}`), s2, false)
 	if err == nil {
 		t.Fatal("Rehydrate on non-persistable workflow: want error, got nil")
 	}
@@ -297,7 +297,7 @@ func TestRehydrateIsNoOpOnceStarted(t *testing.T) {
 	}
 	before := len(log)
 
-	if err := engine.Rehydrate(context.Background(), store.snapshotFor(s2), s2); err != nil {
+	if err := engine.Rehydrate(context.Background(), store.snapshotFor(s2), s2, false); err != nil {
 		t.Fatalf("Rehydrate after completion: %v", err)
 	}
 	if len(log) != before {
@@ -417,6 +417,45 @@ func TestSuspendPersistsDurableCheckpoint(t *testing.T) {
 	}
 	if !store.terminalSet || store.terminal != workflows.StatusDone {
 		t.Fatalf("terminal = %q (set=%v), want done", store.terminal, store.terminalSet)
+	}
+}
+
+// TestRecoveredSuspendedTaskStartsPaused verifies a task recovered from a
+// suspended checkpoint starts parked at its resume state instead of running —
+// the durable suspend must survive the crash it was persisted for, or recovery
+// silently overrides an operator's pause. Resume continues where it left off.
+func TestRecoveredSuspendedTaskStartsPaused(t *testing.T) {
+	var log []workflows.State
+	store := &fakeStore{}
+	snapshot, err := json.Marshal(testSnapshot{Visited: 1})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusSuspended, nil, store)
+
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(context.Background()); done <- serr }()
+
+	// The engine must come up parked: live (started) but suspended, no state run.
+	waitFor(t, func() bool { return task.IsRunning() && task.Status() == workflows.StatusSuspended })
+	if len(log) != 0 {
+		t.Fatalf("states ran while parked: %v", log)
+	}
+
+	if err := task.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start after resume: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("task did not complete after resume")
+	}
+
+	if !reflect.DeepEqual(log, []workflows.State{s2, s3}) {
+		t.Fatalf("states = %v, want [s2 s3] (resumed at the suspend point)", log)
 	}
 }
 
@@ -645,7 +684,7 @@ func TestCheckpointFailureAbortsRun(t *testing.T) {
 	}
 	var resumedLog []workflows.State
 	resumed := newEngine(&testWorkflow{log: &resumedLog}, workflows.Deps{TaskID: "task-1"}, &fakeStore{})
-	if err := resumed.Rehydrate(context.Background(), snapshot, s1); err != nil {
+	if err := resumed.Rehydrate(context.Background(), snapshot, s1, false); err != nil {
 		t.Fatalf("Rehydrate after checkpoint failure: %v", err)
 	}
 	if !reflect.DeepEqual(resumedLog, []workflows.State{s1, s2, s3}) {
