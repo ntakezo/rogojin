@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/ntakezo/rogojin/comms"
@@ -61,5 +62,43 @@ func TestNilRepositoryRecoverTaskErrors(t *testing.T) {
 
 	if _, err := svc.RecoverTask(context.Background(), "missing"); err == nil {
 		t.Fatal("RecoverTask with nil repository: want error, got nil")
+	}
+}
+
+// recordStore is a fakeStore that recovers a canned record, standing in for a
+// repository holding one persisted task.
+type recordStore struct {
+	fakeStore
+	record Record
+}
+
+func (r *recordStore) RecoverTask(ctx context.Context, id string) (Record, error) {
+	return r.record, nil
+}
+
+// TestRecoverNeverCheckpointedTaskFailsLoud verifies a task that was created
+// but never checkpointed recovers into a task whose Start fails with
+// ErrNoCheckpoint. Its input was never persisted, so nothing can actually
+// resume; a cryptic state error — or silently rerunning — would both lie about
+// what recovery can do. Durability begins at the first checkpoint.
+func TestRecoverNeverCheckpointedTaskFailsLoud(t *testing.T) {
+	var log []workflows.State
+	store := &recordStore{record: Record{ID: "t1", WorkflowID: "test"}}
+	svc := NewService(store, comms.NewBus())
+	wf := &testWorkflow{log: &log}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+
+	task, err := svc.RecoverTask(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+
+	if _, err := task.Start(context.Background()); !errors.Is(err, ErrNoCheckpoint) {
+		t.Fatalf("Start err = %v, want ErrNoCheckpoint", err)
+	}
+	if len(log) != 0 {
+		t.Fatalf("no states should have run, got %v", log)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"embed"
 	"fmt"
 	"go/format"
+	"go/token"
 	"os"
 	"path"
 	"path/filepath"
@@ -75,6 +76,11 @@ func (o Options) Validate() error {
 	}
 	if o.Package == "" {
 		return fmt.Errorf("workflow name %q has no valid package identifier", o.Name)
+	}
+	// A keyword fails compilation and "main" cannot be imported; both would
+	// otherwise surface as a confusing format error over the rendered source.
+	if token.IsKeyword(o.Package) || o.Package == "main" {
+		return fmt.Errorf("workflow name %q yields package %q, which is not usable as an importable package name — choose another name", o.Name, o.Package)
 	}
 	if o.Durable && !o.TaskPersist {
 		return fmt.Errorf("a durable workflow needs task persistence: a nil task repository never writes the snapshots the durability hooks produce — pass --no-durable too")

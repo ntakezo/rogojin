@@ -106,6 +106,9 @@ type fakeStore struct {
 	terminalSet    bool
 	terminalOutput []byte
 	saveErr        func(state workflows.State) error
+	// terminalErr, when set, fails MarkTerminal without recording the stamp,
+	// simulating a store outage at the terminal write.
+	terminalErr error
 }
 
 func (f *fakeStore) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
@@ -121,6 +124,9 @@ func (f *fakeStore) SaveCheckpoint(ctx context.Context, id, status, state string
 func (f *fakeStore) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.terminalErr != nil {
+		return f.terminalErr
+	}
 	f.terminal = workflows.Status(outcome)
 	f.terminalSet = true
 	// append to a nil slice preserves nil, so "no output" stays distinguishable.
@@ -241,7 +247,7 @@ func TestRehydrateResumesFromStartState(t *testing.T) {
 	recoverStore := &fakeStore{}
 	engine := newEngine(recovered, workflows.Deps{TaskID: "task-1"}, recoverStore)
 
-	if err := engine.Rehydrate(context.Background(), snapshot, s2); err != nil {
+	if err := engine.Rehydrate(context.Background(), snapshot, s2, false); err != nil {
 		t.Fatalf("Rehydrate: %v", err)
 	}
 
@@ -267,7 +273,7 @@ func TestRehydrateNonPersistableWorkflowErrors(t *testing.T) {
 	var log []workflows.State
 	engine := newEngine(bareWorkflow{log: &log}, workflows.Deps{TaskID: "task-1"}, &fakeStore{})
 
-	err := engine.Rehydrate(context.Background(), []byte(`{}`), s2)
+	err := engine.Rehydrate(context.Background(), []byte(`{}`), s2, false)
 	if err == nil {
 		t.Fatal("Rehydrate on non-persistable workflow: want error, got nil")
 	}
@@ -291,7 +297,7 @@ func TestRehydrateIsNoOpOnceStarted(t *testing.T) {
 	}
 	before := len(log)
 
-	if err := engine.Rehydrate(context.Background(), store.snapshotFor(s2), s2); err != nil {
+	if err := engine.Rehydrate(context.Background(), store.snapshotFor(s2), s2, false); err != nil {
 		t.Fatalf("Rehydrate after completion: %v", err)
 	}
 	if len(log) != before {
@@ -414,6 +420,90 @@ func TestSuspendPersistsDurableCheckpoint(t *testing.T) {
 	}
 }
 
+// TestRecoveredSuspendedTaskStartsPaused verifies a task recovered from a
+// suspended checkpoint starts parked at its resume state instead of running —
+// the durable suspend must survive the crash it was persisted for, or recovery
+// silently overrides an operator's pause. Resume continues where it left off.
+func TestRecoveredSuspendedTaskStartsPaused(t *testing.T) {
+	var log []workflows.State
+	store := &fakeStore{}
+	snapshot, err := json.Marshal(testSnapshot{Visited: 1})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusSuspended, nil, store)
+
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(context.Background()); done <- serr }()
+
+	// The engine must come up parked: live (started) but suspended, no state run.
+	waitFor(t, func() bool { return task.IsRunning() && task.Status() == workflows.StatusSuspended })
+	if len(log) != 0 {
+		t.Fatalf("states ran while parked: %v", log)
+	}
+
+	if err := task.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start after resume: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("task did not complete after resume")
+	}
+
+	if !reflect.DeepEqual(log, []workflows.State{s2, s3}) {
+		t.Fatalf("states = %v, want [s2 s3] (resumed at the suspend point)", log)
+	}
+}
+
+// TestRecoveredTerminalTaskRefusesStart verifies a task recovered with a
+// terminal outcome cannot be started again: MarkTerminal leaves state and
+// snapshot in place, so a permissive Start would silently re-execute the final
+// state — duplicating real-world side effects — and overwrite the stamp.
+func TestRecoveredTerminalTaskRefusesStart(t *testing.T) {
+	snapshot, err := json.Marshal(testSnapshot{Visited: 2})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	for _, status := range []workflows.Status{workflows.StatusDone, workflows.StatusKilled} {
+		var log []workflows.State
+		task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s3, status, nil, &fakeStore{})
+
+		if _, err := task.Start(context.Background()); !errors.Is(err, ErrAlreadyTerminal) {
+			t.Fatalf("Start on recovered %q task: err = %v, want ErrAlreadyTerminal", status, err)
+		}
+		if len(log) != 0 {
+			t.Fatalf("recovered %q task ran states: %v", status, log)
+		}
+	}
+}
+
+// TestRecoveredFailedTaskRetries verifies a failed task is not terminal: it
+// recovers and retries from its last checkpoint, which is the whole point of
+// stamping failure separately from completion.
+func TestRecoveredFailedTaskRetries(t *testing.T) {
+	snapshot, err := json.Marshal(testSnapshot{Visited: 1})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	var log []workflows.State
+	store := &fakeStore{}
+	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusFailed, nil, store)
+
+	if _, err := task.Start(context.Background()); err != nil {
+		t.Fatalf("Start on recovered failed task: %v", err)
+	}
+	if !reflect.DeepEqual(log, []workflows.State{s2, s3}) {
+		t.Fatalf("states = %v, want [s2 s3] (retried from the checkpoint)", log)
+	}
+	if store.terminal != workflows.StatusDone {
+		t.Fatalf("terminal = %q, want done after a successful retry", store.terminal)
+	}
+}
+
 // teardownRecorder captures Teardown invocations so tests can assert when and
 // with what the engine called it. result is what Teardown returns.
 type teardownRecorder struct {
@@ -505,10 +595,9 @@ func TestTeardownRunsOnCompletion(t *testing.T) {
 	}
 }
 
-// TestTeardownRunsOnHandlerError verifies a failed run still tears down and
-// receives the run error, because resources must not leak on failure and the
-// error is what distinguishes failure from clean completion (the engine stamps
-// non-killed exits done either way).
+// TestTeardownRunsOnHandlerError verifies a failed run still tears down,
+// receives the run error, and observes the failed status — resources must not
+// leak on failure, and teardown must be able to tell failure from completion.
 func TestTeardownRunsOnHandlerError(t *testing.T) {
 	rec := &teardownRecorder{}
 	engine := newEngine(&teardownWorkflow{rec: rec, failAt: s2}, workflows.Deps{TaskID: "task-1"}, nil)
@@ -525,8 +614,30 @@ func TestTeardownRunsOnHandlerError(t *testing.T) {
 	if runErr == nil || !strings.Contains(runErr.Error(), "handler failed") {
 		t.Fatalf("teardown runErr = %v, want the handler failure", runErr)
 	}
-	if status != workflows.StatusDone {
-		t.Fatalf("teardown status = %q, want done (engine stamps non-killed exits done)", status)
+	if status != workflows.StatusFailed {
+		t.Fatalf("teardown status = %q, want failed", status)
+	}
+}
+
+// TestHandlerErrorStampsFailed verifies an errored run is durably stamped
+// failed, not done — a consumer reading the store after a restart must be able
+// to tell a run that broke from one that finished, and a failed task must stay
+// recoverable from its last checkpoint rather than look complete.
+func TestHandlerErrorStampsFailed(t *testing.T) {
+	store := &fakeStore{}
+	e := newEngine(outputWorkflow{failRun: true}, workflows.Deps{TaskID: "task-1"}, store)
+
+	if err := e.Execute(context.Background(), nil); err == nil {
+		t.Fatal("Execute: want run error, got nil")
+	}
+	if e.Status() != workflows.StatusFailed {
+		t.Fatalf("status = %q, want failed", e.Status())
+	}
+	if !store.terminalSet || store.terminal != workflows.StatusFailed {
+		t.Fatalf("stamped outcome = %q (set=%v), want failed", store.terminal, store.terminalSet)
+	}
+	if store.terminal.Terminal() {
+		t.Fatal("failed must not be terminal: the task is still recoverable")
 	}
 }
 
@@ -572,6 +683,30 @@ func TestTeardownRunsOnKill(t *testing.T) {
 	}
 }
 
+// TestKillBeforeStartLatches verifies a kill delivered before Start is not
+// lost: the race between an operator's kill and a scheduler's Start must
+// resolve to the kill, or the task runs right after being told to die.
+func TestKillBeforeStartLatches(t *testing.T) {
+	var log []workflows.State
+	task, err := createTask(&testWorkflow{log: &log}, nil, nil, &fakeStore{})
+	if err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+
+	if err := task.Kill(); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if _, err := task.Start(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start after kill: err = %v, want context.Canceled", err)
+	}
+	if len(log) != 0 {
+		t.Fatalf("states ran after a pre-start kill: %v", log)
+	}
+	if task.Status() != workflows.StatusKilled {
+		t.Fatalf("status = %q, want killed", task.Status())
+	}
+}
+
 // TestTeardownErrorSurfaced verifies a teardown failure is returned to the
 // caller rather than swallowed, because a leaked resource must be visible.
 func TestTeardownErrorSurfaced(t *testing.T) {
@@ -605,6 +740,10 @@ func TestCheckpointFailureAbortsRun(t *testing.T) {
 	if !reflect.DeepEqual(log, []workflows.State{s1}) {
 		t.Fatalf("states = %v, want [s1] (aborted before s2's handler)", log)
 	}
+	// The aborted run must stamp failed, not done: the task is unfinished.
+	if store.terminal != workflows.StatusFailed {
+		t.Fatalf("stamped outcome = %q, want failed", store.terminal)
+	}
 
 	// The last good checkpoint (s2's resume point was never saved, s1's was)
 	// still resumes the task: rehydrate from it and run to completion.
@@ -614,7 +753,7 @@ func TestCheckpointFailureAbortsRun(t *testing.T) {
 	}
 	var resumedLog []workflows.State
 	resumed := newEngine(&testWorkflow{log: &resumedLog}, workflows.Deps{TaskID: "task-1"}, &fakeStore{})
-	if err := resumed.Rehydrate(context.Background(), snapshot, s1); err != nil {
+	if err := resumed.Rehydrate(context.Background(), snapshot, s1, false); err != nil {
 		t.Fatalf("Rehydrate after checkpoint failure: %v", err)
 	}
 	if !reflect.DeepEqual(resumedLog, []workflows.State{s1, s2, s3}) {
@@ -724,6 +863,31 @@ func TestOutputErrorAbortsRun(t *testing.T) {
 	err := e.Execute(context.Background(), nil)
 	if err == nil || !strings.Contains(err.Error(), "marshal failed") {
 		t.Fatalf("Execute err = %v, want output failure surfaced", err)
+	}
+}
+
+// TestTerminalStampFailureSurfaced verifies a run whose terminal stamp cannot
+// be persisted returns the failure instead of swallowing it — otherwise the
+// caller reports success while the store still says running, and a restart
+// would re-execute completed work. The harvested output is still handed back:
+// the workflow itself finished.
+func TestTerminalStampFailureSurfaced(t *testing.T) {
+	want := []byte(`{"orderID":"order-1"}`)
+	store := &fakeStore{terminalErr: errors.New("store down")}
+	task, err := createTask(outputWorkflow{output: want}, nil, nil, store)
+	if err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+
+	got, err := task.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "store down") {
+		t.Fatalf("Start err = %v, want the stamp failure surfaced", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("Start output = %q, want %q alongside the error", got, want)
+	}
+	if task.Status() != workflows.StatusDone {
+		t.Fatalf("status = %q, want done (the workflow itself completed)", task.Status())
 	}
 }
 
