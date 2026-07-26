@@ -20,7 +20,10 @@ func (t Topic[T]) Emit(ctx context.Context, v T) error {
 	return t.bus.Publish(ctx, t.name, v)
 }
 
-// On subscribes to the topic. Receivers assert payloads back to T.
+// On subscribes to the topic. Receivers assert payloads back to T. Delivery is
+// at-most-once: a subscriber that falls behind its buffer loses payloads, so
+// coordination that blocks on a single message must size the bus buffer for
+// the topic's burstiness or tolerate loss.
 func (t Topic[T]) On(ctx context.Context) (Subscription, error) {
 	return t.bus.Subscribe(ctx, t.name)
 }
