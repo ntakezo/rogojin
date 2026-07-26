@@ -42,6 +42,19 @@ func TestValidateRejectsIncoherentCombos(t *testing.T) {
 	}
 }
 
+// TestValidateRejectsUnusablePackageNames guards names whose derived package
+// identifier cannot actually be used: Go keywords fail compilation and "main"
+// cannot be imported. Without the guard these die later as a cryptic format
+// error over the full rendered source.
+func TestValidateRejectsUnusablePackageNames(t *testing.T) {
+	for _, name := range []string{"type", "select", "func", "main", "Go!"} {
+		o := Options{Name: name, Package: PackageName(name), TaskPersist: true}
+		if err := o.Validate(); err == nil {
+			t.Errorf("Validate accepted name %q (package %q), want rejection", name, o.Package)
+		}
+	}
+}
+
 // validCombos enumerates every flag combination that survives normalization and
 // Validate, so the compile test covers the whole feature matrix.
 func validCombos() []Options {

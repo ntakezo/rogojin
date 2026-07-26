@@ -37,12 +37,13 @@ func (e *engine) Execute(ctx context.Context, input any) error {
 	if err != nil {
 		return err
 	}
-	return e.run(ctx, instance, nil)
+	return e.run(ctx, instance, nil, false)
 }
 
-// Rehydrate rebuilds an instance from a snapshot and runs it from start.
-// It is a no-op if the engine has already started.
-func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows.State) error {
+// Rehydrate rebuilds an instance from a snapshot and runs it from start. With
+// suspended set it parks before start instead, honoring a persisted suspend
+// until Resume or Kill. It is a no-op if the engine has already started.
+func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows.State, suspended bool) error {
 	pw, ok := e.workflow.(workflows.PersistableWorkflow)
 	if !ok {
 		return fmt.Errorf("workflow %s is not persistable", e.workflow.ID())
@@ -51,24 +52,38 @@ func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows
 	if err != nil {
 		return err
 	}
-	return e.run(ctx, instance, &start)
+	return e.run(ctx, instance, &start, suspended)
 }
 
 // run drives the instance from start (or the graph's initial state when start
 // is nil) until completion, error, or kill, stamping the durable terminal
-// outcome on exit.
-func (e *engine) run(ctx context.Context, instance workflows.Instance, start *workflows.State) (err error) {
+// outcome on exit. With suspended set it begins parked at start, so a recovered
+// suspend resumes paused exactly where it left off.
+func (e *engine) run(ctx context.Context, instance workflows.Instance, start *workflows.State, suspended bool) (err error) {
 	e.mu.Lock()
 	if e.state != workflows.StatusNotStarted {
+		// a kill latched before the first Start wins: the task never runs.
+		killed := e.state == workflows.StatusKilled
 		e.mu.Unlock()
+		if killed {
+			return context.Canceled
+		}
 		return nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
-	e.state = workflows.StatusRunning
+	if suspended {
+		e.state = workflows.StatusSuspended
+	} else {
+		e.state = workflows.StatusRunning
+	}
 	e.mu.Unlock()
 
 	defer cancel()
+	// A stamp failure joins the returned error only after teardown runs, so
+	// teardown sees the workflow's own error, not the persistence failure.
+	var stampErr error
+	defer func() { err = errors.Join(err, stampErr) }()
 	// teardown runs after finish (defers are LIFO) so it observes the stamped
 	// terminal status, and on every exit path so acquired resources never leak.
 	defer func() {
@@ -76,7 +91,7 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 			err = errors.Join(err, td.Teardown(context.Background(), e.Status(), err))
 		}
 	}()
-	defer e.finish()
+	defer func() { stampErr = e.finish(err) }()
 
 	graph := instance.Graph()
 	snapshotter, canSnapshot := instance.(workflows.Snapshotter)
@@ -223,12 +238,16 @@ func (e *engine) Resume() error {
 	return nil
 }
 
-// Kill cancels the engine immediately, interrupting the in-flight state.
-// No-op unless running or suspended.
+// Kill cancels the engine immediately, interrupting the in-flight state. A
+// kill before Start latches so a later Start refuses to run. No-op once
+// terminal.
 func (e *engine) Kill() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.state == workflows.StatusRunning || e.state == workflows.StatusSuspended {
+	switch e.state {
+	case workflows.StatusNotStarted:
+		e.state = workflows.StatusKilled
+	case workflows.StatusRunning, workflows.StatusSuspended:
 		e.state = workflows.StatusKilled
 		e.cancel()
 		e.cond.Signal() // wake a suspended loop so it observes the kill
@@ -236,20 +255,30 @@ func (e *engine) Kill() error {
 	return nil
 }
 
-// finish moves a non-killed engine to done and stamps the durable terminal
-// outcome. The record is never deleted here; removal is consumer-driven. The
-// stamp uses a background context so it lands even after a kill's cancellation.
-func (e *engine) finish() {
+// finish stamps the run's durable outcome: killed stays killed, an errored run
+// is stamped failed (still recoverable from its last checkpoint), a clean one
+// done. The record is never deleted here; removal is consumer-driven. The
+// stamp uses a background context so it lands even after a kill's cancellation;
+// a stamp failure is returned so the run surfaces it rather than silently
+// reporting a durable outcome that never landed.
+func (e *engine) finish(runErr error) error {
 	e.mu.Lock()
 	if e.state != workflows.StatusKilled {
-		e.state = workflows.StatusDone
+		if runErr != nil {
+			e.state = workflows.StatusFailed
+		} else {
+			e.state = workflows.StatusDone
+		}
 	}
 	outcome := e.state
 	output := e.output
 	e.mu.Unlock()
 
 	if e.repo == nil {
-		return
+		return nil
 	}
-	_ = e.repo.MarkTerminal(context.Background(), e.deps.TaskID, string(outcome), output)
+	if err := e.repo.MarkTerminal(context.Background(), e.deps.TaskID, string(outcome), output); err != nil {
+		return fmt.Errorf("mark terminal: %w", err)
+	}
+	return nil
 }
