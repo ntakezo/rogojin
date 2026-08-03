@@ -30,6 +30,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ntakezo/rogojin/internal/capture"
+	"github.com/ntakezo/rogojin/internal/jsontype"
 )
 
 //go:embed templates
@@ -294,22 +295,22 @@ func newCapturedView(ident string, e capture.Entry) capturedView {
 		URL:              e.URL,
 		Headers:          e.Headers,
 		Pseudo:           e.Pseudo,
-		ResponseType:     response.goType,
+		ResponseType:     response.Expr,
 		ResponseInferred: responseTyped,
 		ResponseMedia:    media,
 	}
 
 	imports := map[string]bool{"context": true}
-	for _, path := range response.imports {
+	for _, path := range response.Imports {
 		imports[path] = true
 	}
 
 	// A typed body is marshaled from the request struct; an untyped one is sent
 	// as the captured bytes, which is exact for a body no typer understands.
 	if body, ok := requestBodyType(e); ok {
-		view.BodyType, view.BodyTyped = body.goType, true
+		view.BodyType, view.BodyTyped = body.Expr, true
 		imports["bytes"], imports["encoding/json"] = true, true
-		for _, path := range body.imports {
+		for _, path := range body.Imports {
 			imports[path] = true
 		}
 	} else if len(e.Body) > 0 {
@@ -459,7 +460,7 @@ func WriteRequest(destRoot string, o RequestOptions, force bool) (rel string, ov
 // cannot start with a digit.
 func RequestIdent(name string) string {
 	var b strings.Builder
-	for _, word := range splitWords(name) {
+	for _, word := range jsontype.SplitWords(name) {
 		r := []rune(word)
 		b.WriteString(strings.ToUpper(string(r[0])))
 		b.WriteString(string(r[1:]))
@@ -474,41 +475,11 @@ func RequestIdent(name string) string {
 // RequestFile derives a request's snake_case file base name, so "add-to-cart"
 // and "addToCart" both yield "add_to_cart".
 func RequestFile(name string) string {
-	words := splitWords(name)
+	words := jsontype.SplitWords(name)
 	for i, word := range words {
 		words[i] = strings.ToLower(word)
 	}
 	return strings.Join(words, "_")
-}
-
-// splitWords breaks a raw name into words on any run of non-alphanumeric
-// characters and on lower-to-upper transitions, so kebab, snake, and camel
-// spellings of one name all split the same way.
-func splitWords(name string) []string {
-	var words []string
-	var cur []rune
-	var prev rune
-	for _, r := range name {
-		alnum := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
-		switch {
-		case !alnum:
-			if len(cur) > 0 {
-				words = append(words, string(cur))
-				cur = nil
-			}
-		default:
-			if len(cur) > 0 && prev >= 'a' && prev <= 'z' && r >= 'A' && r <= 'Z' {
-				words = append(words, string(cur))
-				cur = nil
-			}
-			cur = append(cur, r)
-		}
-		prev = r
-	}
-	if len(cur) > 0 {
-		words = append(words, string(cur))
-	}
-	return words
 }
 
 // PackageName derives a valid Go package identifier from a workflow name: it
