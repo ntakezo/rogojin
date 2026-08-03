@@ -24,11 +24,13 @@ func (c *Context) SubmitCheckout(ctx context.Context) (*workflows.State, error) 
 	}
 
 	res, err := requests.SubmitCheckout(ctx, client, requests.SubmitCheckoutRequest{
-		URL:     base + "/checkout",
-		CartID:  c.running.cartID,
-		Email:   c.static.Profile.Email,
-		Name:    c.static.Profile.Name,
-		Address: c.static.Profile.Address,
+		URL: base + "/checkout",
+		Body: requests.SubmitCheckoutBody{
+			CartID:  c.running.cartID,
+			Email:   c.static.Profile.Email,
+			Name:    c.static.Profile.Name,
+			Address: c.static.Profile.Address,
+		},
 	})
 	if err != nil {
 		return nil, err

@@ -69,7 +69,9 @@ func main() {
 	}
 {{- end}}
 
-	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://example.com"})
+	// A fingerprinting endpoint, so the first run reports back how the site saw
+	// the request. Point it at your own target.
+	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://tls.peet.ws/api/all"})
 	if err != nil {
 		log.Fatal(err)
 	}

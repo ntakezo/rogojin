@@ -7,13 +7,13 @@ import (
 	"github.com/ntakezo/rogojin/workflows"
 )
 
-// Process handles the fetched body and completes the task by returning a nil
-// next state. Replace the body with your own terminal logic, or return
-// workflows.Next(someState) to advance to another state instead.
+// Process reports what the fetch state recorded and completes the task by
+// returning a nil next state. Replace the body with your own terminal logic, or
+// return workflows.Next(someState) to advance to another state instead.
 func (c *Context) Process(ctx context.Context) (*workflows.State, error) {
-	fmt.Printf("fetched %d bytes from %s\n", len(c.r.body), c.input.URL)
+	fmt.Printf("%s saw %s over %s\n", c.input.URL, c.r.ip, c.r.httpVersion)
 {{- if .Output}}
-	c.r.result = Result{URL: c.input.URL, Bytes: len(c.r.body)}
+	c.r.result = Result{IP: c.r.ip, HTTPVersion: c.r.httpVersion}
 {{- end}}
 	return nil, nil
 }

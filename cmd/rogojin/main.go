@@ -3,10 +3,15 @@
 // Usage:
 //
 //	rogojin new <name> [flags]
+//	rogojin request <workflow> <name>
 //
 // Run it from inside the Go module that will own the workflow; generated imports
-// resolve against that module's path. Flags subtract features from the default
-// full scaffold:
+// resolve against that module's path. "new" writes the workflow once; "request"
+// adds a single request function to an existing one and is meant to be called
+// again for every request the workflow grows. Neither overwrites a file unless
+// "request" is passed --force, which replaces one request and nothing else.
+//
+// Flags subtract features from the default full scaffold:
 //
 //	--no-durable             omit the Snapshot/Restore recovery hooks
 //	--no-output              omit the Output result hook
@@ -16,11 +21,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
 
+	"github.com/ntakezo/rogojin/internal/capture"
 	"github.com/ntakezo/rogojin/internal/scaffold"
 )
 
@@ -33,6 +40,11 @@ func main() {
 	switch os.Args[1] {
 	case "new":
 		if err := runNew(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "rogojin: "+err.Error())
+			os.Exit(1)
+		}
+	case "request":
+		if err := runRequest(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "rogojin: "+err.Error())
 			os.Exit(1)
 		}
@@ -56,13 +68,14 @@ func runNew(args []string) error {
 	// Pull the workflow name out of the args so flags may appear on either side of
 	// it: the flag package stops at the first non-flag, and all our flags are
 	// boolean (no values to mistake the name for).
-	name, flags := splitName(args)
+	names, flags := splitPositional(fs, args)
 	if err := fs.Parse(flags); err != nil {
 		return err
 	}
-	if name == "" || fs.NArg() != 0 {
+	if len(names) != 1 {
 		return fmt.Errorf("usage: rogojin new <name> [flags]")
 	}
+	name := names[0]
 
 	opts := scaffold.Options{
 		Name:         name,
@@ -97,22 +110,90 @@ func runNew(args []string) error {
 	for _, rel := range written {
 		fmt.Printf("  %s\n", rel)
 	}
-	fmt.Printf("\nrun it with: go run ./%s/cmd/run\n", opts.Package)
+	// The generated requests package imports fhttp, so a module that has not
+	// used it before needs a tidy before the tree builds.
+	fmt.Printf("\nrun it with: go mod tidy && go run ./%s/cmd/run\n", opts.Package)
 	return nil
 }
 
-// splitName returns the first non-flag token as the workflow name and every
-// other token as flags, so the name may sit before or after the flags. It is
-// safe because all of new's flags are boolean and never consume a value.
-func splitName(args []string) (name string, flags []string) {
-	for _, a := range args {
-		if name == "" && !strings.HasPrefix(a, "-") {
-			name = a
+// runRequest adds one request file to an existing workflow. It is additive by
+// design: call it once per request as the workflow grows.
+func runRequest(args []string) error {
+	fs := flag.NewFlagSet("request", flag.ContinueOnError)
+	force := fs.Bool("force", false, "overwrite the request if it already exists")
+	entry := fs.String("entry", "", "powhttp entry id to generate the request from")
+	session := fs.String("session", "active", "powhttp session holding the entry")
+	baseURL := fs.String("powhttp", "", "powhttp data API base URL (default $POWHTTP_BASE_URL)")
+
+	names, flags := splitPositional(fs, args)
+	if err := fs.Parse(flags); err != nil {
+		return err
+	}
+	if len(names) != 2 {
+		return fmt.Errorf("usage: rogojin request <workflow> <name> [--entry <id>] [--force]")
+	}
+	opts := scaffold.NewRequestOptions(names[0], names[1])
+
+	// Without an entry the request is a stub; with one it is the captured
+	// exchange, rendered from what powhttp saw on the wire.
+	if *entry != "" {
+		captured, err := capture.NewPowHTTP(*baseURL).Entry(context.Background(), *session, *entry)
+		if err != nil {
+			return err
+		}
+		opts.Entry = &captured
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	written, overwrote, err := scaffold.WriteRequest(cwd, opts, *force)
+	if err != nil {
+		return err
+	}
+
+	verb := "scaffolded"
+	if overwrote {
+		verb = "overwrote"
+	}
+	fmt.Printf("%s request %s:\n  %s\n", verb, opts.Ident, written)
+	fmt.Printf("\ncall it from a state with: requests.%s(ctx, client, requests.%sRequest{...})\n", opts.Ident, opts.Ident)
+	return nil
+}
+
+// splitPositional separates the non-flag tokens from the flags, so the two may
+// be interleaved in any order. A flag that takes a value claims the token after
+// it, which keeps that value from being mistaken for a positional argument.
+func splitPositional(fs *flag.FlagSet, args []string) (positional, flags []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") {
+			positional = append(positional, arg)
 			continue
 		}
-		flags = append(flags, a)
+		flags = append(flags, arg)
+		if takesValue(fs, arg) && i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
 	}
-	return name, flags
+	return positional, flags
+}
+
+// takesValue reports whether arg names a defined flag whose value is the token
+// that follows it: one that is neither boolean nor already carrying an "=".
+func takesValue(fs *flag.FlagSet, arg string) bool {
+	name := strings.TrimLeft(arg, "-")
+	if strings.Contains(name, "=") {
+		return false
+	}
+	f := fs.Lookup(name)
+	if f == nil {
+		return false
+	}
+	boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return !ok || !boolFlag.IsBoolFlag()
 }
 
 func usage() {
@@ -120,12 +201,26 @@ func usage() {
 
 Usage:
   rogojin new <name> [flags]
+  rogojin request <workflow> <name> [--force]
 
-Flags:
+Commands:
+  new       scaffold a workflow package, with one request to build off of
+  request   add one request to an existing workflow; call it once per request
+
+Neither command overwrites a file, so an edited request survives a repeated
+call. Pass --force to replace one deliberately.
+
+Flags (new):
   --no-durable             omit the Snapshot/Restore recovery hooks
   --no-output              omit the Output result hook
   --no-proxy               omit per-task proxy leasing
   --no-task-persistence    run tasks in memory (nil repo) instead of SQLite
   --no-proxy-persistence   use an in-memory proxy pool instead of SQLite
+
+Flags (request):
+  --entry <id>             render from a powhttp capture instead of a stub
+  --session <id>           powhttp session holding the entry (default "active")
+  --powhttp <url>          powhttp data API address (default $POWHTTP_BASE_URL)
+  --force                  replace the request if it already exists
 `)
 }

@@ -32,7 +32,7 @@ func GetHomepage(ctx context.Context, client *http.Client, r GetHomepageRequest)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header[http.HeaderOrderKey] = []string{"Accept"}
+	req.Header.Append("Accept", "application/json")
+	req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
 	return client.Do(req)
 }

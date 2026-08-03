@@ -1,0 +1,31 @@
+# Builds the scaffolder and the examples against the newest fhttp rather than the
+# pinned one, so an upstream release that breaks the templates surfaces when it
+# ships instead of at the next dependency bump. It reports; it never gates.
+name: canary
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  latest-generated-deps:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Both modules move together, or the drift guard fails on the skew this
+      # job created rather than on anything upstream actually did.
+      - run: go get github.com/bogdanfinn/fhttp@latest
+      - run: go get github.com/bogdanfinn/fhttp@latest
+        working-directory: _examples
+
+      - name: Render and compile every flag combination
+        run: go test ./internal/scaffold/
+      - name: Build the examples
+        run: go build ./... && go vet ./...
+        working-directory: _examples
