@@ -23,10 +23,10 @@ func typeOf(t *testing.T, body string) string {
 	if !ok {
 		t.Fatalf("no type inferred from %s", body)
 	}
-	if _, err := format.Source([]byte("package p\ntype T " + res.goType)); err != nil {
-		t.Fatalf("inferred type does not format: %v\n%s", err, res.goType)
+	if _, err := format.Source([]byte("package p\ntype T " + res.Expr)); err != nil {
+		t.Fatalf("inferred type does not format: %v\n%s", err, res.Expr)
 	}
-	return strings.Join(strings.Fields(res.goType), " ")
+	return strings.Join(strings.Fields(res.Expr), " ")
 }
 
 // TestResponseTypeFromJSON pins the inference: the Go type each JSON value maps
@@ -130,11 +130,11 @@ func TestResponseTypeInfersTimestamps(t *testing.T) {
 	if !ok {
 		t.Fatal("no type inferred")
 	}
-	if !strings.Contains(res.goType, "time.Time") {
-		t.Errorf("timestamp was not typed:\n  %s", res.goType)
+	if !strings.Contains(res.Expr, "time.Time") {
+		t.Errorf("timestamp was not typed:\n  %s", res.Expr)
 	}
-	if strings.Join(res.imports, ",") != "time" {
-		t.Errorf("imports = %v, want [time]", res.imports)
+	if strings.Join(res.Imports, ",") != "time" {
+		t.Errorf("imports = %v, want [time]", res.Imports)
 	}
 }
 
@@ -157,13 +157,13 @@ func TestResponseTypeFallsBack(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			res, ok := responseType(r)
 			if ok {
-				t.Errorf("inferred a shape where none exists: %s", res.goType)
+				t.Errorf("inferred a shape where none exists: %s", res.Expr)
 			}
-			if res.goType != "struct{}" {
-				t.Errorf("fallback type = %s, want struct{}", res.goType)
+			if res.Expr != "struct{}" {
+				t.Errorf("fallback type = %s, want struct{}", res.Expr)
 			}
-			if res.imports != nil {
-				t.Errorf("fallback wants imports %v", res.imports)
+			if res.Imports != nil {
+				t.Errorf("fallback wants imports %v", res.Imports)
 			}
 		})
 	}
