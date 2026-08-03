@@ -1,18 +1,17 @@
 package states
 
 import (
-{{- if .Proxy}}
 	"context"
-{{- end}}
 {{- if or .Output .Durable}}
 	"encoding/json"
 {{- end}}
-{{- if .Proxy}}
 	"fmt"
-	"net/http"
+{{- if .Proxy}}
 	"net/url"
 {{- end}}
 
+	http "github.com/bogdanfinn/fhttp"
+	"github.com/bogdanfinn/fhttp/cookiejar"
 	"github.com/ntakezo/rogojin/comms"
 {{- if .Proxy}}
 	"github.com/ntakezo/rogojin/proxies"
@@ -30,8 +29,8 @@ type Input struct {
 // Result is the workflow's output, set by the terminal state and marshaled by
 // Output on clean completion. Shape it to whatever your workflow produces.
 type Result struct {
-	URL   string `json:"url"`
-	Bytes int    `json:"bytes"`
+	IP          string `json:"ip"`
+	HTTPVersion string `json:"httpVersion"`
 }
 {{- end}}
 
@@ -43,11 +42,12 @@ type running struct {
 	proxies *proxies.Manager
 	taskID  string
 	lease   *proxies.Lease
-	client  *http.Client
 {{- end}}
-	bus comms.Bus
+	client *http.Client
+	bus    comms.Bus
 
-	body string
+	ip          string
+	httpVersion string
 {{- if .Output}}
 	result Result
 {{- end}}
@@ -80,13 +80,18 @@ func (c *Context) Output() ([]byte, error) {
 	return json.Marshal(c.r.result)
 }
 {{end}}
-{{- if .Proxy}}
-// client leases a proxy and builds the HTTP client on first use, so a recovered
-// task acquires its own lease wherever in the graph it resumes.
+// client builds the task's HTTP client on first use, backed by an isolated
+// cookie jar so each task carries its own session{{if .Proxy}}. The proxy is leased here
+// too, so a recovered task acquires its own wherever in the graph it resumes{{end}}.
 func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	if c.r.client != nil {
 		return c.r.client, nil
 	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("new cookie jar: %w", err)
+	}
+{{- if .Proxy}}
 	lease, err := c.r.proxies.Acquire(ctx, c.r.taskID)
 	if err != nil {
 		return nil, fmt.Errorf("acquire proxy: %w", err)
@@ -97,10 +102,13 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		return nil, fmt.Errorf("parse proxy url: %w", err)
 	}
 	c.r.lease = lease
-	c.r.client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	c.r.client = &http.Client{Jar: jar, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+{{- else}}
+	c.r.client = &http.Client{Jar: jar}
+{{- end}}
 	return c.r.client, nil
 }
-
+{{if .Proxy}}
 // Teardown releases the task's proxy lease exactly once when the run exits,
 // reporting success on the absence of a run error.
 func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
@@ -115,14 +123,15 @@ func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr 
 // the durable running fields. Side effects (lease, client, bus) are rebuilt on
 // restore, never serialized.
 type snapshot struct {
-	Input Input  `json:"input"`
-	Body  string `json:"body"`
+	Input       Input  `json:"input"`
+	IP          string `json:"ip"`
+	HTTPVersion string `json:"httpVersion"`
 }
 
 // Snapshot serializes the durable context. The engine calls it before entering
 // each state, so it must be valid as the entry of the state it is taken before.
 func (c *Context) Snapshot() ([]byte, error) {
-	return json.Marshal(snapshot{Input: c.input, Body: c.r.body})
+	return json.Marshal(snapshot{Input: c.input, IP: c.r.ip, HTTPVersion: c.r.httpVersion})
 }
 
 // RestoreContext rebuilds a context from a JSON snapshot; the lease and client
@@ -133,7 +142,8 @@ func RestoreContext(deps workflows.Deps, blob []byte{{if .Proxy}}, manager *prox
 		return nil, err
 	}
 	c := NewContext(s.Input, deps{{if .Proxy}}, manager{{end}})
-	c.r.body = s.Body
+	c.r.ip = s.IP
+	c.r.httpVersion = s.HTTPVersion
 	return c, nil
 }
 {{- end}}

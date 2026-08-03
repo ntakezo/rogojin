@@ -24,9 +24,11 @@ func (c *Context) AddToCart(ctx context.Context) (*workflows.State, error) {
 
 	res, err := requests.AddToCart(ctx, client, requests.AddToCartRequest{
 		URL:       base + "/cart",
-		VariantID: c.running.variantID,
 		CSRFToken: c.running.csrfToken,
-		Quantity:  1,
+		Body: requests.AddToCartBody{
+			VariantID: c.running.variantID,
+			Quantity:  1,
+		},
 	})
 	if err != nil {
 		return nil, err

@@ -1,12 +1,28 @@
 package scaffold
 
 import (
+	"bufio"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/ntakezo/rogojin/internal/capture"
+
+	// The generated requests package imports fhttp, so TestGeneratedCodeCompiles
+	// needs it in this module's go.mod and go.sum to resolve. No rogojin package
+	// imports it, so without this anchor `go mod tidy` drops it and the temp
+	// modules the test builds stop compiling.
+	_ "github.com/bogdanfinn/fhttp"
 )
+
+// generatedDeps are the third-party modules the templates emit imports for.
+// The temp module in TestGeneratedCodeCompiles requires them at whatever
+// version this repo pins, so the two can never drift apart.
+var generatedDeps = []string{"github.com/bogdanfinn/fhttp"}
 
 // TestPackageName pins the identifier derivation: lowercased, non-ident
 // characters dropped, never leading with a digit.
@@ -23,6 +39,276 @@ func TestPackageName(t *testing.T) {
 	for in, want := range cases {
 		if got := PackageName(in); got != want {
 			t.Errorf("PackageName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestRequestNaming pins the two derivations a request name feeds: the exported
+// identifier its func and types are built from, and its file's base name. Kebab,
+// snake, and camel spellings of one name must land on the same pair.
+func TestRequestNaming(t *testing.T) {
+	cases := []struct{ in, ident, file string }{
+		{"add-to-cart", "AddToCart", "add_to_cart"},
+		{"add_to_cart", "AddToCart", "add_to_cart"},
+		{"addToCart", "AddToCart", "add_to_cart"},
+		{"AddToCart", "AddToCart", "add_to_cart"},
+		{"add to cart", "AddToCart", "add_to_cart"},
+		{"submit", "Submit", "submit"},
+		{"get CSRF", "GetCSRF", "get_csrf"},
+		{"checkout2", "Checkout2", "checkout2"},
+		{"2fast", "", "2fast"},
+		{"---", "", ""},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		if got := RequestIdent(c.in); got != c.ident {
+			t.Errorf("RequestIdent(%q) = %q, want %q", c.in, got, c.ident)
+		}
+		if got := RequestFile(c.in); got != c.file {
+			t.Errorf("RequestFile(%q) = %q, want %q", c.in, got, c.file)
+		}
+	}
+}
+
+// TestRequestOptionsValidate guards the names that cannot produce compiling
+// code, so they fail with a usable message rather than at format over the source.
+func TestRequestOptionsValidate(t *testing.T) {
+	valid := NewRequestOptions("checkout", "add-to-cart")
+	if err := valid.Validate(); err != nil {
+		t.Errorf("Validate rejected a usable request: %v", err)
+	}
+	for _, c := range []struct{ workflow, name string }{
+		{"", "add-to-cart"},
+		{"checkout", ""},
+		{"123", "add-to-cart"},
+		{"checkout", "2fast"},
+		{"checkout", "---"},
+	} {
+		if err := NewRequestOptions(c.workflow, c.name).Validate(); err == nil {
+			t.Errorf("Validate accepted workflow %q request %q, want rejection", c.workflow, c.name)
+		}
+	}
+}
+
+// TestWriteRequestIsAdditive is the point of the verb: repeated calls each add a
+// file, an existing request is never clobbered, and a request without a workflow
+// to live in is refused rather than left orphaned.
+func TestWriteRequestIsAdditive(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, _, err := WriteRequest(dir, NewRequestOptions("checkout", "add-to-cart"), false); err == nil {
+		t.Error("WriteRequest wrote into a module with no checkout workflow, want refusal")
+	}
+	if _, _, err := WriteRequest(dir, NewRequestOptions("checkout", "add-to-cart"), true); err == nil {
+		t.Error("force wrote into a module with no checkout workflow: force replaces a request, it does not create the workflow")
+	}
+
+	if _, err := Write(dir, "example.com/consumer", Options{
+		Name: "checkout", Package: "checkout", Output: true,
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	for _, name := range []string{"add-to-cart", "submit-checkout"} {
+		rel, overwrote, err := WriteRequest(dir, NewRequestOptions("checkout", name), false)
+		if err != nil {
+			t.Fatalf("WriteRequest(%q): %v", name, err)
+		}
+		if overwrote {
+			t.Errorf("WriteRequest(%q) reported an overwrite on a fresh file", name)
+		}
+		if want := filepath.Join("checkout", "requests", RequestFile(name)+".go"); rel != want {
+			t.Errorf("WriteRequest(%q) wrote %s, want %s", name, rel, want)
+		}
+	}
+
+	// The scaffolded fetch.go plus the two added above.
+	entries, err := os.ReadDir(filepath.Join(dir, "checkout", "requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Errorf("requests/ holds %d files, want 3", len(entries))
+	}
+
+	// A hand edit is what the refusal exists to protect, and what --force is for
+	// discarding. The camel spelling resolves to the same file, so it collides.
+	edited := filepath.Join(dir, "checkout", "requests", "add_to_cart.go")
+	generated, err := os.ReadFile(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byHand := append(generated, "\n// hand-written since generation\n"...)
+	if err := os.WriteFile(edited, byHand, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := WriteRequest(dir, NewRequestOptions("checkout", "addToCart"), false); err == nil {
+		t.Error("WriteRequest overwrote an existing request, want refusal")
+	}
+	kept, err := os.ReadFile(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(kept) != string(byHand) {
+		t.Error("a refused WriteRequest still modified the existing request")
+	}
+
+	rel, overwrote, err := WriteRequest(dir, NewRequestOptions("checkout", "addToCart"), true)
+	if err != nil {
+		t.Fatalf("forced WriteRequest: %v", err)
+	}
+	if !overwrote {
+		t.Error("forced WriteRequest over an existing request did not report an overwrite")
+	}
+	if want := filepath.Join("checkout", "requests", "add_to_cart.go"); rel != want {
+		t.Errorf("forced WriteRequest wrote %s, want %s", rel, want)
+	}
+	replaced, err := os.ReadFile(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(replaced) != string(generated) {
+		t.Error("force did not restore the request to freshly generated source")
+	}
+
+	// Force replaces one request; it must not disturb its neighbours.
+	entries, err = os.ReadDir(filepath.Join(dir, "checkout", "requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Errorf("requests/ holds %d files after a forced write, want 3", len(entries))
+	}
+}
+
+// capturedEntry is a small captured request covering what rendering has to get
+// right: pseudo-headers, repeated fields, and values full of characters that
+// would break out of a Go literal if they were interpolated raw.
+func capturedEntry() capture.Entry {
+	return capture.Entry{
+		ID:     "01TEST",
+		URL:    "https://example.com/cart?size=M&color=red",
+		Method: http.MethodPost,
+		Pseudo: []string{":method", ":authority", ":scheme", ":path"},
+		Headers: []capture.Header{
+			{Name: "sec-ch-ua", Value: `"Not;A=Brand";v="8", "Chromium";v="150"`},
+			{Name: "content-type", Value: "application/x-www-form-urlencoded"},
+			{Name: "x-weird", Value: "back\\slash\ttab\"quote"},
+			{Name: "cookie", Value: "a=1"},
+			{Name: "cookie", Value: "b=2"},
+		},
+		Body: []byte("variantID=99&quantity=1"),
+		Response: &capture.Response{
+			StatusCode: 200,
+			MediaType:  "application/json",
+			Body:       []byte(`{"cartID":"c1","itemCount":2}`),
+		},
+	}
+}
+
+// TestRenderCapturedRequest is the fidelity contract: everything the capture saw
+// reaches the source in the order it saw it, and every value survives quoting.
+func TestRenderCapturedRequest(t *testing.T) {
+	entry := capturedEntry()
+	opts := NewRequestOptions("checkout", "add-to-cart")
+	opts.Entry = &entry
+
+	rel, source, err := RenderRequest(opts)
+	if err != nil {
+		t.Fatalf("RenderRequest: %v", err)
+	}
+	if want := filepath.Join("checkout", "requests", "add_to_cart.go"); rel != want {
+		t.Errorf("rendered to %s, want %s", rel, want)
+	}
+
+	for _, want := range []string{
+		`http.MethodPost`,
+		`"https://example.com/cart?size=M&color=red"`,
+		"`variantID=99&quantity=1`",
+		`strings.NewReader(body)`,
+		`req.Header.Append("sec-ch-ua", "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\"")`,
+		`req.Header.Append("x-weird", "back\\slash\ttab\"quote")`,
+		`req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}`,
+		"Generated from powhttp entry 01TEST",
+		// The response is typed from the captured body, in the same file.
+		"type AddToCartResponse struct {",
+		"CartID    string `json:\"cartID\"`",
+		"ItemCount int64  `json:\"itemCount\"`",
+	} {
+		if !strings.Contains(source, want) {
+			t.Errorf("rendered source is missing:\n  %s\n--- got ---\n%s", want, source)
+		}
+	}
+
+	// Append records order as it goes, so the written order is the sent order —
+	// which means the source order has to match the capture exactly.
+	var appended []string
+	for _, line := range strings.Split(source, "\n") {
+		if _, name, ok := strings.Cut(strings.TrimSpace(line), `req.Header.Append("`); ok {
+			appended = append(appended, name[:strings.Index(name, `"`)])
+		}
+	}
+	want := []string{"sec-ch-ua", "content-type", "x-weird", "cookie", "cookie"}
+	if strings.Join(appended, ",") != strings.Join(want, ",") {
+		t.Errorf("appended %v, want %v", appended, want)
+	}
+}
+
+// TestRenderCapturedRequestWithoutBody keeps a bodyless request from dragging in
+// an unused strings import, which would not compile.
+func TestRenderCapturedRequestWithoutBody(t *testing.T) {
+	entry := capturedEntry()
+	entry.Body = nil
+	entry.Method = http.MethodGet
+	opts := NewRequestOptions("checkout", "get-cart")
+	opts.Entry = &entry
+
+	_, source, err := RenderRequest(opts)
+	if err != nil {
+		t.Fatalf("RenderRequest: %v", err)
+	}
+	if strings.Contains(source, `"strings"`) {
+		t.Error("a request with no body imported strings")
+	}
+	if !strings.Contains(source, "http.MethodGet, \"https://example.com/cart?size=M&color=red\", nil)") {
+		t.Errorf("expected a nil body argument, got:\n%s", source)
+	}
+}
+
+// TestGoStringLiteral pins when a body renders raw for readability and when it
+// must be quoted: raw literals silently drop carriage returns and cannot hold a
+// backtick, so a multipart or binary body has to take the quoted path.
+func TestGoStringLiteral(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"empty", "", ""},
+		{"form", "a=1&b=2", "`a=1&b=2`"},
+		{"json multiline", "{\n  \"a\": 1\n}", "`{\n  \"a\": 1\n}`"},
+		{"backtick", "a=`b`", `"a=` + "`" + `b` + "`" + `"`},
+		{"carriage return", "a\r\nb", `"a\r\nb"`},
+		{"control byte", "a\x00b", `"a\x00b"`},
+		{"invalid utf8", "a\xffb", `"a\xffb"`},
+	}
+	for _, c := range cases {
+		if got := goStringLiteral([]byte(c.in)); got != c.want {
+			t.Errorf("%s: goStringLiteral(%q) = %s, want %s", c.name, c.in, got, c.want)
+		}
+	}
+}
+
+// TestCapturedMethodRendersAsConstant keeps generated code reading like
+// hand-written code, while still carrying a method net/http does not name.
+func TestCapturedMethodRendersAsConstant(t *testing.T) {
+	for method, want := range map[string]string{
+		"GET":    "http.MethodGet",
+		"post":   "http.MethodPost",
+		"PATCH":  "http.MethodPatch",
+		"REPORT": `"REPORT"`,
+	} {
+		entry := capturedEntry()
+		entry.Method = method
+		if got := newCapturedView("X", entry).Method; got != want {
+			t.Errorf("method %q rendered as %s, want %s", method, got, want)
 		}
 	}
 }
@@ -129,6 +415,78 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compile test in short mode")
 	}
+	for _, o := range validCombos() {
+		t.Run(comboName(o), func(t *testing.T) {
+			dir := t.TempDir()
+
+			if _, err := Write(dir, "example.com/consumer", o); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			writeConsumerModule(t, dir)
+			vetModule(t, dir)
+		})
+	}
+}
+
+// TestAddedRequestsCompile extends the contract to the request verb: requests
+// added one at a time must type-check alongside the workflow they were added to,
+// however many of them there are.
+func TestAddedRequestsCompile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compile test in short mode")
+	}
+	dir := t.TempDir()
+
+	if _, err := Write(dir, "example.com/consumer", Options{
+		Name: "checkout", Package: "checkout", Output: true,
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	for _, name := range []string{"add-to-cart", "submit_checkout", "getCSRF"} {
+		if _, _, err := WriteRequest(dir, NewRequestOptions("checkout", name), false); err != nil {
+			t.Fatalf("WriteRequest(%q): %v", name, err)
+		}
+	}
+
+	// A captured request renders from a different template, so it earns its own
+	// place in the compile contract — with and without a body, since the body is
+	// what decides whether the strings import belongs.
+	withBody := capturedEntry()
+	captured := NewRequestOptions("checkout", "captured-post")
+	captured.Entry = &withBody
+	if _, _, err := WriteRequest(dir, captured, false); err != nil {
+		t.Fatalf("WriteRequest(captured): %v", err)
+	}
+
+	noBody := capturedEntry()
+	noBody.Body = nil
+	noBody.Method = http.MethodGet
+	bodyless := NewRequestOptions("checkout", "captured-get")
+	bodyless.Entry = &noBody
+	if _, _, err := WriteRequest(dir, bodyless, false); err != nil {
+		t.Fatalf("WriteRequest(captured, no body): %v", err)
+	}
+
+	// A JSON body types the request struct and marshals back out of it, which
+	// is a third shape again — and the one that imports bytes and encoding/json.
+	jsonBody := capturedEntry()
+	jsonBody.Headers = []capture.Header{{Name: "content-type", Value: "application/json"}}
+	jsonBody.Body = []byte(`{"zebra":"z","nested":{"when":"2028-07-10T00:00:00-04:00"}}`)
+	typedBody := NewRequestOptions("checkout", "captured-json")
+	typedBody.Entry = &jsonBody
+	if _, _, err := WriteRequest(dir, typedBody, false); err != nil {
+		t.Fatalf("WriteRequest(captured, json body): %v", err)
+	}
+
+	writeConsumerModule(t, dir)
+	vetModule(t, dir)
+}
+
+// writeConsumerModule gives a generated tree the go.mod and go.sum it needs to
+// build: this checkout replaced in, plus every module the templates import, at
+// the version this repo pins.
+func writeConsumerModule(t *testing.T, dir string) {
+	t.Helper()
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -138,37 +496,93 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 		t.Fatalf("read repo go.sum: %v", err)
 	}
 
-	for _, o := range validCombos() {
-		t.Run(comboName(o), func(t *testing.T) {
-			dir := t.TempDir()
+	var requires strings.Builder
+	for _, dep := range generatedDeps {
+		version, err := requiredVersion(filepath.Join(repoRoot, "go.mod"), dep)
+		if err != nil {
+			t.Fatalf("%v — the templates import it, so this module must require it", err)
+		}
+		fmt.Fprintf(&requires, "\t%s %s\n", dep, version)
+	}
 
-			if _, err := Write(dir, "example.com/consumer", o); err != nil {
-				t.Fatalf("Write: %v", err)
-			}
-
-			gomod := fmt.Sprintf(`module example.com/consumer
+	gomod := fmt.Sprintf(`module example.com/consumer
 
 go 1.25.0
 
-require github.com/ntakezo/rogojin v0.0.0
+require (
+	github.com/ntakezo/rogojin v0.0.0
+%s)
 
 replace github.com/ntakezo/rogojin => %s
-`, repoRoot)
-			if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(dir, "go.sum"), goSum, 0o644); err != nil {
-				t.Fatal(err)
-			}
-
-			cmd := exec.Command("go", "vet", "./...")
-			cmd.Dir = dir
-			cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod", "GOPROXY=off")
-			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("go vet failed for combo %s: %v\n%s", comboName(o), err, out)
-			}
-		})
+`, requires.String(), repoRoot)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
+		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "go.sum"), goSum, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// vetModule compiles every package in dir without linking binaries, so a compile
+// error fails the test while the run stays light on disk.
+func vetModule(t *testing.T, dir string) {
+	t.Helper()
+	cmd := exec.Command("go", "vet", "./...")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod", "GOPROXY=off")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go vet failed: %v\n%s", err, out)
+	}
+}
+
+// TestGeneratedDepsMatchExamples pins the two modules to the same version of
+// every dependency the templates emit imports for. They require those modules
+// independently, so nothing but this stops them drifting — and once they drift,
+// the compile test proves the templates against one version while _examples,
+// the reference the templates are kept in step with, demonstrates another.
+func TestGeneratedDepsMatchExamples(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, dep := range generatedDeps {
+		root, err := requiredVersion(filepath.Join(repoRoot, "go.mod"), dep)
+		if err != nil {
+			t.Errorf("%v — the templates import it, so this module must require it", err)
+			continue
+		}
+		examples, err := requiredVersion(filepath.Join(repoRoot, "_examples", "go.mod"), dep)
+		if err != nil {
+			t.Errorf("%v — the templates import it, so the examples must demonstrate it", err)
+			continue
+		}
+		if root != examples {
+			t.Errorf("%s: root pins %s, _examples pins %s — bump both together", dep, root, examples)
+		}
+	}
+}
+
+// requiredVersion returns the version gomod requires modulePath at, scanning the
+// require lines directly so the test needs no module-file parser.
+func requiredVersion(gomod, modulePath string) (string, error) {
+	f, err := os.Open(gomod)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(strings.TrimPrefix(strings.TrimSpace(scanner.Text()), "require "))
+		if len(fields) >= 2 && fields[0] == modulePath {
+			return fields[1], nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("%s requires no %s", gomod, modulePath)
 }
 
 func comboName(o Options) string {

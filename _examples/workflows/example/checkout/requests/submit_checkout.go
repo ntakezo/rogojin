@@ -8,10 +8,15 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 )
 
-// SubmitCheckoutRequest finalizes the order. URL is excluded from the body; the
-// remaining fields marshal directly into the JSON payload the endpoint expects.
+// SubmitCheckoutRequest finalizes the order. Only Body is marshaled, so URL —
+// and anything else added here — cannot reach the payload.
 type SubmitCheckoutRequest struct {
-	URL     string `json:"-"`
+	URL  string
+	Body SubmitCheckoutBody
+}
+
+// SubmitCheckoutBody is the JSON payload the checkout endpoint expects.
+type SubmitCheckoutBody struct {
 	CartID  string `json:"cartID"`
 	Email   string `json:"email"`
 	Name    string `json:"name"`
@@ -26,7 +31,7 @@ type SubmitCheckoutResponse struct {
 
 // SubmitCheckout posts the cart id and buyer profile as a JSON body to place the order.
 func SubmitCheckout(ctx context.Context, client *http.Client, r SubmitCheckoutRequest) (*http.Response, error) {
-	body, err := json.Marshal(r)
+	body, err := json.Marshal(r.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -34,6 +39,7 @@ func SubmitCheckout(ctx context.Context, client *http.Client, r SubmitCheckoutRe
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Append("Content-Type", "application/json")
+	req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
 	return client.Do(req)
 }

@@ -2,36 +2,32 @@ package states
 
 import (
 	"context"
-	"io"
-	"net/http"
+	"encoding/json"
 
 	"github.com/ntakezo/rogojin/workflows"
+	"{{.ModulePath}}/{{.Package}}/requests"
 )
 
-// Fetch retrieves the input URL and stores the body for the next state. It is
-// the graph's initial state.
+// Fetch calls the fetch request and records how the server saw us. It is the
+// graph's initial state.
 func (c *Context) Fetch(ctx context.Context) (*workflows.State, error) {
-{{- if .Proxy}}
 	client, err := c.client(ctx)
 	if err != nil {
 		return nil, err
 	}
-{{- else}}
-	client := http.DefaultClient
-{{- end}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.input.URL, nil)
-	if err != nil {
-		return nil, err
-	}
-	res, err := client.Do(req)
+
+	res, err := requests.Fetch(ctx, client, requests.FetchRequest{URL: c.input.URL})
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
+
+	var body requests.FetchResponse
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		return nil, err
 	}
-	c.r.body = string(body)
+	c.r.ip = body.IP
+	c.r.httpVersion = body.HTTPVersion
+
 	return workflows.Next(process), nil
 }

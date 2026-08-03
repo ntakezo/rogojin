@@ -50,10 +50,48 @@ Generate a runnable skeleton from inside your module:
 ```sh
 go install github.com/ntakezo/rogojin/cmd/rogojin@latest
 rogojin new checkout
+go mod tidy
 go run ./checkout/cmd/run
 ```
 
 `rogojin new <name>` emits a full workflow package wired onto a SQLite-backed task service; flags like `--no-proxy`, `--no-durable`, and `--no-task-persistence` subtract the pieces you don't need.
+
+Each request the workflow makes is one file under `<name>/requests/`, holding a pure function a state calls. `new` writes the first; add the rest one at a time, as you find them:
+
+```sh
+rogojin request checkout add-to-cart
+rogojin request checkout submit-checkout
+```
+
+Neither command overwrites a file, so a request you have edited survives a repeated call. Pass `--force` to replace one deliberately.
+
+Point `request` at a [powhttp](https://powhttp.com) capture and it writes the exchange as it actually happened — same URL, same header and pseudo-header order, same body bytes:
+
+```sh
+rogojin request checkout add-to-cart --entry 01KYWPK8JH135M795ME2G8ACZQ
+```
+
+`--session` selects the capture session (default `active`) and `--powhttp` the data API address (default `$POWHTTP_BASE_URL`, then `http://localhost:7777`).
+
+A JSON request body is typed too, as its own `XBody` type reached through the request's `Body` field, with fields in the order the capture sent them — so setting a value is a struct field rather than an edit inside a string literal. Because only `Body` is marshaled, a URL or header value you add alongside it cannot end up in the payload. Bodies of any other kind keep their captured bytes verbatim.
+
+The response is typed the same way, in the same file — a JSON reply becomes the struct the state unmarshals into:
+
+```go
+type SearchResponse struct {
+	Products []struct {
+		Name     string `json:"name"`
+		ImageURL string `json:"imageUrl"`
+	} `json:"products"`
+	TotalResults int64 `json:"totalResults"`
+}
+```
+
+A response with no shape to infer — HTML, an image, a body that does not match its content type — gets an empty struct and a comment saying why.
+
+Every request value arrives as the captured literal, including the ones that only held for that session: cookies, tokens, nonces. Rewrite those into `Request` fields before the workflow depends on them. What the capture buys you is that the static half — the URL, the header and pseudo-header order, the body bytes, the response shape — is right the first time.
+
+Generated requests are built on [fhttp](https://github.com/bogdanfinn/fhttp), which sends headers and HTTP/2 pseudo-headers in the order you give it. `go mod tidy` resolves it to the version rogojin pins and tests its templates against; run `go get github.com/bogdanfinn/fhttp@latest` in your module to move ahead of that.
 
 ### Run the example
 

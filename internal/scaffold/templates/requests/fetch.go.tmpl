@@ -1,0 +1,40 @@
+// Package requests holds this workflow's request functions, one per file. Each
+// is pure: given a client and a typed request struct it fires exactly one HTTP
+// call and returns the raw response, leaving decode and body-close to the state
+// that called it. The exported response struct is the shape that raw body
+// unmarshals into.
+package requests
+
+import (
+	"context"
+
+	http "github.com/bogdanfinn/fhttp"
+)
+
+// FetchRequest is the input to Fetch: the URL to retrieve.
+type FetchRequest struct {
+	URL string
+}
+
+// FetchResponse is the fingerprint payload the endpoint returns, reporting how
+// the server saw the request that asked for it.
+type FetchResponse struct {
+	IP          string `json:"ip"`
+	HTTPVersion string `json:"http_version"`
+	Method      string `json:"method"`
+	UserAgent   string `json:"user_agent"`
+}
+
+// Fetch retrieves the URL as JSON. Append writes each header and records its
+// place in the order fhttp sends them in; the pseudo-header order is pinned
+// separately, and leaving it unset misroutes some HTTP/2 servers outright.
+func Fetch(ctx context.Context, client *http.Client, r FetchRequest) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Append("Accept", "application/json")
+	req.Header.Append("Accept-Language", "en-US,en;q=0.9")
+	req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
+	return client.Do(req)
+}

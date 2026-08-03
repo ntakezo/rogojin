@@ -1,0 +1,21 @@
+version: 2
+
+# rogojin's require line is the version every scaffolded workflow gets: the
+# templates name no version, so a fresh consumer's MVS resolves each generated
+# import to the floor this repo pins. Keeping that floor on a short clock is
+# what makes generated code current, so both modules are updated together.
+#
+# The two modules must pin the generated dependencies at the same version —
+# TestGeneratedDepsMatchExamples enforces it. If a bump arrives as one PR per
+# module, that test fails until both are merged; merge them together.
+updates:
+  - package-ecosystem: gomod
+    directories:
+      - /
+      - /_examples
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns:
+          - "*"
