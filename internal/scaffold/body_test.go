@@ -89,7 +89,7 @@ func TestRequestBodyKeepsCapturedOrder(t *testing.T) {
 		t.Fatal("no type inferred")
 	}
 	want := "struct { Zebra int64 `json:\"zebra\"` Middle int64 `json:\"middle\"` Alpha int64 `json:\"alpha\"` }"
-	if flat := strings.Join(strings.Fields(got.goType), " "); flat != want {
+	if flat := strings.Join(strings.Fields(got.Expr), " "); flat != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", flat, want)
 	}
 }
@@ -101,7 +101,7 @@ func TestRequestBodyKeepsNestedOrder(t *testing.T) {
 	if !ok {
 		t.Fatal("no type inferred")
 	}
-	flat := strings.Join(strings.Fields(got.goType), " ")
+	flat := strings.Join(strings.Fields(got.Expr), " ")
 	if !strings.Contains(flat, "Zulu int64 `json:\"zulu\"` Alpha int64 `json:\"alpha\"`") {
 		t.Errorf("nested object was reordered:\n  %s", flat)
 	}
@@ -117,7 +117,7 @@ func TestRequestBodyMergesArrayOrder(t *testing.T) {
 	if !ok {
 		t.Fatal("no type inferred")
 	}
-	flat := strings.Join(strings.Fields(got.goType), " ")
+	flat := strings.Join(strings.Fields(got.Expr), " ")
 	if !strings.Contains(flat, "Zebra") || strings.Index(flat, "Zebra") > strings.Index(flat, "Alpha") {
 		t.Errorf("a key from a later element did not sort after the earlier one:\n  %s", flat)
 	}
@@ -135,8 +135,8 @@ func TestRequestBodyStaysStruct(t *testing.T) {
 	if !ok {
 		t.Fatal("no type inferred")
 	}
-	if !strings.HasPrefix(got.goType, "struct {") {
-		t.Errorf("a wide request body collapsed to:\n  %s", got.goType)
+	if !strings.HasPrefix(got.Expr, "struct {") {
+		t.Errorf("a wide request body collapsed to:\n  %s", got.Expr)
 	}
 }
 
@@ -158,7 +158,7 @@ func TestRequestBodyFallsBack(t *testing.T) {
 	for name, e := range cases {
 		t.Run(name, func(t *testing.T) {
 			if got, ok := requestBodyType(e); ok {
-				t.Errorf("typed a body that should stay a literal: %s", got.goType)
+				t.Errorf("typed a body that should stay a literal: %s", got.Expr)
 			}
 		})
 	}
@@ -193,8 +193,8 @@ func TestRequestBodyRoundTrips(t *testing.T) {
 		if before, after := objectKeys(t, []byte(body)), objectKeys(t, bytes.TrimRight(round.Bytes(), "\n")); strings.Join(before, ",") != strings.Join(after, ",") {
 			t.Errorf("key order changed: %v -> %v", before, after)
 		}
-		if !strings.Contains(got.goType, "struct") {
-			t.Errorf("body %s did not type as a struct: %s", body, got.goType)
+		if !strings.Contains(got.Expr, "struct") {
+			t.Errorf("body %s did not type as a struct: %s", body, got.Expr)
 		}
 	}
 }
