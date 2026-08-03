@@ -1,0 +1,30 @@
+package requests
+
+import (
+	"context"
+
+	http "github.com/bogdanfinn/fhttp"
+)
+
+// {{.Ident}}Request is the input to {{.Ident}}. Give it the fields the call
+// needs; a state fills them in at the call site.
+type {{.Ident}}Request struct {
+	URL string
+}
+
+// {{.Ident}}Response is the shape {{.Ident}}'s body unmarshals into. Give it
+// the fields the caller reads, or drop it if the endpoint returns none.
+type {{.Ident}}Response struct{}
+
+// {{.Ident}} fires one call and returns the raw response, leaving decode and
+// body-close to the caller. Replace the method, URL, and headers with the
+// captured ones; Append sends them in the order they are written here.
+func {{.Ident}}(ctx context.Context, client *http.Client, r {{.Ident}}Request) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Append("Accept", "application/json")
+	req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
+	return client.Do(req)
+}
