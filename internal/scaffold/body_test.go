@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -89,7 +90,7 @@ func TestRequestBodyKeepsCapturedOrder(t *testing.T) {
 		t.Fatal("no type inferred")
 	}
 	want := "struct { Zebra int64 `json:\"zebra\"` Middle int64 `json:\"middle\"` Alpha int64 `json:\"alpha\"` }"
-	if flat := strings.Join(strings.Fields(got.Expr), " "); flat != want {
+	if flat := strings.Join(strings.Fields(got.Type.Expr), " "); flat != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", flat, want)
 	}
 }
@@ -101,7 +102,7 @@ func TestRequestBodyKeepsNestedOrder(t *testing.T) {
 	if !ok {
 		t.Fatal("no type inferred")
 	}
-	flat := strings.Join(strings.Fields(got.Expr), " ")
+	flat := strings.Join(strings.Fields(got.Type.Expr), " ")
 	if !strings.Contains(flat, "Zulu int64 `json:\"zulu\"` Alpha int64 `json:\"alpha\"`") {
 		t.Errorf("nested object was reordered:\n  %s", flat)
 	}
@@ -117,7 +118,7 @@ func TestRequestBodyMergesArrayOrder(t *testing.T) {
 	if !ok {
 		t.Fatal("no type inferred")
 	}
-	flat := strings.Join(strings.Fields(got.Expr), " ")
+	flat := strings.Join(strings.Fields(got.Type.Expr), " ")
 	if !strings.Contains(flat, "Zebra") || strings.Index(flat, "Zebra") > strings.Index(flat, "Alpha") {
 		t.Errorf("a key from a later element did not sort after the earlier one:\n  %s", flat)
 	}
@@ -135,18 +136,98 @@ func TestRequestBodyStaysStruct(t *testing.T) {
 	if !ok {
 		t.Fatal("no type inferred")
 	}
-	if !strings.HasPrefix(got.Expr, "struct {") {
-		t.Errorf("a wide request body collapsed to:\n  %s", got.Expr)
+	if !strings.HasPrefix(got.Type.Expr, "struct {") {
+		t.Errorf("a wide request body collapsed to:\n  %s", got.Type.Expr)
+	}
+}
+
+// formBody wraps a body as a captured form submission.
+func formBody(body string) capture.Entry {
+	return capture.Entry{
+		Headers: []capture.Header{{Name: "content-type", Value: "application/x-www-form-urlencoded"}},
+		Body:    []byte(body),
+	}
+}
+
+// TestFormBodyTypesInSendOrder pins the shape a form submission gets: one string
+// field per key, declared in the order the capture sent them, since the
+// generated encoder writes them in declaration order.
+func TestFormBodyTypesInSendOrder(t *testing.T) {
+	got, ok := requestBodyType(formBody("variantID=variant-M&quantity=1&cart_id=c1"))
+	if !ok {
+		t.Fatal("no type inferred")
+	}
+	if got.Encoding != encodingForm {
+		t.Errorf("Encoding = %q, want %q", got.Encoding, encodingForm)
+	}
+	want := "struct { VariantID string Quantity string CartID string }"
+	if flat := strings.Join(strings.Fields(got.Type.Expr), " "); flat != want {
+		t.Errorf("got:\n  %s\nwant:\n  %s", flat, want)
+	}
+
+	// The wire keys ride alongside the fields: the struct carries no tags, so
+	// the generated encoder is the only thing that knows the mapping.
+	var pairs []string
+	for _, f := range got.Fields {
+		pairs = append(pairs, f.Key+"->"+f.Ident)
+	}
+	if joined, want := strings.Join(pairs, ","), "variantID->VariantID,quantity->Quantity,cart_id->CartID"; joined != want {
+		t.Errorf("fields = %s, want %s", joined, want)
+	}
+}
+
+// TestFormBodyRoundTrips is the contract that makes typing a form safe: the
+// generated encoder rebuilds the captured bytes exactly, escaping included.
+func TestFormBodyRoundTrips(t *testing.T) {
+	for _, body := range []string{
+		"variantID=variant-M&quantity=1",
+		"address=1+Example+St&email=buyer%40example.com",
+		"note=a%26b&empty=",
+	} {
+		got, ok := requestBodyType(formBody(body))
+		if !ok {
+			t.Fatalf("no type inferred from %s", body)
+		}
+		var pairs []string
+		for i, f := range got.Fields {
+			_, value, _ := strings.Cut(strings.Split(body, "&")[i], "=")
+			unescaped, err := url.QueryUnescape(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pairs = append(pairs, f.Key+"="+url.QueryEscape(unescaped))
+		}
+		if rebuilt := strings.Join(pairs, "&"); rebuilt != body {
+			t.Errorf("re-encoded %q as %q", body, rebuilt)
+		}
+	}
+}
+
+// TestFormBodyFallsBack covers the forms that keep their literal, which is
+// always exact where a struct would silently send something else.
+func TestFormBodyFallsBack(t *testing.T) {
+	cases := map[string]string{
+		"escaping differs": "note=a%20b", // QueryEscape writes a space as +, not %20
+		"colliding keys":   "cartID=1&cart_id=2",
+		"repeated key":     "size=M&size=L",
+		"no separator":     "novalue",
+		"unnamed key":      "=1",
+		"no identifier":    "!!!=1",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got, ok := requestBodyType(formBody(body)); ok {
+				t.Errorf("typed a form that should stay a literal: %s", got.Type.Expr)
+			}
+		})
 	}
 }
 
 // TestRequestBodyFallsBack covers the bodies that keep their captured literal,
-// which is always exact. A form body is the common one: re-encoding it risks
-// changing the escaping, and nothing here understands its shape anyway.
+// which is always exact for a payload nothing here understands the shape of.
 func TestRequestBodyFallsBack(t *testing.T) {
 	cases := map[string]capture.Entry{
 		"no body":     {Headers: []capture.Header{{Name: "content-type", Value: "application/json"}}},
-		"form":        {Headers: []capture.Header{{Name: "content-type", Value: "application/x-www-form-urlencoded"}}, Body: []byte("a=1&b=2")},
 		"no type":     {Body: []byte(`{"a":1}`)},
 		"text":        {Headers: []capture.Header{{Name: "content-type", Value: "text/plain"}}, Body: []byte("sensor-blob")},
 		"json array":  jsonBody(`[{"a":1}]`),
@@ -158,7 +239,7 @@ func TestRequestBodyFallsBack(t *testing.T) {
 	for name, e := range cases {
 		t.Run(name, func(t *testing.T) {
 			if got, ok := requestBodyType(e); ok {
-				t.Errorf("typed a body that should stay a literal: %s", got.Expr)
+				t.Errorf("typed a body that should stay a literal: %s", got.Type.Expr)
 			}
 		})
 	}
@@ -193,8 +274,8 @@ func TestRequestBodyRoundTrips(t *testing.T) {
 		if before, after := objectKeys(t, []byte(body)), objectKeys(t, bytes.TrimRight(round.Bytes(), "\n")); strings.Join(before, ",") != strings.Join(after, ",") {
 			t.Errorf("key order changed: %v -> %v", before, after)
 		}
-		if !strings.Contains(got.Expr, "struct") {
-			t.Errorf("body %s did not type as a struct: %s", body, got.Expr)
+		if !strings.Contains(got.Type.Expr, "struct") {
+			t.Errorf("body %s did not type as a struct: %s", body, got.Type.Expr)
 		}
 	}
 }

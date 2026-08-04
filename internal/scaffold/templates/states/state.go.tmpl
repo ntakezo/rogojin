@@ -1,0 +1,48 @@
+package states
+
+import (
+	"context"
+{{- if .Decode}}
+	"encoding/json"
+{{- end}}
+
+	"github.com/ntakezo/rogojin/workflows"
+{{- if .Request}}
+	"{{.ModulePath}}/{{.DomainPackage}}/requests"
+{{- end}}
+)
+
+const {{.Const}} workflows.State = "{{.Name}}"
+
+// {{.Handler}} runs the {{.Name}} state.
+{{- if .Request}} Fill the request from the context, and
+// read what came back onto c.r for the states after it.
+{{- end}}
+func (c *Context) {{.Handler}}(ctx context.Context) (*workflows.State, error) {
+{{- if .Request}}
+	client, err := c.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res, err := requests.{{.Request}}(ctx, client, requests.{{.Request}}Request{})
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+{{if .Decode}}
+	var body requests.{{.Request}}Response
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+{{else}}
+	// Nothing typed from this response, so reading it is yours: res.Body holds
+	// the reply exactly as it came back.
+{{end}}
+{{- end}}
+
+{{- if .Next}}
+	return workflows.Next({{.Next}}), nil
+{{- else}}
+	return nil, nil
+{{- end}}
+}

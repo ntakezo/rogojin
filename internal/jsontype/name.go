@@ -15,6 +15,13 @@ func exportName(key string) string {
 	return "Field"
 }
 
+// FieldIdent derives an exported Go field name from a wire key, keeping the
+// initialisms Go style capitalizes whole and running the components together as
+// Go names do, so "cart_id" gives CartID. It returns the empty string for a key
+// that yields no identifier. It is the shared derivation: a form key and a JSON
+// key naming the same value must land on the same field name.
+func FieldIdent(key string) string { return fieldIdent(key) }
+
 // fieldIdent derives an exported Go field name from a JSON key, keeping the
 // initialisms Go style capitalizes whole and running the components together as
 // Go names do. It returns the empty string for a key that yields no identifier.

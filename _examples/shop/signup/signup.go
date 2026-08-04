@@ -1,29 +1,25 @@
-// Package {{.Package}} is the {{.Name}} workflow of the {{.Domain}} domain. It
+// Package signup is the signup workflow of the shop domain. It
 // validates input and builds per-task instances; the automation lives in the
-// states subpackage, and the HTTP in {{.DomainPackage}}/requests, shared with
+// states subpackage, and the HTTP in shop/requests, shared with
 // the domain's other workflows.
-package {{.Package}}
+package signup
 
 import (
 	"fmt"
 
-	"{{.ModulePath}}/{{.DomainPackage}}/{{.Package}}/states"
-{{- if .Proxy}}
+	"github.com/ntakezo/rogojin/_examples/shop/signup/states"
 	"github.com/ntakezo/rogojin/proxies"
-{{- end}}
 	"github.com/ntakezo/rogojin/workflows"
 )
 
 // Name is the ID the workflow registers under, qualified by its domain so
-// another domain may hold a {{.Name}} of its own.
-const Name = "{{.ID}}"
+// another domain may hold a signup of its own.
+const Name = "shop/signup"
 
 // Config is what the domain hands this workflow when it registers it. It is a
 // struct so a new dependency is a new field rather than a changed signature.
 type Config struct {
-{{- if .Proxy}}
 	Proxies *proxies.Manager
-{{- end}}
 }
 
 // workflow is the registered module. It is built once and shared across tasks;
@@ -40,7 +36,7 @@ func (w workflow) ID() string { return Name }
 // ValidateInput ensures the caller passed a states.Input.
 func (w workflow) ValidateInput(input any) error {
 	if _, ok := input.(states.Input); !ok {
-		return fmt.Errorf("{{.ID}}: expected states.Input, got %T", input)
+		return fmt.Errorf("shop/signup: expected states.Input, got %T", input)
 	}
 	return nil
 }
@@ -49,14 +45,13 @@ func (w workflow) ValidateInput(input any) error {
 func (w workflow) NewInstance(input any, deps workflows.Deps) (workflows.Instance, error) {
 	in, ok := input.(states.Input)
 	if !ok {
-		return nil, fmt.Errorf("{{.ID}}: expected states.Input, got %T", input)
+		return nil, fmt.Errorf("shop/signup: expected states.Input, got %T", input)
 	}
-	return states.NewContext(in, deps{{if .Proxy}}, w.cfg.Proxies{{end}}), nil
+	return states.NewContext(in, deps, w.cfg.Proxies), nil
 }
-{{if .Durable}}
+
 // RestoreInstance rebuilds an instance from a snapshot so a task can resume
 // after a crash, restart, or suspend.
 func (w workflow) RestoreInstance(deps workflows.Deps, snapshot []byte) (workflows.Instance, error) {
-	return states.RestoreContext(deps, snapshot{{if .Proxy}}, w.cfg.Proxies{{end}})
+	return states.RestoreContext(deps, snapshot, w.cfg.Proxies)
 }
-{{end}}

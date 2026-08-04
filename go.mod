@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/bogdanfinn/fhttp v0.6.8
 	github.com/google/uuid v1.6.0
+	github.com/justhyped/OrderedForm v0.0.0-20230202094228-bc7aa3c135e8
 	github.com/mattn/go-sqlite3 v1.14.22
 )
 

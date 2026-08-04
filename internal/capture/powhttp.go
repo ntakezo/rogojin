@@ -152,6 +152,7 @@ func (e powEntry) normalize() (Entry, error) {
 
 	return Entry{
 		ID:       e.ID,
+		Source:   "powhttp entry " + e.ID,
 		URL:      target,
 		Method:   e.Request.Method,
 		Proto:    e.HTTPVersion,

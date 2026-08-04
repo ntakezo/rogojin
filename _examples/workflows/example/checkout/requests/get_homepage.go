@@ -32,7 +32,16 @@ func GetHomepage(ctx context.Context, client *http.Client, r GetHomepageRequest)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Append("Accept", "application/json")
-	req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
+
+	// The order keys are the order fhttp sends in, which it matches lowercased.
+	// cookie is listed with no Add: the jar owns it, and this is where its value
+	// has to land.
+	headers := http.Header{
+		http.HeaderOrderKey:  {"accept", "accept-language", "cookie"},
+		http.PHeaderOrderKey: {":method", ":authority", ":scheme", ":path"},
+	}
+	headers.Add("accept", "application/json")
+	headers.Add("accept-language", "en-US,en;q=0.9")
+	req.Header = headers
 	return client.Do(req)
 }

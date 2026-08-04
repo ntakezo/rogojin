@@ -1,0 +1,46 @@
+// Package {{.Package}} is the {{.Domain}} domain: the workflows that drive it,
+// the requests they share, and the registration that puts them on a service.
+package {{.Package}}
+
+import (
+{{- if .Checked}}
+	"errors"
+	"reflect"
+{{end}}
+	"github.com/ntakezo/rogojin/tasks"
+{{- range .Workflows}}
+	"{{$.ModulePath}}/{{$.Package}}/{{.Package}}"
+{{- end}}
+)
+
+// Configs is what the domain builds its workflows from, one field per workflow,
+// so a workflow asking for its own dependencies is handed them. A workflow that
+// asks for anything is refused when its field is left unset. Derived from the
+// workflow packages beside it — edits here are overwritten.
+type Configs struct {
+{{- range .Workflows}}
+	{{.Field}} {{.Package}}.Config
+{{- end}}
+}
+
+// Register puts every workflow in this domain on svc, each built from its own
+// config. Derived from the workflow packages beside it — edits are overwritten.
+func Register(svc tasks.Service, configs Configs) error {
+{{- if .Checked}}
+	// Checked before anything is registered, so a config left unset leaves the
+	// service as it was rather than half a domain on it.
+{{- range .Workflows}}
+{{- if .Checked}}
+	if reflect.ValueOf(configs.{{.Field}}).IsZero() {
+		return errors.New("{{$.Domain}}: {{.Package}} config is not set — fill Configs.{{.Field}} in before registering")
+	}
+{{- end}}
+{{- end}}
+{{end}}
+{{- range .Workflows}}
+	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New(configs.{{.Field}})); err != nil {
+		return err
+	}
+{{- end}}
+	return nil
+}

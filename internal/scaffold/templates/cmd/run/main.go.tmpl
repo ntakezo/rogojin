@@ -1,4 +1,4 @@
-// Command run wires the {{.Name}} workflow onto a task service and runs one
+// Command run wires the {{.Domain}} domain onto a task service and runs one
 // task end to end. It is a starting point — edit the input, swap the
 // persistence, and add proxies to taste.
 package main
@@ -21,15 +21,16 @@ import (
 	"github.com/ntakezo/rogojin/proxies"
 {{- end}}
 	"github.com/ntakezo/rogojin/tasks"
-	"{{.ModulePath}}/{{.Package}}"
-	"{{.ModulePath}}/{{.Package}}/states"
+	"{{.ModulePath}}/{{.DomainPackage}}"
+	"{{.ModulePath}}/{{.DomainPackage}}/{{.Package}}"
+	"{{.ModulePath}}/{{.DomainPackage}}/{{.Package}}/states"
 )
 
 func main() {
 	ctx := context.Background()
 
 {{- if .TaskPersist}}
-	repo, err := tasksqlite.NewSQLite("{{.Package}}.db")
+	repo, err := tasksqlite.NewSQLite("{{.DomainPackage}}.db")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,7 +45,7 @@ func main() {
 {{- if .Proxy}}
 
 {{- if .ProxyPersist}}
-	proxyRepo, err := proxysqlite.NewSQLite("{{.Package}}-proxies.db")
+	proxyRepo, err := proxysqlite.NewSQLite("{{.DomainPackage}}-proxies.db")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -60,18 +61,20 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New(manager)); err != nil {
-		log.Fatal(err)
-	}
-{{- else}}
-	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New()); err != nil {
-		log.Fatal(err)
-	}
+	// Nothing leases a proxy until a workflow's config below carries the manager.
+	_ = manager
 {{- end}}
 
-	// A fingerprinting endpoint, so the first run reports back how the site saw
-	// the request. Point it at your own target.
-	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://tls.peet.ws/api/all"})
+	// Every workflow the domain holds, registered together, each from its own
+	// config. Fill one field in per workflow{{if .Proxy}} — {{.Package}}.Config takes the
+	// manager built above{{end}}: Register refuses a workflow whose config is unset.
+	if err := {{.DomainPackage}}.Register(svc, {{.DomainPackage}}.Configs{}); err != nil {
+		log.Fatal(err)
+	}
+
+	// The input one task runs against. Shape states.Input to your target and
+	// fill it in here.
+	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{})
 	if err != nil {
 		log.Fatal(err)
 	}

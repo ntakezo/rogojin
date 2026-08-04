@@ -1,7 +1,9 @@
-// Package scaffold renders a runnable rogojin workflow package from a small set
-// of embedded templates. The feature flags on Options gate the durability hooks,
+// Package scaffold renders a rogojin workflow package from a small set of
+// embedded templates. The feature flags on Options gate the durability hooks,
 // the output hook, proxy leasing, and the persistence wiring in the generated
-// main, so a generated tree always compiles and never carries code it cannot use.
+// main, so a workflow never carries code it cannot use. It renders no states:
+// those are the part only the workflow's author knows, and a tree compiles once
+// `rogojin state` has written the first one and derived the graph with it.
 //
 // The templates reproduce framework surface (the workflows interfaces, the opt-in
 // capabilities, the service and manager constructors), so they drift when that
@@ -36,26 +38,49 @@ import (
 //go:embed templates
 var templatesFS embed.FS
 
-// Options configures one scaffold render. Name is the raw workflow ID; Package
-// is derived from it as a valid Go identifier for the package and directory.
+// Options configures one workflow render. A workflow lives inside a domain —
+// the target the workflows all speak to — and shares that domain's requests
+// package with its siblings. Domain and Name are the raw names; the package
+// identifiers are derived from them.
 type Options struct {
-	Name    string
-	Package string
+	Domain string
+	Name   string
 
-	// Durable emits Snapshot/RestoreContext/RestoreInstance for crash recovery.
+	DomainPackage string
+	Package       string
+
+	// Durable emits Snapshot/RestoreContext/RestoreInstance for crash recovery,
+	// and Output the Outputter implementation. Both belong to one workflow, so
+	// two workflows in a domain may differ on them.
 	Durable bool
-	// Output emits the Outputter implementation: a Result type the terminal
-	// state fills and Output marshals on clean completion.
-	Output bool
-	// Proxy emits per-task proxy leasing and the Teardown that releases it.
-	Proxy bool
-	// TaskPersist wires a SQLite task repository in main; false uses a nil
-	// (in-memory) repository.
-	TaskPersist bool
-	// ProxyPersist wires a SQLite proxy repository in main; false emits an
-	// in-memory one. Meaningful only when Proxy is set.
+	Output  bool
+
+	// Proxy, TaskPersist, and ProxyPersist are the domain's posture, fixed when
+	// its first workflow creates it: they shape the entrypoint every workflow in
+	// the domain is registered from, so one workflow cannot hold a different one.
+	Proxy        bool
+	TaskPersist  bool
 	ProxyPersist bool
 }
+
+// NewOptions derives the render options for a workflow from the raw domain and
+// workflow names as the user typed them.
+func NewOptions(domain, name string) Options {
+	return Options{
+		Domain:        domain,
+		Name:          name,
+		DomainPackage: PackageName(domain),
+		Package:       PackageName(name),
+	}
+}
+
+// ID is what the workflow registers under: the domain and the workflow joined,
+// so two domains may each hold a workflow of the same name.
+func (o Options) ID() string { return o.Domain + "/" + o.Name }
+
+// ConfigField is the field this workflow's config sits under in the domain's
+// derived Configs struct.
+func (o Options) ConfigField() string { return RequestIdent(o.Package) }
 
 // templateData is what the templates see. ModulePath is the consuming module's
 // path, resolved from its go.mod so generated imports point at the user's code.
@@ -64,33 +89,50 @@ type templateData struct {
 	ModulePath string
 }
 
-// outputs maps each embedded template to the path it renders to, relative to the
-// destination root. Paths use the package name as their leading segment.
+// outputs maps each embedded template to the path it renders to, relative to
+// the destination root, for the files one workflow owns.
 func (o Options) outputs() map[string]string {
 	return map[string]string{
-		"templates/workflow.go.tmpl":       path.Join(o.Package, o.Package+".go"),
-		"templates/states/context.go.tmpl": path.Join(o.Package, "states", "context.go"),
-		"templates/states/graph.go.tmpl":   path.Join(o.Package, "states", "graph.go"),
-		"templates/states/fetch.go.tmpl":   path.Join(o.Package, "states", "fetch.go"),
-		"templates/states/process.go.tmpl": path.Join(o.Package, "states", "process.go"),
-		"templates/requests/fetch.go.tmpl": path.Join(o.Package, "requests", "fetch.go"),
-		"templates/cmd/run/main.go.tmpl":   path.Join(o.Package, "cmd", "run", "main.go"),
+		"templates/workflow.go.tmpl":       path.Join(o.DomainPackage, o.Package, o.Package+".go"),
+		"templates/states/context.go.tmpl": path.Join(o.DomainPackage, o.Package, "states", "context.go"),
+	}
+}
+
+// domainOutputs are the files a domain gets exactly once, written by whichever
+// workflow creates it. The registration beside them is derived, not rendered
+// from this map, because it changes every time a workflow is added.
+func (o Options) domainOutputs() map[string]string {
+	return map[string]string{
+		"templates/cmd/run/main.go.tmpl": path.Join(o.DomainPackage, "cmd", "run", "main.go"),
 	}
 }
 
 // Validate rejects flag combinations that would generate code which lies about
 // what it does, surfacing the conflict rather than emitting dead wiring.
 func (o Options) Validate() error {
+	if o.Domain == "" {
+		return fmt.Errorf("domain name is required")
+	}
 	if o.Name == "" {
 		return fmt.Errorf("workflow name is required")
 	}
-	if o.Package == "" {
-		return fmt.Errorf("workflow name %q has no valid package identifier", o.Name)
+	for _, pkg := range []struct{ raw, ident string }{{o.Domain, o.DomainPackage}, {o.Name, o.Package}} {
+		if pkg.ident == "" {
+			return fmt.Errorf("name %q has no valid package identifier", pkg.raw)
+		}
+		// A keyword fails compilation and "main" cannot be imported; both would
+		// otherwise surface as a confusing format error over the rendered source.
+		if token.IsKeyword(pkg.ident) || pkg.ident == "main" {
+			return fmt.Errorf("name %q yields package %q, which is not usable as an importable package name — choose another name", pkg.raw, pkg.ident)
+		}
 	}
-	// A keyword fails compilation and "main" cannot be imported; both would
-	// otherwise surface as a confusing format error over the rendered source.
-	if token.IsKeyword(o.Package) || o.Package == "main" {
-		return fmt.Errorf("workflow name %q yields package %q, which is not usable as an importable package name — choose another name", o.Name, o.Package)
+	// A workflow package sitting beside the domain's derived registration would
+	// need the same directory entry the registration file already holds.
+	if o.Package == o.DomainPackage {
+		return fmt.Errorf("workflow %q and domain %q both yield package %q; the domain's registration already owns that name — choose another", o.Name, o.Domain, o.Package)
+	}
+	if o.Package == "requests" {
+		return fmt.Errorf("workflow %q yields package \"requests\", which the domain's shared request package already owns — choose another", o.Name)
 	}
 	if o.Durable && !o.TaskPersist {
 		return fmt.Errorf("a durable workflow needs task persistence: a nil task repository never writes the snapshots the durability hooks produce — pass --no-durable too")
@@ -101,42 +143,62 @@ func (o Options) Validate() error {
 	return nil
 }
 
+// renderTemplate executes one embedded template and formats the result, which
+// is where a render that produces invalid Go fails — before anything is written.
+// quote renders a captured value as a Go literal, so a header holding a quote
+// or a backslash cannot break out of the generated source.
+func renderTemplate(tmplPath string, data any) (string, error) {
+	raw, err := templatesFS.ReadFile(tmplPath)
+	if err != nil {
+		return "", fmt.Errorf("read template %s: %w", tmplPath, err)
+	}
+	tmpl, err := template.New(path.Base(tmplPath)).
+		Funcs(template.FuncMap{"quote": strconv.Quote}).
+		Parse(string(raw))
+	if err != nil {
+		return "", fmt.Errorf("parse template %s: %w", tmplPath, err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("execute template %s: %w", tmplPath, err)
+	}
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		return "", fmt.Errorf("format: %w\n--- rendered ---\n%s", err, buf.String())
+	}
+	return string(formatted), nil
+}
+
 // Render returns every generated file as relative-path -> formatted Go source.
-// A render that produces invalid Go fails here, at format, before anything is
-// written.
-func Render(modulePath string, o Options) (map[string]string, error) {
+// It renders no state and no graph: a workflow's states are the part only its
+// author knows, so `rogojin state` writes the first one and derives the graph
+// with it. Until then the tree is incomplete — *Context has no Graph method and
+// so is not yet a workflows.Instance.
+func Render(modulePath string, o Options, withDomain bool) (map[string]string, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
 	data := templateData{Options: o, ModulePath: modulePath}
 
+	outputs := o.outputs()
+	if withDomain {
+		maps.Copy(outputs, o.domainOutputs())
+	}
 	files := make(map[string]string)
-	for tmplPath, outPath := range o.outputs() {
-		raw, err := templatesFS.ReadFile(tmplPath)
+	for tmplPath, outPath := range outputs {
+		source, err := renderTemplate(tmplPath, data)
 		if err != nil {
-			return nil, fmt.Errorf("read template %s: %w", tmplPath, err)
+			return nil, fmt.Errorf("%s: %w", outPath, err)
 		}
-		tmpl, err := template.New(path.Base(tmplPath)).Parse(string(raw))
-		if err != nil {
-			return nil, fmt.Errorf("parse template %s: %w", tmplPath, err)
-		}
-		var buf bytes.Buffer
-		if err := tmpl.Execute(&buf, data); err != nil {
-			return nil, fmt.Errorf("execute template %s: %w", tmplPath, err)
-		}
-		formatted, err := format.Source(buf.Bytes())
-		if err != nil {
-			return nil, fmt.Errorf("format %s: %w\n--- rendered ---\n%s", outPath, err, buf.String())
-		}
-		files[outPath] = string(formatted)
+		files[outPath] = source
 	}
 	return files, nil
 }
 
 // Write renders the workflow and writes it under destRoot, refusing to clobber
 // any file that already exists so a mistaken re-run never overwrites edits.
-func Write(destRoot, modulePath string, o Options) ([]string, error) {
-	files, err := Render(modulePath, o)
+func Write(destRoot, modulePath string, o Options, withDomain bool) ([]string, error) {
+	files, err := Render(modulePath, o, withDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -212,12 +274,12 @@ func findGoMod(dir string) (string, error) {
 // RequestOptions configures one request render: the workflow package the file
 // lands in, plus the identifiers derived from the request's raw name.
 type RequestOptions struct {
-	Workflow string
-	Name     string
+	Domain string
+	Name   string
 
-	// Package is the workflow's directory and package identifier, Ident the
-	// exported Go name the request's func and types are built from, and File
-	// the snake_case base name of the file itself.
+	// Package is the domain's directory and package identifier — requests are
+	// shared by every workflow in it — Ident the exported Go name the request's
+	// func and types are built from, and File the snake_case base name.
 	Package string
 	Ident   string
 	File    string
@@ -231,19 +293,31 @@ type RequestOptions struct {
 // template cannot decide — the method constant, the body literal's quoting — is
 // reduced to a Go source fragment here, so the template only interpolates.
 type capturedView struct {
-	Ident   string
-	Source  string
-	Method  string
-	URL     string
+	Ident  string
+	Source string
+	Method string
+	URL    string
+	Body   string
+
+	// Order is every captured header name, lowercased and deduplicated, in the
+	// order it was sent; Headers are the ones the generated function writes a
+	// value for. Owned names the difference — the headers the client fills in
+	// itself — and is empty when the capture carried none, so the rendered file
+	// never explains a header it does not have. Pseudo is the HTTP/2 order.
+	Order   []string
 	Headers []capture.Header
+	Owned   string
 	Pseudo  []string
-	Body    string
 
 	// BodyType is the Go type the request's Body field declares, typed from a
-	// captured JSON body and marshaled back to it. Anything else leaves the
-	// request struct empty and sends Body, the captured bytes, as a literal.
-	BodyType  string
-	BodyTyped bool
+	// captured body and encoded back to it; BodyEncoding says how. Anything no
+	// typer handles leaves the request struct empty and sends Body, the captured
+	// bytes, as a literal. BodyFields carries the wire keys for an encoding the
+	// template writes field by field.
+	BodyType     string
+	BodyTyped    bool
+	BodyEncoding string
+	BodyFields   []bodyField
 
 	// ResponseType is the Go type the response unmarshals into, and Inferred
 	// says whether it came from the captured body or is the empty placeholder.
@@ -279,8 +353,8 @@ func newCapturedView(ident string, e capture.Entry) capturedView {
 		method = strconv.Quote(e.Method)
 	}
 	source := "a captured request"
-	if e.ID != "" {
-		source = "powhttp entry " + e.ID
+	if e.Source != "" {
+		source = e.Source
 	}
 	response, responseTyped := responseType(e.Response)
 	var media string
@@ -288,12 +362,15 @@ func newCapturedView(ident string, e capture.Entry) capturedView {
 		media = e.Response.MediaType
 	}
 
+	order, written, owned := splitClientOwned(e.Headers)
 	view := capturedView{
 		Ident:            ident,
 		Source:           source,
 		Method:           method,
 		URL:              e.URL,
-		Headers:          e.Headers,
+		Order:            order,
+		Headers:          written,
+		Owned:            owned,
 		Pseudo:           e.Pseudo,
 		ResponseType:     response.Expr,
 		ResponseInferred: responseTyped,
@@ -305,12 +382,18 @@ func newCapturedView(ident string, e capture.Entry) capturedView {
 		imports[path] = true
 	}
 
-	// A typed body is marshaled from the request struct; an untyped one is sent
+	// A typed body is encoded from the request struct; an untyped one is sent
 	// as the captured bytes, which is exact for a body no typer understands.
 	if body, ok := requestBodyType(e); ok {
-		view.BodyType, view.BodyTyped = body.Expr, true
-		imports["bytes"], imports["encoding/json"] = true, true
-		for _, path := range body.Imports {
+		view.BodyType, view.BodyTyped = body.Type.Expr, true
+		view.BodyEncoding, view.BodyFields = body.Encoding, body.Fields
+		switch body.Encoding {
+		case encodingJSON:
+			imports["bytes"], imports["encoding/json"] = true, true
+		case encodingForm:
+			imports["strings"] = true // OrderedForm is third-party; the template adds it
+		}
+		for _, path := range body.Type.Imports {
 			imports[path] = true
 		}
 	} else if len(e.Body) > 0 {
@@ -320,6 +403,51 @@ func newCapturedView(ident string, e capture.Entry) capturedView {
 
 	view.Imports = slices.Sorted(maps.Keys(imports))
 	return view
+}
+
+// clientOwned are the headers the generated function must not write a literal
+// for. The transport derives Content-Length from the body it is handed, and the
+// cookie jar the scaffold wires supplies Cookie — a captured literal would
+// contradict the first and, since fhttp appends the jar's cookies to whatever
+// Cookie header is already there, corrupt the second.
+var clientOwned = map[string]bool{"content-length": true, "cookie": true}
+
+// splitClientOwned divides captured headers into the send order and the fields
+// the function writes. A client-owned header keeps its place in the order —
+// that is where fhttp has to put the value it fills in — but contributes no
+// literal. The order is deduplicated because it names a header once however
+// many fields carry it. owned reads the client-owned names back as prose, and
+// is empty when there were none.
+func splitClientOwned(headers []capture.Header) (order []string, written []capture.Header, owned string) {
+	seen := make(map[string]bool)
+	var ownedNames []string
+	for _, h := range headers {
+		name := strings.ToLower(h.Name)
+		if !seen[name] {
+			seen[name] = true
+			order = append(order, name)
+			if clientOwned[name] {
+				ownedNames = append(ownedNames, name)
+			}
+		}
+		if !clientOwned[name] {
+			written = append(written, h)
+		}
+	}
+	return order, written, joinAnd(ownedNames)
+}
+
+// joinAnd reads a list back as English, so a generated comment names one header
+// or two without the template branching on how many there are.
+func joinAnd(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0]
+	default:
+		return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+	}
 }
 
 // goStringLiteral renders body as a Go string literal, preferring a raw literal
@@ -347,27 +475,27 @@ func goStringLiteral(body []byte) string {
 
 // NewRequestOptions derives the render options for a request from the raw
 // workflow and request names as the user typed them.
-func NewRequestOptions(workflow, name string) RequestOptions {
+func NewRequestOptions(domain, name string) RequestOptions {
 	return RequestOptions{
-		Workflow: workflow,
-		Name:     name,
-		Package:  PackageName(workflow),
-		Ident:    RequestIdent(name),
-		File:     RequestFile(name),
+		Domain:  domain,
+		Name:    name,
+		Package: PackageName(domain),
+		Ident:   RequestIdent(name),
+		File:    RequestFile(name),
 	}
 }
 
 // Validate rejects names that yield no usable package or Go identifier, which
 // would otherwise surface later as a confusing format error over the source.
 func (o RequestOptions) Validate() error {
-	if o.Workflow == "" {
-		return fmt.Errorf("workflow name is required")
+	if o.Domain == "" {
+		return fmt.Errorf("domain name is required")
 	}
 	if o.Name == "" {
 		return fmt.Errorf("request name is required")
 	}
 	if o.Package == "" {
-		return fmt.Errorf("workflow name %q has no valid package identifier", o.Workflow)
+		return fmt.Errorf("domain name %q has no valid package identifier", o.Domain)
 	}
 	if o.Ident == "" {
 		return fmt.Errorf("request name %q yields no usable Go identifier — it must contain a letter, and cannot start with a digit", o.Name)
@@ -406,7 +534,7 @@ func RenderRequest(o RequestOptions) (string, string, error) {
 	if err := tmpl.Execute(&buf, data); err != nil {
 		return "", "", fmt.Errorf("execute template %s: %w", tmplPath, err)
 	}
-	outPath := path.Join(o.Package, "requests", o.File+".go")
+	outPath := path.Join(o.Package, requestsDir, o.File+".go")
 	formatted, err := format.Source(buf.Bytes())
 	if err != nil {
 		return "", "", fmt.Errorf("format %s: %w\n--- rendered ---\n%s", outPath, err, buf.String())
@@ -424,14 +552,14 @@ func WriteRequest(destRoot string, o RequestOptions, force bool) (rel string, ov
 		return "", false, err
 	}
 
-	// A request belongs to a workflow: without one there is no package for it
-	// to compile into, and a bare requests/ directory would never build. Force
-	// overwrites a request, it does not conjure the workflow around it.
-	workflowDir := filepath.Join(destRoot, o.Package)
-	if _, err := os.Stat(workflowDir); os.IsNotExist(err) {
-		return "", false, fmt.Errorf("no workflow package %q at %s — run `rogojin new %s` first", o.Package, workflowDir, o.Workflow)
+	// A request belongs to a domain: without one there is nothing to share it
+	// with, and a bare requests/ directory would never build. Force overwrites a
+	// request, it does not conjure the domain around it.
+	domainDir := filepath.Join(destRoot, o.Package)
+	if _, err := os.Stat(domainDir); os.IsNotExist(err) {
+		return "", false, fmt.Errorf("no domain package %q at %s — run `rogojin workflow %s <name>` first", o.Package, domainDir, o.Domain)
 	} else if err != nil {
-		return "", false, fmt.Errorf("stat %s: %w", workflowDir, err)
+		return "", false, fmt.Errorf("stat %s: %w", domainDir, err)
 	}
 
 	full := filepath.Join(destRoot, rel)

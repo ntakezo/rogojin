@@ -12,17 +12,18 @@ import (
 
 	"github.com/ntakezo/rogojin/internal/capture"
 
-	// The generated requests package imports fhttp, so TestGeneratedCodeCompiles
-	// needs it in this module's go.mod and go.sum to resolve. No rogojin package
-	// imports it, so without this anchor `go mod tidy` drops it and the temp
-	// modules the test builds stop compiling.
+	// The generated requests package imports these, so TestGeneratedCodeCompiles
+	// needs them in this module's go.mod and go.sum to resolve. No rogojin
+	// package imports either, so without these anchors `go mod tidy` drops them
+	// and the temp modules the test builds stop compiling.
 	_ "github.com/bogdanfinn/fhttp"
+	_ "github.com/justhyped/OrderedForm"
 )
 
 // generatedDeps are the third-party modules the templates emit imports for.
 // The temp module in TestGeneratedCodeCompiles requires them at whatever
 // version this repo pins, so the two can never drift apart.
-var generatedDeps = []string{"github.com/bogdanfinn/fhttp"}
+var generatedDeps = []string{"github.com/bogdanfinn/fhttp", "github.com/justhyped/OrderedForm"}
 
 // TestPackageName pins the identifier derivation: lowercased, non-ident
 // characters dropped, never leading with a digit.
@@ -73,19 +74,19 @@ func TestRequestNaming(t *testing.T) {
 // TestRequestOptionsValidate guards the names that cannot produce compiling
 // code, so they fail with a usable message rather than at format over the source.
 func TestRequestOptionsValidate(t *testing.T) {
-	valid := NewRequestOptions("checkout", "add-to-cart")
+	valid := NewRequestOptions("shop", "add-to-cart")
 	if err := valid.Validate(); err != nil {
 		t.Errorf("Validate rejected a usable request: %v", err)
 	}
-	for _, c := range []struct{ workflow, name string }{
+	for _, c := range []struct{ domain, name string }{
 		{"", "add-to-cart"},
-		{"checkout", ""},
+		{"shop", ""},
 		{"123", "add-to-cart"},
-		{"checkout", "2fast"},
-		{"checkout", "---"},
+		{"shop", "2fast"},
+		{"shop", "---"},
 	} {
-		if err := NewRequestOptions(c.workflow, c.name).Validate(); err == nil {
-			t.Errorf("Validate accepted workflow %q request %q, want rejection", c.workflow, c.name)
+		if err := NewRequestOptions(c.domain, c.name).Validate(); err == nil {
+			t.Errorf("Validate accepted domain %q request %q, want rejection", c.domain, c.name)
 		}
 	}
 }
@@ -96,44 +97,45 @@ func TestRequestOptionsValidate(t *testing.T) {
 func TestWriteRequestIsAdditive(t *testing.T) {
 	dir := t.TempDir()
 
-	if _, _, err := WriteRequest(dir, NewRequestOptions("checkout", "add-to-cart"), false); err == nil {
-		t.Error("WriteRequest wrote into a module with no checkout workflow, want refusal")
+	if _, _, err := WriteRequest(dir, NewRequestOptions("shop", "add-to-cart"), false); err == nil {
+		t.Error("WriteRequest wrote into a module with no shop domain, want refusal")
 	}
-	if _, _, err := WriteRequest(dir, NewRequestOptions("checkout", "add-to-cart"), true); err == nil {
-		t.Error("force wrote into a module with no checkout workflow: force replaces a request, it does not create the workflow")
+	if _, _, err := WriteRequest(dir, NewRequestOptions("shop", "add-to-cart"), true); err == nil {
+		t.Error("force wrote into a module with no shop domain: force replaces a request, it does not create the domain")
 	}
 
-	if _, err := Write(dir, "example.com/consumer", Options{
-		Name: "checkout", Package: "checkout", Output: true,
-	}); err != nil {
-		t.Fatalf("Write: %v", err)
+	base := NewOptions("shop", "checkout")
+	base.Output, base.TaskPersist = true, true
+	if _, _, err := WriteWorkflow(dir, "example.com/consumer", base); err != nil {
+		t.Fatalf("WriteWorkflow: %v", err)
 	}
 
 	for _, name := range []string{"add-to-cart", "submit-checkout"} {
-		rel, overwrote, err := WriteRequest(dir, NewRequestOptions("checkout", name), false)
+		rel, overwrote, err := WriteRequest(dir, NewRequestOptions("shop", name), false)
 		if err != nil {
 			t.Fatalf("WriteRequest(%q): %v", name, err)
 		}
 		if overwrote {
 			t.Errorf("WriteRequest(%q) reported an overwrite on a fresh file", name)
 		}
-		if want := filepath.Join("checkout", "requests", RequestFile(name)+".go"); rel != want {
+		if want := filepath.Join("shop", "requests", RequestFile(name)+".go"); rel != want {
 			t.Errorf("WriteRequest(%q) wrote %s, want %s", name, rel, want)
 		}
 	}
 
-	// The scaffolded fetch.go plus the two added above.
-	entries, err := os.ReadDir(filepath.Join(dir, "checkout", "requests"))
+	// Only the two added above: a scaffolded workflow starts with no requests,
+	// and the directory is created by the first one written into it.
+	entries, err := os.ReadDir(filepath.Join(dir, "shop", "requests"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
-		t.Errorf("requests/ holds %d files, want 3", len(entries))
+	if len(entries) != 2 {
+		t.Errorf("requests/ holds %d files, want 2", len(entries))
 	}
 
 	// A hand edit is what the refusal exists to protect, and what --force is for
 	// discarding. The camel spelling resolves to the same file, so it collides.
-	edited := filepath.Join(dir, "checkout", "requests", "add_to_cart.go")
+	edited := filepath.Join(dir, "shop", "requests", "add_to_cart.go")
 	generated, err := os.ReadFile(edited)
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +145,7 @@ func TestWriteRequestIsAdditive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := WriteRequest(dir, NewRequestOptions("checkout", "addToCart"), false); err == nil {
+	if _, _, err := WriteRequest(dir, NewRequestOptions("shop", "addToCart"), false); err == nil {
 		t.Error("WriteRequest overwrote an existing request, want refusal")
 	}
 	kept, err := os.ReadFile(edited)
@@ -154,14 +156,14 @@ func TestWriteRequestIsAdditive(t *testing.T) {
 		t.Error("a refused WriteRequest still modified the existing request")
 	}
 
-	rel, overwrote, err := WriteRequest(dir, NewRequestOptions("checkout", "addToCart"), true)
+	rel, overwrote, err := WriteRequest(dir, NewRequestOptions("shop", "addToCart"), true)
 	if err != nil {
 		t.Fatalf("forced WriteRequest: %v", err)
 	}
 	if !overwrote {
 		t.Error("forced WriteRequest over an existing request did not report an overwrite")
 	}
-	if want := filepath.Join("checkout", "requests", "add_to_cart.go"); rel != want {
+	if want := filepath.Join("shop", "requests", "add_to_cart.go"); rel != want {
 		t.Errorf("forced WriteRequest wrote %s, want %s", rel, want)
 	}
 	replaced, err := os.ReadFile(edited)
@@ -173,25 +175,28 @@ func TestWriteRequestIsAdditive(t *testing.T) {
 	}
 
 	// Force replaces one request; it must not disturb its neighbours.
-	entries, err = os.ReadDir(filepath.Join(dir, "checkout", "requests"))
+	entries, err = os.ReadDir(filepath.Join(dir, "shop", "requests"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
-		t.Errorf("requests/ holds %d files after a forced write, want 3", len(entries))
+	if len(entries) != 2 {
+		t.Errorf("requests/ holds %d files after a forced write, want 2", len(entries))
 	}
 }
 
 // capturedEntry is a small captured request covering what rendering has to get
-// right: pseudo-headers, repeated fields, and values full of characters that
-// would break out of a Go literal if they were interpolated raw.
+// right: pseudo-headers, repeated fields, the headers a client writes for
+// itself, and values full of characters that would break out of a Go literal if
+// they were interpolated raw.
 func capturedEntry() capture.Entry {
 	return capture.Entry{
 		ID:     "01TEST",
+		Source: "powhttp entry 01TEST",
 		URL:    "https://example.com/cart?size=M&color=red",
 		Method: http.MethodPost,
 		Pseudo: []string{":method", ":authority", ":scheme", ":path"},
 		Headers: []capture.Header{
+			{Name: "content-length", Value: "23"},
 			{Name: "sec-ch-ua", Value: `"Not;A=Brand";v="8", "Chromium";v="150"`},
 			{Name: "content-type", Value: "application/x-www-form-urlencoded"},
 			{Name: "x-weird", Value: "back\\slash\ttab\"quote"},
@@ -211,25 +216,28 @@ func capturedEntry() capture.Entry {
 // reaches the source in the order it saw it, and every value survives quoting.
 func TestRenderCapturedRequest(t *testing.T) {
 	entry := capturedEntry()
-	opts := NewRequestOptions("checkout", "add-to-cart")
+	opts := NewRequestOptions("shop", "add-to-cart")
 	opts.Entry = &entry
 
 	rel, source, err := RenderRequest(opts)
 	if err != nil {
 		t.Fatalf("RenderRequest: %v", err)
 	}
-	if want := filepath.Join("checkout", "requests", "add_to_cart.go"); rel != want {
+	if want := filepath.Join("shop", "requests", "add_to_cart.go"); rel != want {
 		t.Errorf("rendered to %s, want %s", rel, want)
 	}
 
 	for _, want := range []string{
 		`http.MethodPost`,
 		`"https://example.com/cart?size=M&color=red"`,
-		"`variantID=99&quantity=1`",
-		`strings.NewReader(body)`,
-		`req.Header.Append("sec-ch-ua", "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\"")`,
-		`req.Header.Append("x-weird", "back\\slash\ttab\"quote")`,
-		`req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}`,
+		// The form body is typed, so its values are fields rather than a literal.
+		`form.Set("variantID", r.Body.VariantID)`,
+		`form.Set("quantity", r.Body.Quantity)`,
+		`headers.Add("sec-ch-ua", "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\"")`,
+		`headers.Add("x-weird", "back\\slash\ttab\"quote")`,
+		`http.HeaderOrderKey:  {"content-length", "sec-ch-ua", "content-type", "x-weird", "cookie"}`,
+		`http.PHeaderOrderKey: {":method", ":authority", ":scheme", ":path"}`,
+		`req.Header = headers`,
 		"Generated from powhttp entry 01TEST",
 		// The response is typed from the captured body, in the same file.
 		"type AddToCartResponse struct {",
@@ -241,17 +249,53 @@ func TestRenderCapturedRequest(t *testing.T) {
 		}
 	}
 
-	// Append records order as it goes, so the written order is the sent order —
-	// which means the source order has to match the capture exactly.
-	var appended []string
-	for _, line := range strings.Split(source, "\n") {
-		if _, name, ok := strings.Cut(strings.TrimSpace(line), `req.Header.Append("`); ok {
-			appended = append(appended, name[:strings.Index(name, `"`)])
+	// The client writes these for itself. A literal would contradict the
+	// transport's Content-Length and be appended to by the cookie jar, so each
+	// holds its place in the order and nothing more.
+	for _, unwanted := range []string{`headers.Add("content-length"`, `headers.Add("cookie"`} {
+		if strings.Contains(source, unwanted) {
+			t.Errorf("rendered a literal for a header the client owns:\n  %s\n--- got ---\n%s", unwanted, source)
 		}
 	}
-	want := []string{"sec-ch-ua", "content-type", "x-weird", "cookie", "cookie"}
-	if strings.Join(appended, ",") != strings.Join(want, ",") {
-		t.Errorf("appended %v, want %v", appended, want)
+
+	// The order key is what fhttp sends by, so the written values have to appear
+	// in the order the capture carried them.
+	var added []string
+	for _, line := range strings.Split(source, "\n") {
+		if _, name, ok := strings.Cut(strings.TrimSpace(line), `headers.Add("`); ok {
+			added = append(added, name[:strings.Index(name, `"`)])
+		}
+	}
+	want := []string{"sec-ch-ua", "content-type", "x-weird"}
+	if strings.Join(added, ",") != strings.Join(want, ",") {
+		t.Errorf("added %v, want %v", added, want)
+	}
+}
+
+// TestRenderCapturedRequestKeepsUntypedBodyLiteral covers the path a payload no
+// typer understands takes: the captured bytes go out verbatim, which is exact
+// where a struct would be a guess.
+func TestRenderCapturedRequestKeepsUntypedBodyLiteral(t *testing.T) {
+	entry := capturedEntry()
+	entry.Headers = []capture.Header{{Name: "content-type", Value: "text/plain"}}
+	entry.Body = []byte("sensor=a;b;c&checksum=91f2")
+
+	opts := NewRequestOptions("shop", "post-sensor")
+	opts.Entry = &entry
+	_, source, err := RenderRequest(opts)
+	if err != nil {
+		t.Fatalf("RenderRequest: %v", err)
+	}
+	for _, want := range []string{
+		// Body is reserved even here, where nothing filled it: the payload is
+		// the captured literal below, so the field stays nil.
+		"Body any",
+		"body := `sensor=a;b;c&checksum=91f2`",
+		"strings.NewReader(body)",
+	} {
+		if !strings.Contains(source, want) {
+			t.Errorf("rendered source is missing:\n  %s\n--- got ---\n%s", want, source)
+		}
 	}
 }
 
@@ -261,7 +305,7 @@ func TestRenderCapturedRequestWithoutBody(t *testing.T) {
 	entry := capturedEntry()
 	entry.Body = nil
 	entry.Method = http.MethodGet
-	opts := NewRequestOptions("checkout", "get-cart")
+	opts := NewRequestOptions("shop", "get-cart")
 	opts.Entry = &entry
 
 	_, source, err := RenderRequest(opts)
@@ -350,15 +394,9 @@ func validCombos() []Options {
 			for _, proxy := range []bool{true, false} {
 				for _, taskPersist := range []bool{true, false} {
 					for _, proxyPersist := range []bool{true, false} {
-						o := Options{
-							Name:         "sample",
-							Package:      "sample",
-							Durable:      durable,
-							Output:       output,
-							Proxy:        proxy,
-							TaskPersist:  taskPersist,
-							ProxyPersist: proxyPersist,
-						}
+						o := NewOptions("shop", "sample")
+						o.Durable, o.Output = durable, output
+						o.Proxy, o.TaskPersist, o.ProxyPersist = proxy, taskPersist, proxyPersist
 						if !o.Proxy {
 							o.ProxyPersist = false // mirror CLI normalization
 						}
@@ -393,7 +431,7 @@ func dedupe(in []Options) []Options {
 func TestRenderProducesValidGo(t *testing.T) {
 	for _, o := range validCombos() {
 		t.Run(comboName(o), func(t *testing.T) {
-			files, err := Render("example.com/consumer", o)
+			files, err := Render("example.com/consumer", o, true)
 			if err != nil {
 				t.Fatalf("Render: %v", err)
 			}
@@ -419,13 +457,50 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 		t.Run(comboName(o), func(t *testing.T) {
 			dir := t.TempDir()
 
-			if _, err := Write(dir, "example.com/consumer", o); err != nil {
-				t.Fatalf("Write: %v", err)
+			if _, _, err := WriteWorkflow(dir, "example.com/consumer", o); err != nil {
+				t.Fatalf("WriteWorkflow: %v", err)
+			}
+			// A workflow has no graph until a state derives one, so the tree is
+			// only a workflows.Instance once the first state lands — which puts
+			// the state template under the same compile check as the rest.
+			state := NewStateOptions(o.Domain, o.Name, "fetch")
+			state.ModulePath = "example.com/consumer"
+			if _, _, err := WriteState(dir, state, false, ""); err != nil {
+				t.Fatalf("WriteState: %v", err)
 			}
 			writeConsumerModule(t, dir)
 			vetModule(t, dir)
 		})
 	}
+}
+
+// TestAddedWorkflowsCompile extends the contract to a domain that grows: the
+// registration is re-derived around each workflow, and the entrypoint written
+// with the first one is not — so a second workflow must leave it building. That
+// is what hands Register a Configs struct rather than a parameter per workflow.
+func TestAddedWorkflowsCompile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compile test in short mode")
+	}
+	dir := t.TempDir()
+
+	for _, name := range []string{"checkout", "signup"} {
+		o := NewOptions("shop", name)
+		o.Durable, o.Output = true, true
+		o.Proxy, o.TaskPersist, o.ProxyPersist = true, true, true
+		if _, _, err := WriteWorkflow(dir, "example.com/consumer", o); err != nil {
+			t.Fatalf("WriteWorkflow(%q): %v", name, err)
+		}
+		// A workflow is only a workflows.Instance once a state derives its graph.
+		state := NewStateOptions("shop", name, "fetch")
+		state.ModulePath = "example.com/consumer"
+		if _, _, err := WriteState(dir, state, false, ""); err != nil {
+			t.Fatalf("WriteState(%q): %v", name, err)
+		}
+	}
+
+	writeConsumerModule(t, dir)
+	vetModule(t, dir)
 }
 
 // TestAddedRequestsCompile extends the contract to the request verb: requests
@@ -437,13 +512,19 @@ func TestAddedRequestsCompile(t *testing.T) {
 	}
 	dir := t.TempDir()
 
-	if _, err := Write(dir, "example.com/consumer", Options{
-		Name: "checkout", Package: "checkout", Output: true,
-	}); err != nil {
-		t.Fatalf("Write: %v", err)
+	base := NewOptions("shop", "checkout")
+	base.Output, base.TaskPersist = true, true
+	if _, _, err := WriteWorkflow(dir, "example.com/consumer", base); err != nil {
+		t.Fatalf("WriteWorkflow: %v", err)
+	}
+	// A workflow is only a workflows.Instance once a state derives its graph.
+	state := NewStateOptions("shop", "checkout", "fetch")
+	state.ModulePath = "example.com/consumer"
+	if _, _, err := WriteState(dir, state, false, ""); err != nil {
+		t.Fatalf("WriteState: %v", err)
 	}
 	for _, name := range []string{"add-to-cart", "submit_checkout", "getCSRF"} {
-		if _, _, err := WriteRequest(dir, NewRequestOptions("checkout", name), false); err != nil {
+		if _, _, err := WriteRequest(dir, NewRequestOptions("shop", name), false); err != nil {
 			t.Fatalf("WriteRequest(%q): %v", name, err)
 		}
 	}
@@ -452,7 +533,7 @@ func TestAddedRequestsCompile(t *testing.T) {
 	// place in the compile contract — with and without a body, since the body is
 	// what decides whether the strings import belongs.
 	withBody := capturedEntry()
-	captured := NewRequestOptions("checkout", "captured-post")
+	captured := NewRequestOptions("shop", "captured-post")
 	captured.Entry = &withBody
 	if _, _, err := WriteRequest(dir, captured, false); err != nil {
 		t.Fatalf("WriteRequest(captured): %v", err)
@@ -461,7 +542,7 @@ func TestAddedRequestsCompile(t *testing.T) {
 	noBody := capturedEntry()
 	noBody.Body = nil
 	noBody.Method = http.MethodGet
-	bodyless := NewRequestOptions("checkout", "captured-get")
+	bodyless := NewRequestOptions("shop", "captured-get")
 	bodyless.Entry = &noBody
 	if _, _, err := WriteRequest(dir, bodyless, false); err != nil {
 		t.Fatalf("WriteRequest(captured, no body): %v", err)
@@ -472,7 +553,7 @@ func TestAddedRequestsCompile(t *testing.T) {
 	jsonBody := capturedEntry()
 	jsonBody.Headers = []capture.Header{{Name: "content-type", Value: "application/json"}}
 	jsonBody.Body = []byte(`{"zebra":"z","nested":{"when":"2028-07-10T00:00:00-04:00"}}`)
-	typedBody := NewRequestOptions("checkout", "captured-json")
+	typedBody := NewRequestOptions("shop", "captured-json")
 	typedBody.Entry = &jsonBody
 	if _, _, err := WriteRequest(dir, typedBody, false); err != nil {
 		t.Fatalf("WriteRequest(captured, json body): %v", err)

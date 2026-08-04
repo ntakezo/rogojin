@@ -13,6 +13,7 @@ require (
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/bogdanfinn/utls v1.7.7-barnius // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
+	github.com/mattn/go-sqlite3 v1.14.22 // indirect
 	golang.org/x/crypto v0.36.0 // indirect
 	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect

@@ -1,8 +1,8 @@
-// Package capture reads recorded HTTP exchanges from a capture tool and reduces
-// them to what a generated request function needs: the URL, the wire order of
-// the headers and HTTP/2 pseudo-headers, and the body bytes exactly as sent.
+// Package capture reads recorded HTTP exchanges and reduces them to what a
+// generated request function needs: the URL, the wire order of the headers and
+// HTTP/2 pseudo-headers, and the body bytes exactly as sent.
 //
-// The capture is the source of truth. Nothing here normalizes, sorts, or
+// The capture is the source of truth. Nothing here normalizes, sorts, drops, or
 // re-encodes what it reads — header order and body bytes are fingerprinting
 // signals, and a value that looks wrong is a value the client really sent.
 package capture
@@ -21,7 +21,10 @@ type Header struct {
 // reproduced from Pseudo instead. Response is nil when the exchange recorded
 // no reply.
 type Entry struct {
-	ID       string
+	ID string
+	// Source names where the entry came from, in the words of the adapter that
+	// read it, so the renderer can cite its provenance without knowing any.
+	Source   string
 	URL      string
 	Method   string
 	Proto    string
@@ -41,21 +44,14 @@ type Response struct {
 	Body       []byte
 }
 
-// dropped are the headers a generated request must not write: the transport
-// derives Content-Length from the body it is given, and a stale literal
-// contradicts it.
-var dropped = map[string]bool{"content-length": true}
-
 // splitHeaders divides captured fields into the pseudo-header names and the
-// ordinary headers, preserving the order of each and dropping only what the
-// transport owns.
+// ordinary headers, preserving the order of each. Nothing is dropped: which
+// headers a client writes for itself is the renderer's decision, and the order
+// they were sent in belongs to every one of them.
 func splitHeaders(fields []Header) (headers []Header, pseudo []string) {
 	for _, f := range fields {
 		if strings.HasPrefix(f.Name, ":") {
 			pseudo = append(pseudo, f.Name)
-			continue
-		}
-		if dropped[strings.ToLower(f.Name)] {
 			continue
 		}
 		headers = append(headers, f)

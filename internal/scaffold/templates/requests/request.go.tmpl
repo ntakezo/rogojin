@@ -10,6 +10,10 @@ import (
 // needs; a state fills them in at the call site.
 type {{.Ident}}Request struct {
 	URL string
+
+	// Body is the payload, and the only thing encoded. Give it a named
+	// {{.Ident}}Body when this request grows one; until then it stays nil.
+	Body any
 }
 
 // {{.Ident}}Response is the shape {{.Ident}}'s body unmarshals into. Give it
@@ -17,14 +21,21 @@ type {{.Ident}}Request struct {
 type {{.Ident}}Response struct{}
 
 // {{.Ident}} fires one call and returns the raw response, leaving decode and
-// body-close to the caller. Replace the method, URL, and headers with the
-// captured ones; Append sends them in the order they are written here.
+// body-close to the caller. `rogojin request --entry` writes this from a capture.
 func {{.Ident}}(ctx context.Context, client *http.Client, r {{.Ident}}Request) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Append("Accept", "application/json")
-	req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
+
+	// The order key is the send order, matched lowercased.
+	// cookie gets no Add: the jar fills it in at that position.
+	headers := http.Header{
+		http.HeaderOrderKey:  {"accept", "accept-language", "cookie"},
+		http.PHeaderOrderKey: {":method", ":authority", ":scheme", ":path"},
+	}
+	headers.Add("accept", "application/json")
+	headers.Add("accept-language", "en-US,en;q=0.9")
+	req.Header = headers
 	return client.Do(req)
 }

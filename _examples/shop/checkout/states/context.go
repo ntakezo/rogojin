@@ -2,20 +2,14 @@ package states
 
 import (
 	"context"
-{{- if or .Output .Durable}}
 	"encoding/json"
-{{- end}}
 	"fmt"
-{{- if .Proxy}}
 	"net/url"
-{{- end}}
 
 	http "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/fhttp/cookiejar"
 	"github.com/ntakezo/rogojin/comms"
-{{- if .Proxy}}
 	"github.com/ntakezo/rogojin/proxies"
-{{- end}}
 	"github.com/ntakezo/rogojin/workflows"
 )
 
@@ -23,27 +17,20 @@ import (
 // the fields your workflow needs; they are held by value and never mutated.
 type Input struct{}
 
-{{- if .Output}}
-
 // Output is what the workflow produces, set by the terminal state and marshaled
 // on clean completion. Add the fields your workflow returns.
 type Output struct{}
-{{- end}}
 
 // running is the state the workflow accumulates as it advances, plus its side
 // effects. It is a pointer on Context so handlers mutate one shared copy.
 type running struct {
-{{- if .Proxy}}
 	proxies *proxies.Manager
 	taskID  string
 	lease   *proxies.Lease
-{{- end}}
-	client *http.Client
-	bus    comms.Bus
-{{- if .Output}}
+	client  *http.Client
+	bus     comms.Bus
 
 	output Output
-{{- end}}
 }
 
 // Context is the receiver shared across every state. input is immutable per
@@ -54,28 +41,26 @@ type Context struct {
 }
 
 // NewContext builds a fresh context for one task.
-func NewContext(input Input, deps workflows.Deps{{if .Proxy}}, manager *proxies.Manager{{end}}) *Context {
+func NewContext(input Input, deps workflows.Deps, manager *proxies.Manager) *Context {
 	return &Context{
 		input: input,
 		r: &running{
-{{- if .Proxy}}
 			proxies: manager,
 			taskID:  deps.TaskID,
-{{- end}}
-			bus: deps.Bus,
+			bus:     deps.Bus,
 		},
 	}
 }
-{{if .Output}}
+
 // Output marshals the workflow's Output to JSON. The engine reads it only on
 // clean completion; a run that is killed or errors produces none.
 func (c *Context) Output() ([]byte, error) {
 	return json.Marshal(c.r.output)
 }
-{{end}}
+
 // client builds the task's HTTP client on first use, backed by an isolated
-// cookie jar so each task carries its own session{{if .Proxy}}. The proxy is leased here
-// too, so a recovered task acquires its own wherever in the graph it resumes{{end}}.
+// cookie jar so each task carries its own session. The proxy is leased here
+// too, so a recovered task acquires its own wherever in the graph it resumes.
 func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	if c.r.client != nil {
 		return c.r.client, nil
@@ -84,7 +69,6 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new cookie jar: %w", err)
 	}
-{{- if .Proxy}}
 	lease, err := c.r.proxies.Acquire(ctx, c.r.taskID)
 	if err != nil {
 		return nil, fmt.Errorf("acquire proxy: %w", err)
@@ -96,12 +80,9 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	}
 	c.r.lease = lease
 	c.r.client = &http.Client{Jar: jar, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
-{{- else}}
-	c.r.client = &http.Client{Jar: jar}
-{{- end}}
 	return c.r.client, nil
 }
-{{if .Proxy}}
+
 // Teardown releases the task's proxy lease exactly once when the run exits,
 // reporting success on the absence of a run error.
 func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
@@ -110,8 +91,7 @@ func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr 
 	}
 	return c.r.lease.Release(runErr == nil)
 }
-{{end}}
-{{- if .Durable}}
+
 // snapshot is the JSON persisted for recovery: every value a resumed state
 // needs, and nothing else. Side effects are rebuilt on restore, not serialized.
 type snapshot struct {
@@ -126,11 +106,10 @@ func (c *Context) Snapshot() ([]byte, error) {
 
 // RestoreContext rebuilds a context from a JSON snapshot; the lease and client
 // are re-acquired lazily on first use.
-func RestoreContext(deps workflows.Deps, blob []byte{{if .Proxy}}, manager *proxies.Manager{{end}}) (*Context, error) {
+func RestoreContext(deps workflows.Deps, blob []byte, manager *proxies.Manager) (*Context, error) {
 	var s snapshot
 	if err := json.Unmarshal(blob, &s); err != nil {
 		return nil, err
 	}
-	return NewContext(s.Input, deps{{if .Proxy}}, manager{{end}}), nil
+	return NewContext(s.Input, deps, manager), nil
 }
-{{- end}}

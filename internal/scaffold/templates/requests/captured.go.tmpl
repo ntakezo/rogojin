@@ -6,48 +6,68 @@ import (
 {{- end}}
 
 	http "github.com/bogdanfinn/fhttp"
+{{- if eq .BodyEncoding "form"}}
+	"github.com/justhyped/OrderedForm"
+{{- end}}
 )
 
 {{if .BodyTyped -}}
-// {{.Ident}}Body is the JSON body {{.Ident}} sends, typed from the capture and
-// marshaled back to it. Its fields are declared in the order the capture
-// carried them, which is the order they go out in.
+{{if eq .BodyEncoding "form" -}}
+// {{.Ident}}Body is the form {{.Ident}} submits. Fields are declared and set in
+// the captured order, and are strings because a form carries no other type.
+{{else -}}
+// {{.Ident}}Body is the JSON body {{.Ident}} sends. Fields are declared in the
+// captured order, which is the order they are marshaled in.
+{{end -}}
 type {{.Ident}}Body {{.BodyType}}
 
-// {{.Ident}}Request is the input to {{.Ident}}: the body, plus any value you
-// lift out of the call below. Only Body is marshaled, so a URL or a header
-// field added here cannot leak into the payload.
+// {{.Ident}}Request is the input to {{.Ident}}. Lift each value that varies per
+// task into a field here and reference it below.
 type {{.Ident}}Request struct {
+	// Body is the payload, and the only thing encoded. Every request reserves
+	// the name, so a field added beside it cannot reach the wire.
 	Body {{.Ident}}Body
 }
 {{- else -}}
-// {{.Ident}}Request is the input to {{.Ident}}. It is empty because the request
-// renders exactly as captured; lift each value that varies per task into a
-// field here and reference it below.
-type {{.Ident}}Request struct{}
+// {{.Ident}}Request is the input to {{.Ident}}. Lift each value that varies per
+// task into a field here and reference it below.
+type {{.Ident}}Request struct {
+	// Body is the payload, and the only thing encoded. Every request reserves
+{{- if .Body}}
+	// the name; this one's body was not typed, so it stays nil.
+{{- else}}
+	// the name; this request sends no body, so it stays nil.
+{{- end}}
+	Body any
+}
 {{- end}}
 
 {{if .ResponseInferred -}}
 // {{.Ident}}Response is the body {{.Ident}} returned, typed from the capture. It
-// describes that one reply, so a field the endpoint only sometimes sends is not
-// here until you add it.
+// describes that one reply: a field the endpoint only sometimes sends is absent.
 {{- else -}}
 // {{.Ident}}Response is the shape {{.Ident}}'s body unmarshals into: give it the
-// fields the caller reads, or drop it if the endpoint returns none.
 {{- if .ResponseMedia}}
-// Nothing was typed from the capture, whose response was {{.ResponseMedia}}.
+// fields the caller reads. Nothing typed from a {{.ResponseMedia}} response.
+{{- else}}
+// fields the caller reads, or drop it if the endpoint returns none.
 {{- end}}
 {{- end}}
 type {{.Ident}}Response {{.ResponseType}}
 
-// {{.Ident}} sends the request exactly as captured: same URL, same header
-// order, same body. Every value is still the captured literal, so rewrite
-// the ones that vary per task before relying on it.
-// Generated from {{.Source}}.
+// {{.Ident}} sends the request as captured, so every value below is still the
+// captured one. Generated from {{.Source}}.
 func {{.Ident}}(ctx context.Context, client *http.Client, r {{.Ident}}Request) (*http.Response, error) {
 {{- if .BodyTyped}}
-	// json.Marshal escapes <, > and & to \u00xx, which the captured body did
-	// not; an encoder with escaping off reproduces it byte for byte.
+{{- if eq .BodyEncoding "form"}}
+	// OrderedForm sends the fields in the order they are set; url.Values sorts.
+	form := new(OrderedForm.OrderedForm)
+{{- range .BodyFields}}
+	form.Set({{quote .Key}}, r.Body.{{.Ident}})
+{{- end}}
+	req, err := http.NewRequestWithContext(ctx, {{.Method}}, {{quote .URL}}, strings.NewReader(form.URLEncode()))
+{{- else}}
+	// json.Marshal escapes <, > and & to \u00xx; the captured body did not.
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -56,6 +76,7 @@ func {{.Ident}}(ctx context.Context, client *http.Client, r {{.Ident}}Request) (
 	}
 	body := bytes.TrimRight(buf.Bytes(), "\n")
 	req, err := http.NewRequestWithContext(ctx, {{.Method}}, {{quote .URL}}, bytes.NewReader(body))
+{{- end}}
 {{- else if .Body}}
 	body := {{.Body}}
 	req, err := http.NewRequestWithContext(ctx, {{.Method}}, {{quote .URL}}, strings.NewReader(body))
@@ -65,13 +86,20 @@ func {{.Ident}}(ctx context.Context, client *http.Client, r {{.Ident}}Request) (
 	if err != nil {
 		return nil, err
 	}
-	// Append writes the header and records its place in the order fhttp sends
-	// them in, so these lines are the captured order.
-{{- range .Headers}}
-	req.Header.Append({{quote .Name}}, {{quote .Value}})
+
+	// The order key is the captured send order, matched lowercased.
+{{- if .Owned}}
+	// {{.Owned}} get no Add: the client fills them in at that position.
 {{- end}}
+	headers := http.Header{
+		http.HeaderOrderKey: { {{- range $i, $name := .Order}}{{if $i}}, {{end}}{{quote $name}}{{end -}} },
 {{- if .Pseudo}}
-	req.Header[http.PHeaderOrderKey] = []string{ {{- range $i, $name := .Pseudo}}{{if $i}}, {{end}}{{quote $name}}{{end -}} }
+		http.PHeaderOrderKey: { {{- range $i, $name := .Pseudo}}{{if $i}}, {{end}}{{quote $name}}{{end -}} },
 {{- end}}
+	}
+{{- range .Headers}}
+	headers.Add({{quote .Name}}, {{quote .Value}})
+{{- end}}
+	req.Header = headers
 	return client.Do(req)
 }

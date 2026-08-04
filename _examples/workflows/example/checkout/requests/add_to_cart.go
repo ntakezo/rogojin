@@ -31,6 +31,8 @@ type AddToCartResponse struct {
 
 // AddToCart posts the variant as a form body with the CSRF token in a header.
 func AddToCart(ctx context.Context, client *http.Client, r AddToCartRequest) (*http.Response, error) {
+	// OrderedForm keeps the fields in the order they are set; url.Values would
+	// sort the keys instead.
 	form := new(OrderedForm.OrderedForm)
 	form.Set("variantID", r.Body.VariantID)
 	form.Set("quantity", strconv.Itoa(r.Body.Quantity))
@@ -38,8 +40,15 @@ func AddToCart(ctx context.Context, client *http.Client, r AddToCartRequest) (*h
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Append("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Append("X-CSRF-Token", r.CSRFToken)
-	req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
+
+	// content-length and cookie are listed with no Add: the transport and the
+	// cookie jar own them, and this is where their values have to land.
+	headers := http.Header{
+		http.HeaderOrderKey:  {"content-length", "content-type", "x-csrf-token", "cookie"},
+		http.PHeaderOrderKey: {":method", ":authority", ":scheme", ":path"},
+	}
+	headers.Add("content-type", "application/x-www-form-urlencoded")
+	headers.Add("x-csrf-token", r.CSRFToken)
+	req.Header = headers
 	return client.Do(req)
 }

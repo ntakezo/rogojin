@@ -39,7 +39,14 @@ func SubmitCheckout(ctx context.Context, client *http.Client, r SubmitCheckoutRe
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Append("Content-Type", "application/json")
-	req.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
+
+	// content-length and cookie are listed with no Add: the transport and the
+	// cookie jar own them, and this is where their values have to land.
+	headers := http.Header{
+		http.HeaderOrderKey:  {"content-length", "content-type", "cookie"},
+		http.PHeaderOrderKey: {":method", ":authority", ":scheme", ":path"},
+	}
+	headers.Add("content-type", "application/json")
+	req.Header = headers
 	return client.Do(req)
 }

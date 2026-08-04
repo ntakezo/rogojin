@@ -28,9 +28,8 @@ func serve(t *testing.T, status int, body string) PowHTTP {
 }
 
 // TestEntryReadsCapturedOrder is the contract the whole generator rests on: the
-// wire order of the headers survives the round trip through the data API, the
-// pseudo-headers are split out of the ordinary ones, and Content-Length — which
-// the transport owns — is dropped.
+// wire order of the headers survives the round trip through the data API, and
+// the pseudo-headers are split out of the ordinary ones.
 func TestEntryReadsCapturedOrder(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/entry_get.json")
 	if err != nil {
@@ -92,10 +91,12 @@ func entryJSON(t *testing.T, method string, headers [][2]string, body []byte) st
 	return string(raw)
 }
 
-// TestEntryKeepsRepeatedHeaders guards the case that a header map would destroy:
-// HTTP/2 splits a long cookie into several fields, and each one has to survive
-// in place or the request that goes out is not the request that was captured.
-func TestEntryKeepsRepeatedHeaders(t *testing.T) {
+// TestEntryKeepsEveryHeader guards the cases a header map would destroy: HTTP/2
+// splits a long cookie into several fields, and each one has to survive in place
+// or the request that goes out is not the request that was captured. Nothing is
+// dropped here — Content-Length included — because its position in the order is
+// part of the capture even where the value is the renderer's to leave out.
+func TestEntryKeepsEveryHeader(t *testing.T) {
 	headers := [][2]string{
 		{":method", "POST"},
 		{":path", "/cart"},
@@ -111,17 +112,13 @@ func TestEntryKeepsRepeatedHeaders(t *testing.T) {
 		t.Fatalf("Entry: %v", err)
 	}
 
-	var cookies int
+	var order []string
 	for _, h := range got.Headers {
-		if h.Name == "content-length" {
-			t.Error("Content-Length survived; the transport derives it from the body")
-		}
-		if h.Name == "cookie" {
-			cookies++
-		}
+		order = append(order, h.Name)
 	}
-	if cookies != 3 {
-		t.Errorf("kept %d cookie fields, want 3", cookies)
+	wantOrder := []string{"content-length", "content-type", "cookie", "cookie", "cookie"}
+	if strings.Join(order, ",") != strings.Join(wantOrder, ",") {
+		t.Errorf("header order = %v, want %v", order, wantOrder)
 	}
 	if string(got.Body) != "variant=1" {
 		t.Errorf("Body = %q, want %q", got.Body, "variant=1")
