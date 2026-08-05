@@ -7,9 +7,9 @@ import (
 	"context"
 	"log"
 
-	"github.com/ntakezo/rogojin/_examples/shop"
-	"github.com/ntakezo/rogojin/_examples/shop/checkout"
-	"github.com/ntakezo/rogojin/_examples/shop/checkout/states"
+	"github.com/ntakezo/rogojin/_examples/workflows/shop"
+	"github.com/ntakezo/rogojin/_examples/workflows/shop/checkout"
+	"github.com/ntakezo/rogojin/_examples/workflows/shop/checkout/states"
 	"github.com/ntakezo/rogojin/comms"
 	"github.com/ntakezo/rogojin/persistence/proxysqlite"
 	"github.com/ntakezo/rogojin/persistence/tasksqlite"

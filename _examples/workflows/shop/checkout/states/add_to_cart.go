@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/ntakezo/rogojin/_examples/shop/requests"
+	"github.com/ntakezo/rogojin/_examples/workflows/shop/requests"
 	"github.com/ntakezo/rogojin/workflows"
 )
 

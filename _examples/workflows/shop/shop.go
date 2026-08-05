@@ -6,8 +6,8 @@ import (
 	"errors"
 	"reflect"
 
-	"github.com/ntakezo/rogojin/_examples/shop/checkout"
-	"github.com/ntakezo/rogojin/_examples/shop/signup"
+	"github.com/ntakezo/rogojin/_examples/workflows/shop/checkout"
+	"github.com/ntakezo/rogojin/_examples/workflows/shop/signup"
 	"github.com/ntakezo/rogojin/tasks"
 )
 

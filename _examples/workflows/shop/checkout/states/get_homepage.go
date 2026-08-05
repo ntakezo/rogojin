@@ -3,7 +3,7 @@ package states
 import (
 	"context"
 
-	"github.com/ntakezo/rogojin/_examples/shop/requests"
+	"github.com/ntakezo/rogojin/_examples/workflows/shop/requests"
 	"github.com/ntakezo/rogojin/workflows"
 )
 
