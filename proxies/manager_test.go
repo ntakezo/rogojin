@@ -163,7 +163,7 @@ type acquireResult struct {
 func acquireAsync(ctx context.Context, m *Manager, taskID, groupID string) chan acquireResult {
 	ch := make(chan acquireResult, 1)
 	go func() {
-		l, err := m.Acquire(ctx, taskID, groupID)
+		l, err := m.Acquire(ctx, Assignment{TaskID: taskID, GroupID: groupID})
 		ch <- acquireResult{l, err}
 	}()
 	return ch
@@ -194,7 +194,7 @@ func mustComplete(t *testing.T, ch chan acquireResult) acquireResult {
 // with nothing to rotate.
 func TestAcquireEmptyPool(t *testing.T) {
 	m := newTestManager(t, newFakeRepo(), 1, nil)
-	if _, err := m.Acquire(context.Background(), "t1", ""); !errors.Is(err, ErrNoProxies) {
+	if _, err := m.Acquire(context.Background(), Assignment{TaskID: "t1"}); !errors.Is(err, ErrNoProxies) {
 		t.Fatalf("err = %v, want ErrNoProxies", err)
 	}
 }
@@ -203,7 +203,7 @@ func TestAcquireEmptyPool(t *testing.T) {
 // know fails with ErrGroupNotFound instead of blocking or falling back.
 func TestAcquireUnknownGroup(t *testing.T) {
 	m := newTestManager(t, newFakeRepo(Proxy{ID: "p1"}), 1, nil)
-	if _, err := m.Acquire(context.Background(), "t1", "missing"); !errors.Is(err, ErrGroupNotFound) {
+	if _, err := m.Acquire(context.Background(), Assignment{TaskID: "t1", GroupID: "missing"}); !errors.Is(err, ErrGroupNotFound) {
 		t.Fatalf("err = %v, want ErrGroupNotFound", err)
 	}
 }
@@ -277,7 +277,7 @@ func TestExclusiveBlocksUntilRelease(t *testing.T) {
 	repo := newFakeRepo(Proxy{ID: "p1", URL: "http://p1"})
 	m := newTestManager(t, repo, 1, nil)
 
-	lease, err := m.Acquire(context.Background(), "t1", "")
+	lease, err := m.Acquire(context.Background(), Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
@@ -305,11 +305,11 @@ func TestGroupCapAllowsConcurrentHolders(t *testing.T) {
 	m := newTestManager(t, repo, 2, nil)
 	ctx := context.Background()
 
-	l1, err := m.Acquire(ctx, "t1", "")
+	l1, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	if _, err := m.Acquire(ctx, "t2", ""); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t2"}); err != nil {
 		t.Fatalf("second acquire under cap: %v", err)
 	}
 
@@ -332,7 +332,7 @@ func TestProxyCapOverridesGroupCap(t *testing.T) {
 	m := newTestManager(t, repo, 2, nil)
 	ctx := context.Background()
 
-	if _, err := m.Acquire(ctx, "t1", ""); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t1"}); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	mustBlock(t, acquireAsync(ctx, m, "t2", ""))
@@ -340,10 +340,10 @@ func TestProxyCapOverridesGroupCap(t *testing.T) {
 	// group tolerates 1, proxy tolerates 2: second acquire succeeds.
 	repo = newFakeRepo(Proxy{ID: "p1", MaxHolders: 2})
 	m = newTestManager(t, repo, 1, nil)
-	if _, err := m.Acquire(ctx, "t1", ""); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t1"}); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	if _, err := m.Acquire(ctx, "t2", ""); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t2"}); err != nil {
 		t.Fatalf("second acquire under proxy cap: %v", err)
 	}
 }
@@ -356,7 +356,7 @@ func TestUnlimitedHolders(t *testing.T) {
 	ctx := context.Background()
 
 	for i := range 25 {
-		if _, err := m.Acquire(ctx, "t", ""); err != nil {
+		if _, err := m.Acquire(ctx, Assignment{TaskID: "t"}); err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
 	}
@@ -375,7 +375,7 @@ func TestAcquireScopedToGroup(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	l, err := m.Acquire(ctx, "t1", "ga")
+	l, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
 	if err != nil {
 		t.Fatalf("acquire from ga: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestAcquireScopedToGroup(t *testing.T) {
 	mustBlock(t, acquireAsync(ctx, m, "t2", "ga"))
 
 	// gb unaffected.
-	got, err := m.Acquire(ctx, "t3", "gb")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t3", GroupID: "gb"})
 	if err != nil {
 		t.Fatalf("acquire from gb: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestPerGroupStrategyState(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	first, err := m.Acquire(ctx, "t1", "ga")
+	first, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
 	if err != nil {
 		t.Fatalf("acquire ga: %v", err)
 	}
@@ -418,7 +418,7 @@ func TestPerGroupStrategyState(t *testing.T) {
 		t.Fatalf("ga first pick = %s, want a1", first.Proxy().ID)
 	}
 	// If cursors were shared, ga's acquire above would push gb's pick to b2.
-	got, err := m.Acquire(ctx, "t2", "gb")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t2", GroupID: "gb"})
 	if err != nil {
 		t.Fatalf("acquire gb: %v", err)
 	}
@@ -433,7 +433,7 @@ func TestAcquireHonorsContextCancel(t *testing.T) {
 	repo := newFakeRepo(Proxy{ID: "p1"})
 	m := newTestManager(t, repo, 1, nil)
 
-	if _, err := m.Acquire(context.Background(), "t1", ""); err != nil {
+	if _, err := m.Acquire(context.Background(), Assignment{TaskID: "t1"}); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 
@@ -456,14 +456,14 @@ func TestReleaseRecordsOutcomeAndPersists(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	l1, err := m.Acquire(ctx, "t1", "")
+	l1, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	if err := l1.Release(true); err != nil {
 		t.Fatalf("release success: %v", err)
 	}
-	l2, err := m.Acquire(ctx, "t1", "")
+	l2, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestDoubleReleaseFreesOnce(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	l, err := m.Acquire(ctx, "t1", "")
+	l, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -498,7 +498,7 @@ func TestDoubleReleaseFreesOnce(t *testing.T) {
 		t.Fatalf("second release should be a no-op, got %v", err)
 	}
 
-	if _, err := m.Acquire(ctx, "t2", ""); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t2"}); err != nil {
 		t.Fatalf("acquire after release: %v", err)
 	}
 	// if the double release had leaked a slot, this would succeed instead of block.
@@ -512,7 +512,7 @@ func TestLockExcludesProxyFromRotation(t *testing.T) {
 	repo := newFakeRepo(Proxy{ID: "p1"})
 	m := newTestManager(t, repo, 1, nil)
 
-	l, err := m.Lock(context.Background(), "t1", "")
+	l, err := m.Lock(context.Background(), Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -535,7 +535,7 @@ func TestLockPersistsBinding(t *testing.T) {
 	repo := newFakeRepo(Proxy{ID: "p1"})
 	m := newTestManager(t, repo, 1, nil)
 
-	l, err := m.Lock(context.Background(), "t1", "")
+	l, err := m.Lock(context.Background(), Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -553,7 +553,7 @@ func TestAcquireReturnsLockedProxy(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -562,7 +562,7 @@ func TestAcquireReturnsLockedProxy(t *testing.T) {
 	}
 	l.Release(true)
 
-	got, err := m.Acquire(ctx, "t1", "")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -578,13 +578,13 @@ func TestLockIdempotent(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	l1, err := m.Lock(ctx, "t1", "")
+	l1, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("first lock: %v", err)
 	}
 	l1.Release(true)
 
-	l2, err := m.Lock(ctx, "t1", "")
+	l2, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("second lock: %v", err)
 	}
@@ -604,7 +604,7 @@ func TestReclaimAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 
 	m1 := newTestManager(t, repo, 1, nil)
-	l, err := m1.Lock(ctx, "t1", "")
+	l, err := m1.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -614,7 +614,7 @@ func TestReclaimAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewManager after restart: %v", err)
 	}
-	got, err := m2.Acquire(ctx, "t1", "")
+	got, err := m2.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire after restart: %v", err)
 	}
@@ -630,7 +630,7 @@ func TestUnlockReturnsProxyToPool(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -643,7 +643,7 @@ func TestUnlockReturnsProxyToPool(t *testing.T) {
 		t.Fatalf("persisted OwnerID = %q, want cleared", owner)
 	}
 
-	got, err := m.Acquire(ctx, "t2", "")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t2"})
 	if err != nil {
 		t.Fatalf("acquire after unlock: %v", err)
 	}
@@ -678,7 +678,7 @@ func TestDeleteUnlockedProxy(t *testing.T) {
 	if repo.has("p1") {
 		t.Fatal("p1 still in repo after delete")
 	}
-	got, err := m.Acquire(ctx, "t1", "")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -696,7 +696,7 @@ func TestDeleteLockedProxyReassign(t *testing.T) {
 	m := newTestManager(t, repo, 1, policy)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -715,7 +715,7 @@ func TestDeleteLockedProxyReassign(t *testing.T) {
 		t.Fatal("p1 still in repo after delete")
 	}
 
-	got, err := m.Acquire(ctx, "t1", "")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -738,7 +738,7 @@ func TestDeleteLockedProxyReassignStaysInGroup(t *testing.T) {
 	m := newTestManager(t, repo, 1, policy)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "ga")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -763,7 +763,7 @@ func TestDeleteLockedProxyUnbind(t *testing.T) {
 	m := newTestManager(t, repo, 1, policy)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -776,7 +776,7 @@ func TestDeleteLockedProxyUnbind(t *testing.T) {
 		t.Fatalf("p2 OwnerID = %q, want unbound", owner)
 	}
 
-	got, err := m.Acquire(ctx, "t1", "")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -793,7 +793,7 @@ func TestDeleteLockedProxyFail(t *testing.T) {
 	m := newTestManager(t, repo, 1, policy)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -819,7 +819,7 @@ func TestDeleteLockedProxyWithoutPolicy(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -851,7 +851,7 @@ func TestAddProxy(t *testing.T) {
 		t.Fatal("timestamps not stamped")
 	}
 
-	got, err := m.Acquire(ctx, "t1", "")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -894,7 +894,7 @@ func TestCreateGroup(t *testing.T) {
 	if err := m.AddProxy(ctx, Proxy{ID: "p1", GroupID: "g"}); err != nil {
 		t.Fatalf("add to new group: %v", err)
 	}
-	if _, err := m.Acquire(ctx, "t1", "g"); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "g"}); err != nil {
 		t.Fatalf("acquire from new group: %v", err)
 	}
 
@@ -921,7 +921,7 @@ func TestDeleteGroupCascades(t *testing.T) {
 	m := newTestManager(t, repo, 1, policy)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "ga")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -942,7 +942,7 @@ func TestDeleteGroupCascades(t *testing.T) {
 	}
 
 	// the freed task rotates again: its durable lock died with the group.
-	if _, err := m.Acquire(ctx, "t1", "gb"); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "gb"}); err != nil {
 		t.Fatalf("acquire after cascade: %v", err)
 	}
 }
@@ -956,7 +956,7 @@ func TestDeleteGroupUnbindFreesLocksSilently(t *testing.T) {
 	m := newTestManager(t, repo, 1, policy)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "ga")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -986,7 +986,7 @@ func TestDeleteGroupRefusals(t *testing.T) {
 		t.Fatalf("err = %v, want ErrGroupNotFound", err)
 	}
 
-	l, err := m.Lock(ctx, "t1", "ga")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -1000,11 +1000,17 @@ func TestDeleteGroupRefusals(t *testing.T) {
 }
 
 // fixedUsage reports a canned set of running tasks, standing in for the task
-// service the manager consults before deleting a group.
+// service the manager consults before deleting a proxy or a group. running
+// maps a proxy group to the tasks rotating through it; live names the tasks
+// that answer the per-task half of the guard; pinned maps a proxy to the tasks
+// whose records name it.
 type fixedUsage struct {
 	running map[string][]string
+	live    map[string]bool
+	pinned  map[string][]string
 	err     error
 	asked   []string
+	askedID []string
 }
 
 func (u *fixedUsage) RunningTasks(ctx context.Context, proxyGroupID string) ([]string, error) {
@@ -1013,6 +1019,21 @@ func (u *fixedUsage) RunningTasks(ctx context.Context, proxyGroupID string) ([]s
 		return nil, u.err
 	}
 	return u.running[proxyGroupID], nil
+}
+
+func (u *fixedUsage) PinnedTasks(ctx context.Context, proxyID string) ([]string, error) {
+	if u.err != nil {
+		return nil, u.err
+	}
+	return u.pinned[proxyID], nil
+}
+
+func (u *fixedUsage) TaskIsRunning(ctx context.Context, taskID string) (bool, error) {
+	u.askedID = append(u.askedID, taskID)
+	if u.err != nil {
+		return false, u.err
+	}
+	return u.live[taskID], nil
 }
 
 // TestDeleteGroupRefusesGroupInUse verifies a group a running task leases from
@@ -1095,9 +1116,13 @@ func TestBlockedAcquireFailsWhenGroupDeleted(t *testing.T) {
 	repo := newFakeRepo(Proxy{ID: "a1", GroupID: "ga"})
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: "first"})
 	m := newTestManager(t, repo, 1, nil)
+	// A policy is wired because the holder t1 would otherwise block the delete:
+	// with none, the guard cannot tell a live holder from a parked one and
+	// refuses. Here it reports nothing running, the state of a suspended task.
+	m.usage = &fixedUsage{}
 	ctx := context.Background()
 
-	if _, err := m.Acquire(ctx, "t1", "ga"); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga"}); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	ch := acquireAsync(ctx, m, "t2", "ga")
@@ -1162,7 +1187,7 @@ func TestFailedRemoveLeavesStoreAndMemoryAgreeing(t *testing.T) {
 		t.Fatalf("manager unstartable after failed cascade: %v", err)
 	}
 	// And the surviving member is still leasable.
-	if _, err := m.Acquire(ctx, "t1", "ga"); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga"}); err != nil {
 		t.Fatalf("surviving member not leasable: %v", err)
 	}
 }
@@ -1178,7 +1203,7 @@ func TestFailedRemoveKeepsDurableLockVisible(t *testing.T) {
 	m := newTestManager(t, repo, 1, policy)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -1191,7 +1216,7 @@ func TestFailedRemoveKeepsDurableLockVisible(t *testing.T) {
 		t.Fatalf("stored owner = %q, want t1 still locked", owner)
 	}
 	// Memory must still agree: the owner reclaims its proxy, as a restart would.
-	got, err := m.Acquire(ctx, "t1", "")
+	got, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("owner cannot reclaim its still-locked proxy: %v", err)
 	}
@@ -1209,7 +1234,7 @@ func TestLockNeverStealsAProxyInUse(t *testing.T) {
 	m := newTestManager(t, repo, 2, nil)
 	ctx := context.Background()
 
-	holder, err := m.Acquire(ctx, "t1", "")
+	holder, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -1217,7 +1242,7 @@ func TestLockNeverStealsAProxyInUse(t *testing.T) {
 	// p1 is under the cap of 2, but t1 holds it: the lock must wait, not steal.
 	locked := make(chan acquireResult, 1)
 	go func() {
-		l, err := m.Lock(ctx, "t2", "")
+		l, err := m.Lock(ctx, Assignment{TaskID: "t2"})
 		locked <- acquireResult{l, err}
 	}()
 	select {
@@ -1238,7 +1263,7 @@ func TestLockNeverStealsAProxyInUse(t *testing.T) {
 	if err := res.lease.Release(true); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	owned, err := m.Acquire(ctx, "t2", "")
+	owned, err := m.Acquire(ctx, Assignment{TaskID: "t2"})
 	if err != nil {
 		t.Fatalf("owner blocked on its own locked proxy: %v", err)
 	}
@@ -1256,13 +1281,13 @@ func TestReassignNeverStealsAProxyInUse(t *testing.T) {
 	m := newTestManager(t, repo, 2, policy)
 	ctx := context.Background()
 
-	l, err := m.Lock(ctx, "t1", "")
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
 	l.Release(true)
 	// Occupy p2 so only p3 is idle; firstSelection would otherwise pick p2.
-	if _, err := m.Acquire(ctx, "t2", ""); err != nil {
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t2"}); err != nil {
 		t.Fatalf("acquire p2: %v", err)
 	}
 
@@ -1301,7 +1326,7 @@ func TestSelectionMustReturnACandidate(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
-	if _, err := m.Acquire(context.Background(), "t1", "ga"); err == nil {
+	if _, err := m.Acquire(context.Background(), Assignment{TaskID: "t1", GroupID: "ga"}); err == nil {
 		t.Fatal("expected an error for a selection outside the candidate set")
 	}
 	if owner := repo.get(t, "taken").OwnerID; owner != "someone" {
@@ -1340,7 +1365,7 @@ func TestReleaseCannotResurrectStaleLock(t *testing.T) {
 	m := newTestManager(t, repo, 1, nil)
 	ctx := context.Background()
 
-	lease, err := m.Lock(ctx, "t1", "")
+	lease, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("Lock: %v", err)
 	}
@@ -1381,5 +1406,670 @@ func TestReleaseCannotResurrectStaleLock(t *testing.T) {
 	}
 	if stored.Successes != 1 {
 		t.Fatalf("stored successes = %d, want 1: the release outcome must survive the unlock", stored.Successes)
+	}
+}
+
+// TestDeleteProxyRefusesLeaseHeldByRunningTask verifies a proxy a running task
+// is leasing right now cannot be deleted out from under it. Once that task
+// stops advancing — suspended or dead — the same delete goes through, even
+// though the lease object still exists: a parked task has no request in flight.
+func TestDeleteProxyRefusesLeaseHeldByRunningTask(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "p2", GroupID: "ga"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	usage := &fixedUsage{live: map[string]bool{"t1": true}}
+	m, err := NewManager(ctx, repo, nil, withFirst(), WithUsagePolicy(usage))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	lease, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if lease.Proxy().ID != "p1" {
+		t.Fatalf("leased %s, want p1", lease.Proxy().ID)
+	}
+
+	err = m.DeleteProxy(ctx, "p1")
+	if !errors.Is(err, ErrProxyInUse) {
+		t.Fatalf("err = %v, want ErrProxyInUse", err)
+	}
+	if !strings.Contains(err.Error(), "t1") {
+		t.Fatalf("error %q does not name the holding task", err)
+	}
+	if !repo.has("p1") {
+		t.Fatal("refused delete removed the proxy anyway")
+	}
+
+	// An idle holder no longer blocks it: the guard reads liveness, not the lease.
+	usage.live = nil
+	if err := m.DeleteProxy(ctx, "p1"); err != nil {
+		t.Fatalf("delete once the holder stopped: %v", err)
+	}
+	if repo.has("p1") {
+		t.Fatal("proxy survived the delete")
+	}
+}
+
+// TestDeleteProxyRefusesLockHeldByRunningTask verifies a proxy durably locked
+// to a running task is refused even when that task runs against a different
+// group — a binding outranks the group a task is assigned, so the group
+// question alone would miss it. The refusal lands before the deletion policy
+// runs, so the task's fate is never decided for a delete that does not happen.
+func TestDeleteProxyRefusesLockHeldByRunningTask(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga", OwnerID: "t1"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	usage := &fixedUsage{live: map[string]bool{"t1": true}}
+	policy := &fixedPolicy{decision: Unbind}
+	m, err := NewManager(ctx, repo, policy, withFirst(), WithUsagePolicy(usage))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	err = m.DeleteProxy(ctx, "p1")
+	if !errors.Is(err, ErrProxyInUse) {
+		t.Fatalf("err = %v, want ErrProxyInUse", err)
+	}
+	if !strings.Contains(err.Error(), "t1") {
+		t.Fatalf("error %q does not name the owning task", err)
+	}
+	if policy.calls != 0 {
+		t.Fatalf("deletion policy consulted %d times on a refused delete", policy.calls)
+	}
+	if !repo.has("p1") {
+		t.Fatal("refused delete removed the proxy anyway")
+	}
+
+	usage.live = nil
+	if err := m.DeleteProxy(ctx, "p1"); err != nil {
+		t.Fatalf("delete once the owner stopped: %v", err)
+	}
+	if policy.calls != 1 || policy.taskID != "t1" {
+		t.Fatalf("policy calls = %d for %q, want 1 for t1", policy.calls, policy.taskID)
+	}
+}
+
+// TestDeleteProxyRefusesWhileGroupInUse verifies a proxy cannot be pulled out
+// of a group a running task rotates through, even one the task has not leased
+// yet: its next acquire would otherwise find a pool that shrank mid-run.
+func TestDeleteProxyRefusesWhileGroupInUse(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "p2", GroupID: "gb"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	repo.SaveGroup(ctx, Group{ID: "gb", Strategy: "first"})
+	usage := &fixedUsage{running: map[string][]string{"ga": {"t9"}}}
+	m, err := NewManager(ctx, repo, nil, withFirst(), WithUsagePolicy(usage))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	err = m.DeleteProxy(ctx, "p1")
+	if !errors.Is(err, ErrProxyInUse) {
+		t.Fatalf("err = %v, want ErrProxyInUse", err)
+	}
+	if !strings.Contains(err.Error(), "t9") {
+		t.Fatalf("error %q does not name the running task", err)
+	}
+	if !repo.has("p1") {
+		t.Fatal("refused delete removed the proxy anyway")
+	}
+
+	// A quiet group is untouched by the noisy one next door.
+	if err := m.DeleteProxy(ctx, "p2"); err != nil {
+		t.Fatalf("delete from an idle group: %v", err)
+	}
+}
+
+// TestDeleteProxySurfacesUsageError verifies an unanswerable usage check
+// refuses the delete rather than assuming the proxy is idle, because guessing
+// wrong strands a live run.
+func TestDeleteProxySurfacesUsageError(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: GlobalGroup})
+	ctx := context.Background()
+	usage := &fixedUsage{err: errors.New("task service down")}
+	m := newTestManager(t, repo, 1, nil)
+	m.usage = usage
+
+	if err := m.DeleteProxy(ctx, "p1"); err == nil {
+		t.Fatal("expected the usage failure to refuse the delete")
+	}
+	if !repo.has("p1") {
+		t.Fatal("failed usage check still removed the proxy")
+	}
+}
+
+// TestDeleteWithoutUsagePolicyRefusesHeldProxies verifies the guard falls back
+// to the one fact the manager owns outright when no policy is wired: a proxy
+// with a live lease on it is not deleted. Of the two ways to be wrong here,
+// refusing is reversible — wire the policy and retry — while deleting a proxy
+// out from under a request is not. An unheld proxy is untouched by the
+// fallback; there is nothing to be wrong about.
+func TestDeleteWithoutUsagePolicyRefusesHeldProxies(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: GlobalGroup}, Proxy{ID: "p2", GroupID: GlobalGroup})
+	ctx := context.Background()
+	m := newTestManager(t, repo, 1, nil)
+
+	lease, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: GlobalGroup})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if lease.Proxy().ID != "p1" {
+		t.Fatalf("leased %s, want p1", lease.Proxy().ID)
+	}
+
+	err = m.DeleteProxy(ctx, "p1")
+	if !errors.Is(err, ErrProxyInUse) {
+		t.Fatalf("err = %v, want ErrProxyInUse", err)
+	}
+	if !strings.Contains(err.Error(), "t1") {
+		t.Fatalf("error %q does not name the holder", err)
+	}
+	if !repo.has("p1") {
+		t.Fatal("refused delete removed the proxy anyway")
+	}
+
+	// Nobody holds p2, so the fallback has nothing to protect.
+	if err := m.DeleteProxy(ctx, "p2"); err != nil {
+		t.Fatalf("DeleteProxy of an unheld proxy: %v", err)
+	}
+
+	// Releasing frees it, and the same delete then goes through.
+	if err := lease.Release(true); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if err := m.DeleteProxy(ctx, "p1"); err != nil {
+		t.Fatalf("DeleteProxy after release: %v", err)
+	}
+}
+
+// TestUsagePolicyLetsAParkedHolderGo verifies wiring the policy is what buys
+// back the precision the fallback lacks: a suspended task still holds its
+// lease, but the policy can say it is not running, so its proxy is deletable.
+// That is the escape hatch a refusal points at, and it exists only with a
+// policy wired.
+func TestUsagePolicyLetsAParkedHolderGo(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: GlobalGroup})
+	ctx := context.Background()
+	usage := &fixedUsage{live: map[string]bool{"t1": true}}
+	m := newTestManager(t, repo, 1, nil)
+	m.usage = usage
+
+	lease, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: GlobalGroup})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if err := m.DeleteProxy(ctx, "p1"); !errors.Is(err, ErrProxyInUse) {
+		t.Fatalf("err = %v, want ErrProxyInUse while t1 runs", err)
+	}
+
+	// t1 suspends: the lease is still held, but nothing is in flight.
+	usage.live = nil
+	if err := m.DeleteProxy(ctx, "p1"); err != nil {
+		t.Fatalf("DeleteProxy once the holder parked: %v", err)
+	}
+	if err := lease.Release(true); err != nil {
+		t.Fatalf("Release of a deleted proxy: %v", err)
+	}
+}
+
+// TestDeleteGroupRefusesMemberLockedToRunningTask verifies the cascade cannot
+// be used to sidestep the per-proxy guard: a member locked to a task running
+// against some other group blocks the whole group delete.
+func TestDeleteGroupRefusesMemberLockedToRunningTask(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga", OwnerID: "t1"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	usage := &fixedUsage{live: map[string]bool{"t1": true}}
+	policy := &fixedPolicy{decision: Unbind}
+	m, err := NewManager(ctx, repo, policy, withFirst(), WithUsagePolicy(usage))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	err = m.DeleteGroup(ctx, "ga")
+	if !errors.Is(err, ErrGroupInUse) {
+		t.Fatalf("err = %v, want ErrGroupInUse", err)
+	}
+	if policy.calls != 0 {
+		t.Fatalf("deletion policy consulted %d times on a refused cascade", policy.calls)
+	}
+	if !repo.has("p1") || !repo.hasGroup("ga") {
+		t.Fatal("refused cascade mutated state")
+	}
+
+	usage.live = nil
+	if err := m.DeleteGroup(ctx, "ga"); err != nil {
+		t.Fatalf("cascade once the owner stopped: %v", err)
+	}
+}
+
+// TestDeleteProxyAsksEachHolderOnce verifies every task holding a shared proxy
+// is checked, and each only once — the answer is memoized per delete so a busy
+// pool does not hammer the task service.
+func TestDeleteProxyAsksEachHolderOnce(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga", MaxHolders: UnlimitedHolders})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	usage := &fixedUsage{live: map[string]bool{"t2": true}}
+	m, err := NewManager(ctx, repo, nil, withFirst(), WithUsagePolicy(usage))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	for _, taskID := range []string{"t1", "t2"} {
+		if _, err := m.Acquire(ctx, Assignment{TaskID: taskID, GroupID: "ga"}); err != nil {
+			t.Fatalf("Acquire for %s: %v", taskID, err)
+		}
+	}
+
+	err = m.DeleteProxy(ctx, "p1")
+	if !errors.Is(err, ErrProxyInUse) {
+		t.Fatalf("err = %v, want ErrProxyInUse: t2 is still running", err)
+	}
+	if !strings.Contains(err.Error(), "t2") {
+		t.Fatalf("error %q does not name the running holder", err)
+	}
+	if len(usage.askedID) != 2 {
+		t.Fatalf("asked about %v, want each holder once up to the refusal", usage.askedID)
+	}
+}
+
+// TestPinnedAssignmentLeasesOnlyItsProxy verifies a pin is a group assignment
+// minus the rotation: every lease is the pinned proxy, however many members the
+// group has.
+func TestPinnedAssignmentLeasesOnlyItsProxy(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "p2", GroupID: "ga"}, Proxy{ID: "p3", GroupID: "ga"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: StrategyRoundRobin})
+	m, err := NewManager(ctx, repo, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	pinned := Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "p2"}
+	for i := range 3 {
+		lease, err := m.Acquire(ctx, pinned)
+		if err != nil {
+			t.Fatalf("Acquire %d: %v", i, err)
+		}
+		if lease.Proxy().ID != "p2" {
+			t.Fatalf("lease %d = %s, want p2 every time: a pin does not rotate", i, lease.Proxy().ID)
+		}
+		if err := lease.Release(true); err != nil {
+			t.Fatalf("Release %d: %v", i, err)
+		}
+	}
+}
+
+// TestPinnedAssignmentLeavesRotationUntouched verifies a pin bypasses the
+// group's strategy rather than passing through it with one candidate: advancing
+// a shared round-robin cursor for a choice nobody made would skew what the
+// group's other tasks get next.
+func TestPinnedAssignmentLeavesRotationUntouched(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "p2", GroupID: "ga"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: StrategyRoundRobin})
+	m, err := NewManager(ctx, repo, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	pin, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "p2"})
+	if err != nil {
+		t.Fatalf("pinned Acquire: %v", err)
+	}
+	pin.Release(true)
+
+	rotating, err := m.Acquire(ctx, Assignment{TaskID: "t2", GroupID: "ga"})
+	if err != nil {
+		t.Fatalf("rotating Acquire: %v", err)
+	}
+	if rotating.Proxy().ID != "p1" {
+		t.Fatalf("rotating lease = %s, want p1: the pin advanced the group cursor", rotating.Proxy().ID)
+	}
+}
+
+// TestPinRefusesUnresolvableProxy verifies a pin that no longer resolves is
+// reported rather than quietly degraded to rotation — running on some other
+// proxy is exactly what a pinned task did not ask for. The distinct errors are
+// what a recovered task's fallback policy branches on.
+func TestPinRefusesUnresolvableProxy(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "q1", GroupID: "gb"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	repo.SaveGroup(ctx, Group{ID: "gb", Strategy: "first"})
+	m, err := NewManager(ctx, repo, nil, withFirst())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	_, err = m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "gone"})
+	if !errors.Is(err, ErrProxyNotFound) {
+		t.Fatalf("err = %v, want ErrProxyNotFound", err)
+	}
+
+	// A pin outside its assigned group is a misconfiguration, not a fallback:
+	// resolving it either way would silently move the task off one or the other.
+	_, err = m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "q1"})
+	if !errors.Is(err, ErrProxyNotInGroup) {
+		t.Fatalf("err = %v, want ErrProxyNotInGroup", err)
+	}
+}
+
+// TestPinConflictWithDurableLock verifies a lease never resolves a pin that
+// disagrees with an existing lock. Dropping a durable lock is a deliberate act,
+// so acquire reports it and ReleaseStaleLock — the reassignment path — is what
+// clears it.
+func TestPinConflictWithDurableLock(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "p2", GroupID: "ga"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	m, err := NewManager(ctx, repo, nil, withFirst())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	lease, err := m.Lock(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	if lease.Proxy().ID != "p1" {
+		t.Fatalf("locked %s, want p1", lease.Proxy().ID)
+	}
+	lease.Release(true)
+
+	repinned := Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "p2"}
+	_, err = m.Acquire(ctx, repinned)
+	if !errors.Is(err, ErrPinConflict) {
+		t.Fatalf("err = %v, want ErrPinConflict", err)
+	}
+	if repo.get(t, "p1").OwnerID != "t1" {
+		t.Fatal("a refused lease dropped the durable lock")
+	}
+
+	// The reassignment resolves it, and the next lease lands on the pin.
+	if err := m.ReleaseStaleLock(ctx, repinned); err != nil {
+		t.Fatalf("ReleaseStaleLock: %v", err)
+	}
+	if repo.get(t, "p1").OwnerID != "" {
+		t.Fatal("stale lock survived the reassignment")
+	}
+	got, err := m.Acquire(ctx, repinned)
+	if err != nil {
+		t.Fatalf("Acquire after reassignment: %v", err)
+	}
+	if got.Proxy().ID != "p2" {
+		t.Fatalf("lease = %s, want the pinned p2", got.Proxy().ID)
+	}
+}
+
+// TestReleaseStaleLockKeepsLocksThatStillFit verifies the reassignment path is
+// not a blanket unlock: repointing a task at the proxy it already holds, or at
+// the group that proxy is in, keeps the lock. Dropping it would return the
+// proxy to the pool for another task to take between the release and the
+// task's next lock.
+func TestReleaseStaleLockKeepsLocksThatStillFit(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "q1", GroupID: "gb"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	repo.SaveGroup(ctx, Group{ID: "gb", Strategy: "first"})
+	m, err := NewManager(ctx, repo, nil, withFirst())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	lease, err := m.Lock(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	lease.Release(true)
+
+	kept := []struct {
+		name string
+		a    Assignment
+	}{
+		{"pinned to the proxy it holds", Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "p1"}},
+		{"still in the locked proxy's group", Assignment{TaskID: "t1", GroupID: "ga"}},
+	}
+	for _, tc := range kept {
+		if err := m.ReleaseStaleLock(ctx, tc.a); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if repo.get(t, "p1").OwnerID != "t1" {
+			t.Fatalf("%s: lock dropped though the placement still fits", tc.name)
+		}
+	}
+
+	// Moving the task to another group no longer fits, so the lock goes.
+	if err := m.ReleaseStaleLock(ctx, Assignment{TaskID: "t1", GroupID: "gb"}); err != nil {
+		t.Fatalf("ReleaseStaleLock to another group: %v", err)
+	}
+	if repo.get(t, "p1").OwnerID != "" {
+		t.Fatal("lock survived a move to another group")
+	}
+}
+
+// TestReleaseStaleLockOnEmptyPlacementReleases verifies a task reassigned to no
+// proxies at all loses its lock. Unlike Acquire, an empty group here means none
+// rather than the global one — a proxyless task must not keep a proxy bound.
+func TestReleaseStaleLockOnEmptyPlacementReleases(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: GlobalGroup})
+	ctx := context.Background()
+	m := newTestManager(t, repo, 1, nil)
+	lease, err := m.Lock(ctx, Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	lease.Release(true)
+
+	if err := m.ReleaseStaleLock(ctx, Assignment{TaskID: "t1"}); err != nil {
+		t.Fatalf("ReleaseStaleLock: %v", err)
+	}
+	if repo.get(t, "p1").OwnerID != "" {
+		t.Fatal("lock survived a reassignment to no proxies")
+	}
+}
+
+// TestPinRefusesProxyLockedToAnotherTask verifies a pin on a proxy another task
+// durably owns fails instead of blocking. The acquire loop waits out a lease
+// because a lease ends on its own; a durable lock does not, so waiting on one
+// is waiting on a condition that never arrives.
+func TestPinRefusesProxyLockedToAnotherTask(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga", OwnerID: "t2"}, Proxy{ID: "p2", GroupID: "ga"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	m, err := NewManager(ctx, repo, nil, withFirst())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "p1"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrProxyLocked) {
+			t.Fatalf("err = %v, want ErrProxyLocked", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Acquire blocked on a pin no release can satisfy")
+	}
+
+	// The owner itself is not shut out of its own locked proxy.
+	lease, err := m.Acquire(ctx, Assignment{TaskID: "t2", GroupID: "ga", ProxyID: "p1"})
+	if err != nil {
+		t.Fatalf("owner Acquire: %v", err)
+	}
+	if lease.Proxy().ID != "p1" {
+		t.Fatalf("owner leased %s, want p1", lease.Proxy().ID)
+	}
+}
+
+// TestEmptyGroupFailsRatherThanWaiting verifies an assignment to a group with
+// no members at all fails immediately. A group whose proxies are merely busy is
+// worth blocking on — one will free — but an empty group is a misconfiguration
+// far more often than a swap in progress, and blocking would hide it as a hang.
+func TestEmptyGroupFailsRatherThanWaiting(t *testing.T) {
+	repo := newFakeRepo()
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	m, err := NewManager(ctx, repo, nil, withFirst())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "ga"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrNoProxies) {
+			t.Fatalf("err = %v, want ErrNoProxies", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Acquire blocked on an empty group instead of failing")
+	}
+}
+
+// TestCheckAssignmentReportsEveryWayAPlacementCanFail verifies the question a
+// recovering task's fallback policy asks answers with the same rule the acquire
+// loop applies, so a policy cannot be told a placement resolves and then have
+// the lease disagree.
+func TestCheckAssignmentReportsEveryWayAPlacementCanFail(t *testing.T) {
+	repo := newFakeRepo(
+		Proxy{ID: "p1", GroupID: "ga"},
+		Proxy{ID: "p2", GroupID: "ga", OwnerID: "t9"},
+		Proxy{ID: "q1", GroupID: "gb"},
+	)
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	repo.SaveGroup(ctx, Group{ID: "gb", Strategy: "first"})
+	m, err := NewManager(ctx, repo, nil, withFirst())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		a    Assignment
+		want error
+	}{
+		{"resolves", Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "p1"}, nil},
+		{"unpinned resolves", Assignment{TaskID: "t1", GroupID: "ga"}, nil},
+		{"group gone", Assignment{TaskID: "t1", GroupID: "missing"}, ErrGroupNotFound},
+		{"pin gone", Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "gone"}, ErrProxyNotFound},
+		{"pin elsewhere", Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "q1"}, ErrProxyNotInGroup},
+		{"pin owned", Assignment{TaskID: "t1", GroupID: "ga", ProxyID: "p2"}, ErrProxyLocked},
+		{"owner's own pin", Assignment{TaskID: "t9", GroupID: "ga", ProxyID: "p2"}, nil},
+	} {
+		err := m.CheckAssignment(tc.a)
+		if tc.want == nil && err != nil {
+			t.Fatalf("%s: CheckAssignment = %v, want nil", tc.name, err)
+		}
+		if tc.want != nil && !errors.Is(err, tc.want) {
+			t.Fatalf("%s: CheckAssignment = %v, want %v", tc.name, err, tc.want)
+		}
+	}
+}
+
+// TestDeletionImpactWarnsWithoutRefusing verifies the query that makes a
+// deletion deliberate: it names the running tasks that would refuse it and the
+// pinned tasks that would be stranded by it, changes nothing, and leaves the
+// decision to the caller — DeleteProxy still enforces only the running half.
+func TestDeletionImpactWarnsWithoutRefusing(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "p2", GroupID: "ga"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	usage := &fixedUsage{pinned: map[string][]string{"p1": {"t5", "t4"}}}
+	m, err := NewManager(ctx, repo, nil, withFirst(), WithUsagePolicy(usage))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	impact, err := m.DeletionImpact(ctx, "p1")
+	if err != nil {
+		t.Fatalf("DeletionImpact: %v", err)
+	}
+	if len(impact.Running) != 0 {
+		t.Fatalf("Running = %v, want none", impact.Running)
+	}
+	if len(impact.Pinned) != 2 || impact.Pinned[0] != "t4" || impact.Pinned[1] != "t5" {
+		t.Fatalf("Pinned = %v, want sorted [t4 t5]", impact.Pinned)
+	}
+	if !repo.has("p1") {
+		t.Fatal("the impact query deleted something")
+	}
+
+	// A pin is a warning, not a refusal: the deletion still goes through.
+	if err := m.DeleteProxy(ctx, "p1"); err != nil {
+		t.Fatalf("DeleteProxy despite pinned tasks: %v", err)
+	}
+
+	// A proxy nobody is linked to reports nothing.
+	impact, err = m.DeletionImpact(ctx, "p2")
+	if err != nil {
+		t.Fatalf("DeletionImpact p2: %v", err)
+	}
+	if !impact.Empty() {
+		t.Fatalf("impact = %+v, want empty", impact)
+	}
+}
+
+// TestDeletionImpactCountsARunningTaskOnce verifies a task that is both running
+// and pinned is reported only as running: it is the stronger finding, and
+// listing it twice would overstate what the deletion costs.
+func TestDeletionImpactCountsARunningTaskOnce(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	usage := &fixedUsage{
+		running: map[string][]string{"ga": {"t1"}},
+		pinned:  map[string][]string{"p1": {"t1", "t2"}},
+	}
+	m, err := NewManager(ctx, repo, nil, withFirst(), WithUsagePolicy(usage))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	impact, err := m.DeletionImpact(ctx, "p1")
+	if err != nil {
+		t.Fatalf("DeletionImpact: %v", err)
+	}
+	if len(impact.Running) != 1 || impact.Running[0] != "t1" {
+		t.Fatalf("Running = %v, want [t1]", impact.Running)
+	}
+	if len(impact.Pinned) != 1 || impact.Pinned[0] != "t2" {
+		t.Fatalf("Pinned = %v, want [t2]: t1 is already counted as running", impact.Pinned)
+	}
+}
+
+// TestGroupDeletionImpactPoolsItsMembers verifies the cascade's warning covers
+// every member, so deleting a group cannot strand a pinned task more quietly
+// than deleting that task's proxy directly would.
+func TestGroupDeletionImpactPoolsItsMembers(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "ga"}, Proxy{ID: "p2", GroupID: "ga"}, Proxy{ID: "q1", GroupID: "gb"})
+	ctx := context.Background()
+	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
+	repo.SaveGroup(ctx, Group{ID: "gb", Strategy: "first"})
+	usage := &fixedUsage{pinned: map[string][]string{"p1": {"t1"}, "p2": {"t2"}, "q1": {"t3"}}}
+	m, err := NewManager(ctx, repo, nil, withFirst(), WithUsagePolicy(usage))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	impact, err := m.GroupDeletionImpact(ctx, "ga")
+	if err != nil {
+		t.Fatalf("GroupDeletionImpact: %v", err)
+	}
+	if len(impact.Pinned) != 2 || impact.Pinned[0] != "t1" || impact.Pinned[1] != "t2" {
+		t.Fatalf("Pinned = %v, want [t1 t2]: t3 is pinned in another group", impact.Pinned)
+	}
+
+	if _, err := m.GroupDeletionImpact(ctx, "missing"); !errors.Is(err, ErrGroupNotFound) {
+		t.Fatalf("err = %v, want ErrGroupNotFound", err)
 	}
 }

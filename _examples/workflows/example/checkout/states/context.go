@@ -31,12 +31,11 @@ type Profile struct {
 // through states, plus its side effects (proxy lease, HTTP client) and the bus
 // it uses to coordinate with other tasks.
 type RunningContext struct {
-	proxies      *proxies.Manager
-	taskID       string
-	proxyGroupID string
-	lease        *proxies.Lease
-	client       *http.Client
-	bus          comms.Bus
+	proxies    *proxies.Manager
+	assignment proxies.Assignment
+	lease      *proxies.Lease
+	client     *http.Client
+	bus        comms.Bus
 
 	queueCookie string
 	variantID   string
@@ -58,10 +57,15 @@ func NewContext(input StaticContext, deps workflows.Deps, manager *proxies.Manag
 	return &Context{
 		static: input,
 		running: &RunningContext{
-			proxies:      manager,
-			taskID:       deps.TaskID,
-			proxyGroupID: deps.ProxyGroupID,
-			bus:          deps.Bus,
+			proxies: manager,
+			// The whole placement travels together: the group to rotate within,
+			// or the one proxy pinned inside it. No branching here.
+			assignment: proxies.Assignment{
+				TaskID:  deps.TaskID,
+				GroupID: deps.ProxyGroupID,
+				ProxyID: deps.ProxyID,
+			},
+			bus: deps.Bus,
 		},
 	}
 }
@@ -73,10 +77,10 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		return c.running.client, nil
 	}
 
-	if c.running.proxyGroupID == "" {
-		return nil, fmt.Errorf("task %s has no proxy group assigned", c.running.taskID)
+	if c.running.assignment.GroupID == "" {
+		return nil, fmt.Errorf("task %s has no proxy group assigned", c.running.assignment.TaskID)
 	}
-	lease, err := c.running.proxies.Acquire(ctx, c.running.taskID, c.running.proxyGroupID)
+	lease, err := c.running.proxies.Acquire(ctx, c.running.assignment)
 	if err != nil {
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}
@@ -85,7 +89,7 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		lease.Release(false)
 		return nil, err
 	}
-	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.taskID, lease.Proxy().ID, lease.Proxy().URL)
+	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.assignment.TaskID, lease.Proxy().ID, lease.Proxy().URL)
 
 	c.running.lease = lease
 	c.running.client = client

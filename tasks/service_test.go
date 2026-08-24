@@ -134,6 +134,18 @@ func (m *memStore) MarkTerminal(ctx context.Context, id, outcome string, output 
 	return nil
 }
 
+func (m *memStore) SaveAssignment(ctx context.Context, id string, proxyGroupID, proxyID *string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.records[id]
+	if !ok {
+		return errors.New("not found")
+	}
+	rec.ProxyGroupID, rec.ProxyID = proxyGroupID, proxyID
+	m.records[id] = rec
+	return nil
+}
+
 func (m *memStore) RecoverTask(ctx context.Context, id string) (Record, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -191,6 +203,18 @@ func (m *memStore) DeleteGroup(ctx context.Context, id string) error {
 	defer m.mu.Unlock()
 	delete(m.groups, id)
 	return nil
+}
+
+func (m *memStore) TasksPinnedTo(ctx context.Context, proxyID string) ([]Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Record, 0)
+	for _, rec := range m.records {
+		if rec.ProxyID != nil && *rec.ProxyID == proxyID {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
 }
 
 func (m *memStore) TasksInGroup(ctx context.Context, groupID string) ([]string, error) {
@@ -928,5 +952,318 @@ func TestGroupCreationRefusals(t *testing.T) {
 	}
 	if err := memory.DeleteGroup(ctx, "g"); err == nil {
 		t.Fatal("expected refusal deleting a group with no repository")
+	}
+}
+
+// TestUsageGuardReadsSuspendedAsIdle verifies the guard a proxy manager
+// consults treats a suspended task as idle, both group-wide and per task. That
+// is the escape hatch a refused proxy deletion points at: a parked task holds
+// no request in flight, so its pool can be edited without stranding one. The
+// task is still live — IsRunning keeps saying so — it is simply not advancing.
+func TestUsageGuardReadsSuspendedAsIdle(t *testing.T) {
+	store := newMemStore()
+	svc := NewService(store, comms.NewBus())
+	var log []workflows.State
+	wf := &gatedWorkflow{log: &log, entered: make(chan struct{}), release: make(chan struct{})}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"))
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	go task.Start(ctx)
+	<-wf.entered
+
+	if got, _ := svc.RunningTasks(ctx, "residential"); len(got) != 1 || got[0] != task.ID() {
+		t.Fatalf("running = %v, want [%s]", got, task.ID())
+	}
+	if live, _ := svc.TaskIsRunning(ctx, task.ID()); !live {
+		t.Fatal("TaskIsRunning = false for a task mid-state")
+	}
+
+	// Suspend parks the task at the next state boundary.
+	if err := task.Suspend(); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	close(wf.release)
+	waitUntil(t, func() bool { return task.Status() == workflows.StatusSuspended })
+
+	if got, _ := svc.RunningTasks(ctx, "residential"); len(got) != 0 {
+		t.Fatalf("running while suspended = %v, want none: the pool is free to edit", got)
+	}
+	if live, _ := svc.TaskIsRunning(ctx, task.ID()); live {
+		t.Fatal("TaskIsRunning = true while suspended")
+	}
+	if !svc.IsRunning(task.ID()) {
+		t.Fatal("IsRunning = false while suspended: parked is not finished")
+	}
+
+	// Resuming puts it back in the guard's sight until it finishes.
+	if err := task.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	waitUntil(t, func() bool { return !svc.IsRunning(task.ID()) })
+	if got, _ := svc.RunningTasks(ctx, "residential"); len(got) != 0 {
+		t.Fatalf("running after completion = %v, want none", got)
+	}
+}
+
+// TestTaskIsRunningUnknownTask verifies an id this service never created — or
+// has already deleted — reads as idle, so a proxy left locked to a task that no
+// longer exists here does not block its own deletion forever.
+func TestTaskIsRunningUnknownTask(t *testing.T) {
+	svc := NewService(newMemStore(), comms.NewBus())
+	live, err := svc.TaskIsRunning(context.Background(), "never-created")
+	if err != nil {
+		t.Fatalf("TaskIsRunning: %v", err)
+	}
+	if live {
+		t.Fatal("TaskIsRunning = true for an unknown task")
+	}
+}
+
+// TestWithProxyPinsTaskThroughRecovery verifies a pin is durable placement, not
+// a runtime accident: it lands on the record, reaches the workflow through
+// Deps, and comes back on recovery alongside the group it narrows.
+func TestWithProxyPinsTaskThroughRecovery(t *testing.T) {
+	store := newMemStore()
+	svc := NewService(store, comms.NewBus())
+	wf := &depsWorkflow{}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"), WithProxy("p2"))
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if task.ProxyGroupID() != "residential" || task.ProxyID() != "p2" {
+		t.Fatalf("placement = %q/%q, want residential/p2", task.ProxyGroupID(), task.ProxyID())
+	}
+
+	record, err := store.RecoverTask(ctx, task.ID())
+	if err != nil {
+		t.Fatalf("RecoverTask record: %v", err)
+	}
+	if record.ProxyID == nil || *record.ProxyID != "p2" {
+		t.Fatalf("record pin = %v, want p2", record.ProxyID)
+	}
+
+	// The pin survives the trip through the store.
+	if err := store.SaveCheckpoint(ctx, task.ID(), "running", "s1", nil); err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+	recovered, err := svc.RecoverTask(ctx, task.ID())
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if recovered.ProxyID() != "p2" || recovered.ProxyGroupID() != "residential" {
+		t.Fatalf("recovered placement = %q/%q, want residential/p2", recovered.ProxyGroupID(), recovered.ProxyID())
+	}
+}
+
+// TestWithoutProxiesClearsThePin verifies a proxyless task carries no pin
+// either, so a group default cannot leave a stray proxy assigned.
+func TestWithoutProxiesClearsThePin(t *testing.T) {
+	store := newMemStore()
+	svc := NewService(store, comms.NewBus())
+	wf := &depsWorkflow{}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxy("p2"), WithoutProxies())
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if task.ProxyGroupID() != "" || task.ProxyID() != "" {
+		t.Fatalf("placement = %q/%q, want both empty", task.ProxyGroupID(), task.ProxyID())
+	}
+}
+
+// TestAssignProxyRepointsAndReleasesStaleLock verifies assignment is the
+// deliberate act that outranks a durable lock: it writes the new placement and
+// hands the releaser the placement as resolved, so the lock the task no longer
+// fits is dropped by the reassignment rather than by a lease.
+func TestAssignProxyRepointsAndReleasesStaleLock(t *testing.T) {
+	store := newMemStore()
+	var got []string
+	svc := NewService(store, comms.NewBus(),
+		WithTaskReassigner(func(ctx context.Context, taskID, proxyGroupID, proxyID string) error {
+			got = append(got, taskID, proxyGroupID, proxyID)
+			return nil
+		}))
+	wf := &depsWorkflow{}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"))
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	group, pin := "datacenter", "p7"
+	if err := svc.AssignProxy(ctx, task.ID(), ProxyAssignment{GroupID: &group, ProxyID: &pin}); err != nil {
+		t.Fatalf("AssignProxy: %v", err)
+	}
+
+	record, _ := store.RecoverTask(ctx, task.ID())
+	if record.ProxyGroupID == nil || *record.ProxyGroupID != "datacenter" {
+		t.Fatalf("record group = %v, want datacenter", record.ProxyGroupID)
+	}
+	if record.ProxyID == nil || *record.ProxyID != "p7" {
+		t.Fatalf("record pin = %v, want p7", record.ProxyID)
+	}
+	want := []string{task.ID(), "datacenter", "p7"}
+	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("releaser told %v, want %v", got, want)
+	}
+
+	// The live handle keeps the placement it was wired with; the move lands on
+	// the next recovery.
+	if task.ProxyGroupID() != "residential" {
+		t.Fatalf("live task group = %q, want the wired residential", task.ProxyGroupID())
+	}
+	if err := store.SaveCheckpoint(ctx, task.ID(), "running", "s1", nil); err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+	recovered, err := svc.RecoverTask(ctx, task.ID())
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if recovered.ProxyGroupID() != "datacenter" || recovered.ProxyID() != "p7" {
+		t.Fatalf("recovered placement = %q/%q, want datacenter/p7", recovered.ProxyGroupID(), recovered.ProxyID())
+	}
+}
+
+// TestAssignProxyInheritsGroupForTheReleaser verifies the releaser is told the
+// placement the task will actually lease from, not the nil that was stored: a
+// cleared assignment inherits the task group's, and a lock is stale or not
+// against that resolved group.
+func TestAssignProxyInheritsGroupForTheReleaser(t *testing.T) {
+	store := newMemStore()
+	var gotGroup string
+	svc := NewService(store, comms.NewBus(),
+		WithTaskReassigner(func(ctx context.Context, taskID, proxyGroupID, proxyID string) error {
+			gotGroup = proxyGroupID
+			return nil
+		}))
+	wf := &depsWorkflow{}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ProxyGroupID: "residential"}); err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), WithProxyGroup("datacenter"))
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	// Clearing the task's own assignment falls back to the task group's.
+	if err := svc.AssignProxy(ctx, task.ID(), ProxyAssignment{}); err != nil {
+		t.Fatalf("AssignProxy: %v", err)
+	}
+	if gotGroup != "residential" {
+		t.Fatalf("releaser told group %q, want the inherited residential", gotGroup)
+	}
+}
+
+// TestPinnedTasksCountsOnlyWhatCanStillRun verifies the warning a proxy
+// deletion carries names exactly the tasks it would strand. A task that
+// finished, and one that ran without ever checkpointing, can never run again —
+// warning about them is noise, not caution.
+func TestPinnedTasksCountsOnlyWhatCanStillRun(t *testing.T) {
+	store := newMemStore()
+	svc := NewService(store, comms.NewBus())
+	ctx := context.Background()
+
+	pin := "p1"
+	other := "p2"
+	for _, rec := range []Record{
+		{ID: "resumable", WorkflowID: "wf", Status: string(workflows.StatusFailed), State: "s2", ProxyID: &pin},
+		{ID: "suspended", WorkflowID: "wf", Status: string(workflows.StatusSuspended), State: "s1", ProxyID: &pin},
+		{ID: "finished", WorkflowID: "wf", Status: string(workflows.StatusDone), State: "s3", ProxyID: &pin},
+		{ID: "killed", WorkflowID: "wf", Status: string(workflows.StatusKilled), State: "s1", ProxyID: &pin},
+		{ID: "no-checkpoint", WorkflowID: "wf", Status: string(workflows.StatusNotStarted), ProxyID: &pin},
+		{ID: "elsewhere", WorkflowID: "wf", Status: string(workflows.StatusFailed), State: "s1", ProxyID: &other},
+		{ID: "unpinned", WorkflowID: "wf", Status: string(workflows.StatusFailed), State: "s1"},
+	} {
+		if err := store.CreateTask(ctx, rec); err != nil {
+			t.Fatalf("CreateTask %s: %v", rec.ID, err)
+		}
+	}
+
+	got, err := svc.PinnedTasks(ctx, "p1")
+	if err != nil {
+		t.Fatalf("PinnedTasks: %v", err)
+	}
+	want := []string{"resumable", "suspended"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("PinnedTasks = %v, want %v", got, want)
+	}
+
+	if got, _ := svc.PinnedTasks(ctx, ""); len(got) != 0 {
+		t.Fatalf("PinnedTasks(\"\") = %v, want none: an unpinned task pins nothing", got)
+	}
+}
+
+// TestPinnedTasksSeesUnstartedLiveTasks verifies a task created here and never
+// started still counts. It has no checkpoint, so the store alone would call it
+// unresumable — but it is sitting in the registry able to start, and deleting
+// its pin would break its very first lease.
+func TestPinnedTasksSeesUnstartedLiveTasks(t *testing.T) {
+	store := newMemStore()
+	svc := NewService(store, comms.NewBus())
+	wf := &depsWorkflow{}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"), WithProxy("p1"))
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	got, err := svc.PinnedTasks(ctx, "p1")
+	if err != nil {
+		t.Fatalf("PinnedTasks: %v", err)
+	}
+	if len(got) != 1 || got[0] != task.ID() {
+		t.Fatalf("PinnedTasks = %v, want [%s]", got, task.ID())
+	}
+}
+
+// TestPinnedTasksWithoutRepository verifies in-memory operation still answers
+// from the registry, so a consumer running without durability is not told a
+// deletion is free when it is not.
+func TestPinnedTasksWithoutRepository(t *testing.T) {
+	svc := NewService(nil, comms.NewBus())
+	wf := &depsWorkflow{}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"), WithProxy("p1"))
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	got, err := svc.PinnedTasks(ctx, "p1")
+	if err != nil {
+		t.Fatalf("PinnedTasks: %v", err)
+	}
+	if len(got) != 1 || got[0] != task.ID() {
+		t.Fatalf("PinnedTasks = %v, want [%s]", got, task.ID())
 	}
 }

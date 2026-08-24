@@ -81,6 +81,10 @@ var migrations = []sqlitemigrate.Migration{
 		SQL:  `ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
 	},
 	{
+		Name: "add nullable proxy_id column pinning a task to one proxy",
+		SQL:  `ALTER TABLE tasks ADD COLUMN proxy_id TEXT`,
+	},
+	{
 		Name: "create task_groups table",
 		SQL: `CREATE TABLE IF NOT EXISTS task_groups (
 			id             TEXT PRIMARY KEY,
@@ -99,14 +103,12 @@ func (s *SQLite) Close() error {
 // CreateTask inserts a fresh task row from its record: workflow, placement,
 // and timestamps, with no checkpoint yet.
 func (s *SQLite) CreateTask(ctx context.Context, rec tasks.Record) error {
-	var proxyGroup sql.NullString
-	if rec.ProxyGroupID != nil {
-		proxyGroup = sql.NullString{String: *rec.ProxyGroupID, Valid: true}
-	}
+	proxyGroup := nullable(rec.ProxyGroupID)
+	proxy := nullable(rec.ProxyID)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO tasks (id, workflow_id, group_id, proxy_group_id, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		rec.ID, rec.WorkflowID, rec.GroupID, proxyGroup, formatTime(rec.CreatedAt), formatTime(rec.UpdatedAt))
+		`INSERT INTO tasks (id, workflow_id, group_id, proxy_group_id, proxy_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		rec.ID, rec.WorkflowID, rec.GroupID, proxyGroup, proxy, formatTime(rec.CreatedAt), formatTime(rec.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("create task %s: %w", rec.ID, err)
 	}
@@ -125,6 +127,34 @@ func (s *SQLite) SaveCheckpoint(ctx context.Context, id, status, state string, s
 		return fmt.Errorf("save checkpoint %s: %w", id, err)
 	}
 	return errRowMissing("save checkpoint", id, res)
+}
+
+// SaveAssignment repoints a task's proxy placement, leaving the rest of the
+// record untouched. A nil field stores NULL: no group assignment of its own, or
+// no pin.
+func (s *SQLite) SaveAssignment(ctx context.Context, id string, proxyGroupID, proxyID *string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET proxy_group_id = ?, proxy_id = ?, updated_at = ? WHERE id = ?`,
+		nullable(proxyGroupID), nullable(proxyID), formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("assign proxy placement of task %s: %w", id, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("assign proxy placement of task %s: %w", id, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("assign proxy placement: task %s does not exist", id)
+	}
+	return nil
+}
+
+// nullable renders an optional assignment as a SQL value: NULL when unset.
+func nullable(v *string) sql.NullString {
+	if v == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: *v, Valid: true}
 }
 
 // MarkTerminal stamps the terminal outcome and the run's output, refreshing
@@ -157,7 +187,7 @@ func errRowMissing(op, id string, res sql.Result) error {
 // RecoverTask returns the record for id, or ErrNotFound if none exists.
 func (s *SQLite) RecoverTask(ctx context.Context, id string) (tasks.Record, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, workflow_id, group_id, proxy_group_id, state, status, snapshot, output, created_at, updated_at
+		`SELECT id, workflow_id, group_id, proxy_group_id, proxy_id, state, status, snapshot, output, created_at, updated_at
 		 FROM tasks WHERE id = ?`, id)
 	rec, err := scanRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -172,7 +202,7 @@ func (s *SQLite) RecoverTask(ctx context.Context, id string) (tasks.Record, erro
 // RecoverAll returns every persisted record, terminal ones included.
 func (s *SQLite) RecoverAll(ctx context.Context) ([]tasks.Record, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, workflow_id, group_id, proxy_group_id, state, status, snapshot, output, created_at, updated_at
+		`SELECT id, workflow_id, group_id, proxy_group_id, proxy_id, state, status, snapshot, output, created_at, updated_at
 		 FROM tasks`)
 	if err != nil {
 		return nil, fmt.Errorf("recover all: %w", err)
@@ -287,6 +317,29 @@ func (s *SQLite) TasksInGroup(ctx context.Context, groupID string) ([]string, er
 	return ids, nil
 }
 
+// TasksPinnedTo returns every task record pinned to proxyID. It reads whole
+// records because the caller decides which of them could still run, a rule this
+// store does not own.
+func (s *SQLite) TasksPinnedTo(ctx context.Context, proxyID string) ([]tasks.Record, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, workflow_id, group_id, proxy_group_id, proxy_id, state, status, snapshot, output, created_at, updated_at
+		 FROM tasks WHERE proxy_id = ? ORDER BY id`, proxyID)
+	if err != nil {
+		return nil, fmt.Errorf("list tasks pinned to proxy %s: %w", proxyID, err)
+	}
+	defer rows.Close()
+
+	records := make([]tasks.Record, 0)
+	for rows.Next() {
+		record, err := scanRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list tasks pinned to proxy %s: %w", proxyID, err)
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 // scanner is the read surface shared by sql.Row and sql.Rows.
 type scanner interface {
 	Scan(dest ...any) error
@@ -295,13 +348,16 @@ type scanner interface {
 // scanRecord reads one row into a tasks.Record.
 func scanRecord(row scanner) (tasks.Record, error) {
 	var rec tasks.Record
-	var proxyGroup sql.NullString
+	var proxyGroup, proxy sql.NullString
 	var created, updated string
-	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &proxyGroup, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated); err != nil {
+	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &proxyGroup, &proxy, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated); err != nil {
 		return tasks.Record{}, err
 	}
 	if proxyGroup.Valid {
 		rec.ProxyGroupID = &proxyGroup.String
+	}
+	if proxy.Valid {
+		rec.ProxyID = &proxy.String
 	}
 	var err error
 	if rec.CreatedAt, err = parseTime(created); err != nil {

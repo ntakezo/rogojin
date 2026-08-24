@@ -135,6 +135,14 @@ func (f *fakeStore) MarkTerminal(ctx context.Context, id, outcome string, output
 }
 
 func (f *fakeStore) CreateTask(ctx context.Context, record Record) error { return nil }
+func (f *fakeStore) SaveAssignment(ctx context.Context, id string, proxyGroupID, proxyID *string) error {
+	return nil
+}
+
+func (f *fakeStore) TasksPinnedTo(ctx context.Context, proxyID string) ([]Record, error) {
+	return nil, nil
+}
+
 func (f *fakeStore) RecoverTask(ctx context.Context, id string) (Record, error) {
 	return Record{}, nil
 }
@@ -442,7 +450,7 @@ func TestRecoveredSuspendedTaskStartsPaused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
 	}
-	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusSuspended, nil, store, "")
+	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusSuspended, nil, store, "", "")
 
 	done := make(chan error, 1)
 	go func() { _, serr := task.Start(context.Background()); done <- serr }()
@@ -481,7 +489,7 @@ func TestRecoveredTerminalTaskRefusesStart(t *testing.T) {
 	}
 	for _, status := range []workflows.Status{workflows.StatusDone, workflows.StatusKilled} {
 		var log []workflows.State
-		task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s3, status, nil, &fakeStore{}, "")
+		task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s3, status, nil, &fakeStore{}, "", "")
 
 		if _, err := task.Start(context.Background()); !errors.Is(err, ErrAlreadyTerminal) {
 			t.Fatalf("Start on recovered %q task: err = %v, want ErrAlreadyTerminal", status, err)
@@ -502,7 +510,7 @@ func TestRecoveredFailedTaskRetries(t *testing.T) {
 	}
 	var log []workflows.State
 	store := &fakeStore{}
-	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusFailed, nil, store, "")
+	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusFailed, nil, store, "", "")
 
 	if _, err := task.Start(context.Background()); err != nil {
 		t.Fatalf("Start on recovered failed task: %v", err)
@@ -699,7 +707,7 @@ func TestTeardownRunsOnKill(t *testing.T) {
 // resolve to the kill, or the task runs right after being told to die.
 func TestKillBeforeStartLatches(t *testing.T) {
 	var log []workflows.State
-	task, err := createTask(&testWorkflow{log: &log}, nil, nil, &fakeStore{}, "")
+	task, err := createTask(&testWorkflow{log: &log}, nil, nil, &fakeStore{}, "", "")
 	if err != nil {
 		t.Fatalf("createTask: %v", err)
 	}
@@ -885,7 +893,7 @@ func TestOutputErrorAbortsRun(t *testing.T) {
 func TestTerminalStampFailureSurfaced(t *testing.T) {
 	want := []byte(`{"orderID":"order-1"}`)
 	store := &fakeStore{terminalErr: errors.New("store down")}
-	task, err := createTask(outputWorkflow{output: want}, nil, nil, store, "")
+	task, err := createTask(outputWorkflow{output: want}, nil, nil, store, "", "")
 	if err != nil {
 		t.Fatalf("createTask: %v", err)
 	}
@@ -907,7 +915,7 @@ func TestTerminalStampFailureSurfaced(t *testing.T) {
 // at the task boundary the consumer actually calls.
 func TestStartReturnsWorkflowOutput(t *testing.T) {
 	want := []byte(`{"orderID":"order-1"}`)
-	task, err := createTask(outputWorkflow{output: want}, nil, nil, &fakeStore{}, "")
+	task, err := createTask(outputWorkflow{output: want}, nil, nil, &fakeStore{}, "", "")
 	if err != nil {
 		t.Fatalf("createTask: %v", err)
 	}

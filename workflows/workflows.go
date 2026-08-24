@@ -124,4 +124,8 @@ type Deps struct {
 	// from the task's own assignment or its task group's when it has none. It
 	// is "" for a task that runs without proxies.
 	ProxyGroupID string
+	// ProxyID pins the task's leases to one proxy within that group. It is ""
+	// for a task that rotates the group. Pass both to the proxy manager
+	// verbatim; it needs no branching here.
+	ProxyID string
 }

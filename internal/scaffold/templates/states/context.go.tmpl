@@ -40,11 +40,10 @@ type Result struct {
 // one shared copy.
 type running struct {
 {{- if .Proxy}}
-	proxies      *proxies.Manager
-	taskID       string
-	proxyGroupID string
-	lease        *proxies.Lease
-	client       *http.Client
+	proxies    *proxies.Manager
+	assignment proxies.Assignment
+	lease      *proxies.Lease
+	client     *http.Client
 {{- end}}
 	bus comms.Bus
 
@@ -67,9 +66,13 @@ func NewContext(input Input, deps workflows.Deps{{if .Proxy}}, manager *proxies.
 		input: input,
 		r: &running{
 {{- if .Proxy}}
-			proxies:      manager,
-			taskID:       deps.TaskID,
-			proxyGroupID: deps.ProxyGroupID,
+			proxies: manager,
+			// The whole placement travels together: group, or pin within it.
+			assignment: proxies.Assignment{
+				TaskID:  deps.TaskID,
+				GroupID: deps.ProxyGroupID,
+				ProxyID: deps.ProxyID,
+			},
 {{- end}}
 			bus: deps.Bus,
 		},
@@ -89,11 +92,14 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	if c.r.client != nil {
 		return c.r.client, nil
 	}
-	if c.r.proxyGroupID == "" {
-		return nil, fmt.Errorf("task %s has no proxy group assigned", c.r.taskID)
+	if c.r.assignment.GroupID == "" {
+		return nil, fmt.Errorf("task %s has no proxy group assigned", c.r.assignment.TaskID)
 	}
-	lease, err := c.r.proxies.Acquire(ctx, c.r.taskID, c.r.proxyGroupID)
+	lease, err := c.r.proxies.Acquire(ctx, c.r.assignment)
 	if err != nil {
+		// A pin that no longer resolves is the fallback decision point: this
+		// scaffold refuses, but returning an unproxied client here would run the
+		// task naked instead.
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}
 	proxyURL, err := url.Parse(lease.Proxy().URL)

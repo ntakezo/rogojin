@@ -505,3 +505,124 @@ func TestWritesToMissingTaskFailLoud(t *testing.T) {
 		t.Fatalf("MarkTerminal on missing task: err = %v, want ErrNotFound", err)
 	}
 }
+
+// TestProxyPinRoundTrips verifies a task's pin survives storage on the same
+// three-way distinction as its group: nil (unpinned, rotate), "" (explicitly
+// none), and a named proxy.
+func TestProxyPinRoundTrips(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	group, none, named := "residential", "", "p7"
+	for _, tc := range []struct {
+		id     string
+		pinned *string
+	}{
+		{"unpinned", nil},
+		{"cleared", &none},
+		{"pinned", &named},
+	} {
+		rec := tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: "g1", ProxyGroupID: &group, ProxyID: tc.pinned}
+		if err := repo.CreateTask(ctx, rec); err != nil {
+			t.Fatalf("CreateTask %s: %v", tc.id, err)
+		}
+		got, err := repo.RecoverTask(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("RecoverTask %s: %v", tc.id, err)
+		}
+		switch {
+		case tc.pinned == nil && got.ProxyID != nil:
+			t.Fatalf("%s: ProxyID = %q, want nil (unpinned)", tc.id, *got.ProxyID)
+		case tc.pinned != nil && got.ProxyID == nil:
+			t.Fatalf("%s: ProxyID = nil, want %q", tc.id, *tc.pinned)
+		case tc.pinned != nil && *got.ProxyID != *tc.pinned:
+			t.Fatalf("%s: ProxyID = %q, want %q", tc.id, *got.ProxyID, *tc.pinned)
+		}
+	}
+}
+
+// TestSaveAssignmentRepointsPlacement verifies a reassignment rewrites both
+// halves of the placement and nothing else, and that it reports a task that
+// does not exist rather than silently updating no rows.
+func TestSaveAssignmentRepointsPlacement(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	group, pin := "residential", "p1"
+	rec := tasks.Record{ID: "t1", WorkflowID: "wf1", GroupID: "g1", ProxyGroupID: &group, ProxyID: &pin}
+	if err := repo.CreateTask(ctx, rec); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := repo.SaveCheckpoint(ctx, "t1", "running", "s1", []byte(`{"v":1}`)); err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+
+	moved, repinned := "datacenter", "p9"
+	if err := repo.SaveAssignment(ctx, "t1", &moved, &repinned); err != nil {
+		t.Fatalf("SaveAssignment: %v", err)
+	}
+	got, err := repo.RecoverTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if got.ProxyGroupID == nil || *got.ProxyGroupID != "datacenter" {
+		t.Fatalf("ProxyGroupID = %v, want datacenter", got.ProxyGroupID)
+	}
+	if got.ProxyID == nil || *got.ProxyID != "p9" {
+		t.Fatalf("ProxyID = %v, want p9", got.ProxyID)
+	}
+	if got.State != "s1" || got.Status != "running" || string(got.Snapshot) != `{"v":1}` {
+		t.Fatalf("reassignment disturbed the checkpoint: %+v", got)
+	}
+
+	// Clearing both halves stores NULL, not the empty string.
+	if err := repo.SaveAssignment(ctx, "t1", nil, nil); err != nil {
+		t.Fatalf("SaveAssignment clearing: %v", err)
+	}
+	if got, _ = repo.RecoverTask(ctx, "t1"); got.ProxyGroupID != nil || got.ProxyID != nil {
+		t.Fatalf("cleared placement = %v/%v, want nil/nil", got.ProxyGroupID, got.ProxyID)
+	}
+
+	if err := repo.SaveAssignment(ctx, "missing", &moved, nil); err == nil {
+		t.Fatal("expected an error assigning a task that does not exist")
+	}
+}
+
+// TestTasksPinnedToSelectsByPin verifies the store answers the pin question the
+// deletion warning is built on: whole records for exactly the tasks naming the
+// proxy, so the caller can apply its own can-this-still-run rule.
+func TestTasksPinnedToSelectsByPin(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	group, pin, other := "residential", "p1", "p2"
+	for _, rec := range []tasks.Record{
+		{ID: "a", WorkflowID: "wf", GroupID: "g1", ProxyGroupID: &group, ProxyID: &pin},
+		{ID: "b", WorkflowID: "wf", GroupID: "g1", ProxyGroupID: &group, ProxyID: &pin},
+		{ID: "c", WorkflowID: "wf", GroupID: "g1", ProxyGroupID: &group, ProxyID: &other},
+		{ID: "d", WorkflowID: "wf", GroupID: "g1", ProxyGroupID: &group},
+	} {
+		if err := repo.CreateTask(ctx, rec); err != nil {
+			t.Fatalf("CreateTask %s: %v", rec.ID, err)
+		}
+	}
+	if err := repo.SaveCheckpoint(ctx, "a", "failed", "s2", []byte(`{"v":2}`)); err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+
+	got, err := repo.TasksPinnedTo(ctx, "p1")
+	if err != nil {
+		t.Fatalf("TasksPinnedTo: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
+		t.Fatalf("TasksPinnedTo = %v, want records a and b", got)
+	}
+	// Whole records: the caller needs status and state to judge resumability.
+	if got[0].Status != "failed" || got[0].State != "s2" {
+		t.Fatalf("record a = %+v, want its checkpoint carried through", got[0])
+	}
+
+	if empty, err := repo.TasksPinnedTo(ctx, "nobody"); err != nil || len(empty) != 0 {
+		t.Fatalf("TasksPinnedTo(nobody) = %v, %v, want none", empty, err)
+	}
+}

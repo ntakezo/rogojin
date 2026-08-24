@@ -31,19 +31,32 @@ func main() {
 	forward := newForwardProxy()
 	defer forward.Close()
 
-	// The manager is built first but the task service answers "is this group in
-	// use?", so the usage guard closes over svc and resolves it at call time.
+	// The manager is built first but the task service answers "is this in use?",
+	// so the usage guard closes over svc and resolves it at call time.
 	var svc tasks.Service
 	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{ID: "local-1", URL: forward.URL}), nil,
-		proxies.WithUsagePolicy(proxies.UsageFunc(func(ctx context.Context, groupID string) ([]string, error) {
-			return svc.RunningTasks(ctx, groupID)
-		})))
+		proxies.WithUsagePolicy(proxies.Usage{
+			RunningInGroup: func(ctx context.Context, groupID string) ([]string, error) {
+				return svc.RunningTasks(ctx, groupID)
+			},
+			TaskRunning: func(ctx context.Context, taskID string) (bool, error) {
+				return svc.TaskIsRunning(ctx, taskID)
+			},
+			PinnedToProxy: func(ctx context.Context, proxyID string) ([]string, error) {
+				return svc.PinnedTasks(ctx, proxyID)
+			},
+		}))
 	if err != nil {
 		log.Fatalf("proxy manager: %v", err)
 	}
 
-	// Proxy locks outlive the process, so deleting a task must free its own.
-	svc = tasks.NewService(newMemRepo(), comms.NewBus(), tasks.WithTaskReleaser(manager.Unlock))
+	// Proxy locks outlive the process, so deleting a task must free its own —
+	// and repointing a task must drop the lock its new placement no longer fits.
+	svc = tasks.NewService(newMemRepo(), comms.NewBus(),
+		tasks.WithTaskReleaser(manager.Unlock),
+		tasks.WithTaskReassigner(func(ctx context.Context, taskID, proxyGroupID, proxyID string) error {
+			return manager.ReleaseStaleLock(ctx, proxies.Assignment{TaskID: taskID, GroupID: proxyGroupID, ProxyID: proxyID})
+		}))
 	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager)); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}

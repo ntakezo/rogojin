@@ -38,6 +38,9 @@ type Task interface {
 	// creation or recovery from its own assignment or its task group's. It is
 	// "" for a task that runs without proxies.
 	ProxyGroupID() string
+	// ProxyID names the one proxy this task is pinned to within that group,
+	// resolved alongside ProxyGroupID. It is "" for a task that rotates.
+	ProxyID() string
 	// Start executes the task synchronously until completion, error, or kill,
 	// returning the workflow's output on clean completion. The output is nil if
 	// the workflow produces none, or if the run errors or is killed. A run whose
@@ -66,6 +69,7 @@ type task struct {
 	id           string
 	input        any
 	proxyGroupID string
+	proxyID      string
 	engine       *engine
 
 	// recovered marks a task rebuilt from a snapshot; Start resumes at
@@ -79,7 +83,7 @@ type task struct {
 // createTask validates input against the workflow and returns a new unstarted
 // task whose instance leases proxies from proxyGroupID ("" runs proxyless).
 // The caller must not modify input after creation.
-func createTask(workflow workflows.Workflow, input any, bus comms.Bus, repo Repository, proxyGroupID string) (*task, error) {
+func createTask(workflow workflows.Workflow, input any, bus comms.Bus, repo Repository, proxyGroupID, proxyID string) (*task, error) {
 	if err := workflow.ValidateInput(input); err != nil {
 		return nil, fmt.Errorf("task input validation error: %w", err)
 	}
@@ -89,17 +93,19 @@ func createTask(workflow workflows.Workflow, input any, bus comms.Bus, repo Repo
 		id:           id,
 		input:        input,
 		proxyGroupID: proxyGroupID,
-		engine:       newEngine(workflow, workflows.Deps{TaskID: id, Bus: bus, ProxyGroupID: proxyGroupID}, repo),
+		proxyID:      proxyID,
+		engine:       newEngine(workflow, workflows.Deps{TaskID: id, Bus: bus, ProxyGroupID: proxyGroupID, ProxyID: proxyID}, repo),
 	}, nil
 }
 
 // rehydrateTask rebuilds a task from a persisted snapshot so Start resumes at
 // resumeAt. status is the persisted lifecycle reported until the task starts.
-func rehydrateTask(workflow workflows.Workflow, id string, snapshot []byte, resumeAt workflows.State, status workflows.Status, bus comms.Bus, repo Repository, proxyGroupID string) *task {
+func rehydrateTask(workflow workflows.Workflow, id string, snapshot []byte, resumeAt workflows.State, status workflows.Status, bus comms.Bus, repo Repository, proxyGroupID, proxyID string) *task {
 	return &task{
 		id:              id,
 		proxyGroupID:    proxyGroupID,
-		engine:          newEngine(workflow, workflows.Deps{TaskID: id, Bus: bus, ProxyGroupID: proxyGroupID}, repo),
+		proxyID:         proxyID,
+		engine:          newEngine(workflow, workflows.Deps{TaskID: id, Bus: bus, ProxyGroupID: proxyGroupID, ProxyID: proxyID}, repo),
 		recovered:       true,
 		snapshot:        snapshot,
 		resumeAt:        resumeAt,
@@ -113,6 +119,10 @@ func (t *task) ID() string {
 
 func (t *task) ProxyGroupID() string {
 	return t.proxyGroupID
+}
+
+func (t *task) ProxyID() string {
+	return t.proxyID
 }
 
 // seal latches the task closed for deletion, reporting false if it is live.
