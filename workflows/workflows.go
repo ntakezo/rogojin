@@ -120,4 +120,8 @@ func (s Status) Terminal() bool {
 type Deps struct {
 	TaskID string
 	Bus    comms.Bus
+	// ProxyGroupID names the proxy group the task's leases draw from, resolved
+	// from the task's own assignment or its task group's when it has none. It
+	// is "" for a task that runs without proxies.
+	ProxyGroupID string
 }

@@ -31,11 +31,12 @@ type Profile struct {
 // through states, plus its side effects (proxy lease, HTTP client) and the bus
 // it uses to coordinate with other tasks.
 type RunningContext struct {
-	proxies *proxies.Manager
-	taskID  string
-	lease   *proxies.Lease
-	client  *http.Client
-	bus     comms.Bus
+	proxies      *proxies.Manager
+	taskID       string
+	proxyGroupID string
+	lease        *proxies.Lease
+	client       *http.Client
+	bus          comms.Bus
 
 	queueCookie string
 	variantID   string
@@ -57,9 +58,10 @@ func NewContext(input StaticContext, deps workflows.Deps, manager *proxies.Manag
 	return &Context{
 		static: input,
 		running: &RunningContext{
-			proxies: manager,
-			taskID:  deps.TaskID,
-			bus:     deps.Bus,
+			proxies:      manager,
+			taskID:       deps.TaskID,
+			proxyGroupID: deps.ProxyGroupID,
+			bus:          deps.Bus,
 		},
 	}
 }
@@ -71,7 +73,10 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		return c.running.client, nil
 	}
 
-	lease, err := c.running.proxies.Acquire(ctx, c.running.taskID)
+	if c.running.proxyGroupID == "" {
+		return nil, fmt.Errorf("task %s has no proxy group assigned", c.running.taskID)
+	}
+	lease, err := c.running.proxies.Acquire(ctx, c.running.taskID, c.running.proxyGroupID)
 	if err != nil {
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}

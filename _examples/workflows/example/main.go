@@ -31,12 +31,19 @@ func main() {
 	forward := newForwardProxy()
 	defer forward.Close()
 
-	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{ID: "local-1", URL: forward.URL}), proxies.NewRoundRobin(), proxies.Exclusive(), nil)
+	// The manager is built first but the task service answers "is this group in
+	// use?", so the usage guard closes over svc and resolves it at call time.
+	var svc tasks.Service
+	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{ID: "local-1", URL: forward.URL}), nil,
+		proxies.WithUsagePolicy(proxies.UsageFunc(func(ctx context.Context, groupID string) ([]string, error) {
+			return svc.RunningTasks(ctx, groupID)
+		})))
 	if err != nil {
 		log.Fatalf("proxy manager: %v", err)
 	}
 
-	svc := tasks.NewService(newMemRepo(), comms.NewBus())
+	// Proxy locks outlive the process, so deleting a task must free its own.
+	svc = tasks.NewService(newMemRepo(), comms.NewBus(), tasks.WithTaskReleaser(manager.Unlock))
 	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager)); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}
@@ -47,7 +54,7 @@ func main() {
 		Profile:    states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"},
 	}
 
-	task, err := svc.CreateTask(ctx, example_checkout.Name, input)
+	task, err := svc.CreateTask(ctx, example_checkout.Name, input, tasks.WithProxyGroup(proxies.GlobalGroup))
 	if err != nil {
 		log.Fatalf("create task: %v", err)
 	}
@@ -103,10 +110,11 @@ type memProxyRepo struct {
 	mu      sync.Mutex
 	records map[string]proxies.Proxy
 	order   []string
+	groups  map[string]proxies.Group
 }
 
 func newMemProxyRepo(seed ...proxies.Proxy) *memProxyRepo {
-	r := &memProxyRepo{records: make(map[string]proxies.Proxy)}
+	r := &memProxyRepo{records: make(map[string]proxies.Proxy), groups: make(map[string]proxies.Group)}
 	for _, p := range seed {
 		r.records[p.ID] = p
 		r.order = append(r.order, p.ID)
@@ -144,21 +152,46 @@ func (r *memProxyRepo) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (r *memProxyRepo) ListGroups(ctx context.Context) ([]proxies.Group, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]proxies.Group, 0, len(r.groups))
+	for _, g := range r.groups {
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+func (r *memProxyRepo) SaveGroup(ctx context.Context, g proxies.Group) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.groups[g.ID] = g
+	return nil
+}
+
+func (r *memProxyRepo) DeleteGroup(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.groups, id)
+	return nil
+}
+
 // memRepo is a minimal in-memory Repository: a dumb byte store that records each
 // task's last checkpoint and prints the states it advances through.
 type memRepo struct {
 	mu      sync.Mutex
 	records map[string]tasks.Record
+	groups  map[string]tasks.Group
 }
 
 func newMemRepo() *memRepo {
-	return &memRepo{records: make(map[string]tasks.Record)}
+	return &memRepo{records: make(map[string]tasks.Record), groups: make(map[string]tasks.Group)}
 }
 
-func (r *memRepo) CreateTask(ctx context.Context, id, workflowID string) error {
+func (r *memRepo) CreateTask(ctx context.Context, rec tasks.Record) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.records[id] = tasks.Record{ID: id, WorkflowID: workflowID}
+	r.records[rec.ID] = rec
 	return nil
 }
 
@@ -206,4 +239,47 @@ func (r *memRepo) DeleteTask(ctx context.Context, id string) error {
 	defer r.mu.Unlock()
 	delete(r.records, id)
 	return nil
+}
+
+func (r *memRepo) SaveGroup(ctx context.Context, g tasks.Group) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.groups[g.ID] = g
+	return nil
+}
+
+func (r *memRepo) GetGroup(ctx context.Context, id string) (tasks.Group, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g, ok := r.groups[id]
+	return g, ok, nil
+}
+
+func (r *memRepo) ListGroups(ctx context.Context) ([]tasks.Group, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]tasks.Group, 0, len(r.groups))
+	for _, g := range r.groups {
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+func (r *memRepo) DeleteGroup(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.groups, id)
+	return nil
+}
+
+func (r *memRepo) TasksInGroup(ctx context.Context, groupID string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make([]string, 0)
+	for id, rec := range r.records {
+		if rec.GroupID == groupID {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }

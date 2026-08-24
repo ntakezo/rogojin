@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ntakezo/rogojin/tasks"
 )
@@ -25,15 +26,24 @@ func newTestRepo(t *testing.T) *SQLite {
 // satisfiesRepositoryPort fails to compile if SQLite drifts from the persistence port it exists to implement.
 var _ tasks.Repository = (*SQLite)(nil)
 
+// seedTask inserts a task in the global group with fresh timestamps, the
+// placement most tests do not care about.
+func seedTask(t *testing.T, repo *SQLite, id, workflowID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	rec := tasks.Record{ID: id, WorkflowID: workflowID, GroupID: tasks.GlobalGroup, CreatedAt: now, UpdatedAt: now}
+	if err := repo.CreateTask(context.Background(), rec); err != nil {
+		t.Fatalf("CreateTask %s: %v", id, err)
+	}
+}
+
 // TestCreateTaskRecoverable verifies a created task is recoverable by id with its workflow and no checkpoint yet,
 // because recovery must be able to resolve the workflow before any state has run.
 func TestCreateTaskRecoverable(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	seedTask(t, repo, "t1", "wf1")
 
 	rec, err := repo.RecoverTask(ctx, "t1")
 	if err != nil {
@@ -53,9 +63,7 @@ func TestSaveCheckpointPersistsState(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	seedTask(t, repo, "t1", "wf1")
 	snap := []byte(`{"cart":"abc"}`)
 	if err := repo.SaveCheckpoint(ctx, "t1", "running", "add_to_cart", snap); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
@@ -79,9 +87,7 @@ func TestSaveCheckpointOverwrites(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	seedTask(t, repo, "t1", "wf1")
 	if err := repo.SaveCheckpoint(ctx, "t1", "running", "s1", []byte("a")); err != nil {
 		t.Fatalf("SaveCheckpoint 1: %v", err)
 	}
@@ -101,9 +107,7 @@ func TestMarkTerminalKeepsStateAndSnapshot(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	seedTask(t, repo, "t1", "wf1")
 	if err := repo.SaveCheckpoint(ctx, "t1", "running", "submit", []byte("snap")); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
@@ -127,9 +131,7 @@ func TestMarkTerminalPersistsOutput(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	seedTask(t, repo, "t1", "wf1")
 	out := []byte(`{"orderID":"order-1"}`)
 	if err := repo.MarkTerminal(ctx, "t1", "done", out); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
@@ -161,12 +163,8 @@ func TestRecoverAll(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
-		t.Fatalf("CreateTask t1: %v", err)
-	}
-	if err := repo.CreateTask(ctx, "t2", "wf2"); err != nil {
-		t.Fatalf("CreateTask t2: %v", err)
-	}
+	seedTask(t, repo, "t1", "wf1")
+	seedTask(t, repo, "t2", "wf2")
 	if err := repo.MarkTerminal(ctx, "t2", "done", nil); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
@@ -206,9 +204,7 @@ func TestDeleteTask(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	seedTask(t, repo, "t1", "wf1")
 	if err := repo.DeleteTask(ctx, "t1"); err != nil {
 		t.Fatalf("DeleteTask: %v", err)
 	}
@@ -228,9 +224,7 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSQLite: %v", err)
 	}
-	if err := repo.CreateTask(ctx, "t1", "wf1"); err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	seedTask(t, repo, "t1", "wf1")
 	if err := repo.SaveCheckpoint(ctx, "t1", "suspended", "wait", []byte("snap")); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
@@ -307,6 +301,192 @@ func TestMigratesLegacyDatabaseAddingOutput(t *testing.T) {
 	rec, _ = repo.RecoverTask(ctx, "t1")
 	if string(rec.Output) != string(out) {
 		t.Fatalf("output after migration = %q, want %q", rec.Output, out)
+	}
+}
+
+// TestProxyGroupAssignmentRoundTrips verifies the three distinct assignments a
+// task can carry survive storage: nil (inherit the task group's), "" (run
+// proxyless), and a named group. Collapsing nil and "" would silently turn an
+// inheriting task into a proxyless one.
+func TestProxyGroupAssignmentRoundTrips(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	none, named := "", "residential"
+	for _, tc := range []struct {
+		id       string
+		assigned *string
+	}{
+		{"inherit", nil},
+		{"proxyless", &none},
+		{"named", &named},
+	} {
+		rec := tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: "g1", ProxyGroupID: tc.assigned}
+		if err := repo.CreateTask(ctx, rec); err != nil {
+			t.Fatalf("CreateTask %s: %v", tc.id, err)
+		}
+		got, err := repo.RecoverTask(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("RecoverTask %s: %v", tc.id, err)
+		}
+		switch {
+		case tc.assigned == nil && got.ProxyGroupID != nil:
+			t.Fatalf("%s: ProxyGroupID = %q, want nil (inherit)", tc.id, *got.ProxyGroupID)
+		case tc.assigned != nil && got.ProxyGroupID == nil:
+			t.Fatalf("%s: ProxyGroupID = nil, want %q", tc.id, *tc.assigned)
+		case tc.assigned != nil && *got.ProxyGroupID != *tc.assigned:
+			t.Fatalf("%s: ProxyGroupID = %q, want %q", tc.id, *got.ProxyGroupID, *tc.assigned)
+		}
+		if got.GroupID != "g1" {
+			t.Fatalf("%s: GroupID = %q, want g1", tc.id, got.GroupID)
+		}
+	}
+}
+
+// TestTimestampsRoundTripAndRefresh verifies CreatedAt survives storage
+// unchanged while writes move UpdatedAt forward, so a consumer can tell when a
+// task last progressed.
+func TestTimestampsRoundTripAndRefresh(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	rec := tasks.Record{ID: "t1", WorkflowID: "wf1", GroupID: tasks.GlobalGroup, CreatedAt: created, UpdatedAt: created}
+	if err := repo.CreateTask(ctx, rec); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	got, err := repo.RecoverTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if !got.CreatedAt.Equal(created) || !got.UpdatedAt.Equal(created) {
+		t.Fatalf("timestamps = %v/%v, want both %v", got.CreatedAt, got.UpdatedAt, created)
+	}
+
+	if err := repo.SaveCheckpoint(ctx, "t1", "running", "s1", nil); err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+	got, _ = repo.RecoverTask(ctx, "t1")
+	if !got.CreatedAt.Equal(created) {
+		t.Fatalf("CreatedAt = %v, want it untouched at %v", got.CreatedAt, created)
+	}
+	if !got.UpdatedAt.After(created) {
+		t.Fatalf("UpdatedAt = %v, want it moved past %v", got.UpdatedAt, created)
+	}
+}
+
+// TestGroupCRUD verifies a task group round-trips with its proxy-group
+// assignment, that a missing group reports found=false rather than an error,
+// and that deletion removes it.
+func TestGroupCRUD(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	if _, found, err := repo.GetGroup(ctx, "ghost"); err != nil || found {
+		t.Fatalf("GetGroup(ghost) = found %v, err %v; want false, nil", found, err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	g := tasks.Group{ID: "g1", ProxyGroupID: "residential", CreatedAt: now, UpdatedAt: now}
+	if err := repo.SaveGroup(ctx, g); err != nil {
+		t.Fatalf("SaveGroup: %v", err)
+	}
+
+	got, found, err := repo.GetGroup(ctx, "g1")
+	if err != nil || !found {
+		t.Fatalf("GetGroup(g1) = found %v, err %v; want true, nil", found, err)
+	}
+	if got.ProxyGroupID != "residential" || !got.CreatedAt.Equal(now) {
+		t.Fatalf("got %+v, want proxy group residential created %v", got, now)
+	}
+
+	listed, err := repo.ListGroups(ctx)
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("ListGroups = %d groups, err %v; want 1, nil", len(listed), err)
+	}
+
+	if err := repo.DeleteGroup(ctx, "g1"); err != nil {
+		t.Fatalf("DeleteGroup: %v", err)
+	}
+	if _, found, _ := repo.GetGroup(ctx, "g1"); found {
+		t.Fatal("group survived delete")
+	}
+}
+
+// TestTasksInGroup verifies membership lookup returns exactly the group's
+// tasks, because the service drives its cascade delete off this list.
+func TestTasksInGroup(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	for _, tc := range []struct{ id, group string }{
+		{"a1", "ga"}, {"a2", "ga"}, {"b1", "gb"},
+	} {
+		if err := repo.CreateTask(ctx, tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: tc.group}); err != nil {
+			t.Fatalf("CreateTask %s: %v", tc.id, err)
+		}
+	}
+
+	ids, err := repo.TasksInGroup(ctx, "ga")
+	if err != nil {
+		t.Fatalf("TasksInGroup: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != "a1" || ids[1] != "a2" {
+		t.Fatalf("got %v, want [a1 a2]", ids)
+	}
+	if empty, err := repo.TasksInGroup(ctx, "ghost"); err != nil || len(empty) != 0 {
+		t.Fatalf("TasksInGroup(ghost) = %v, err %v; want empty, nil", empty, err)
+	}
+}
+
+// TestLegacyRowsLandInGlobalGroup verifies the group migration places
+// pre-group tasks in the global namespace rather than an empty one, so an
+// upgraded database's tasks stay addressable as a group.
+func TestLegacyRowsLandInGlobalGroup(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "legacy.db")
+
+	raw, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE tasks (
+		id          TEXT PRIMARY KEY,
+		workflow_id TEXT NOT NULL,
+		state       TEXT NOT NULL DEFAULT '',
+		status      TEXT NOT NULL DEFAULT '',
+		snapshot    BLOB
+	)`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO tasks (id, workflow_id) VALUES ('t1', 'wf1')`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	raw.Close()
+
+	repo, err := NewSQLite(dsn)
+	if err != nil {
+		t.Fatalf("NewSQLite on legacy db: %v", err)
+	}
+	t.Cleanup(func() { repo.Close() })
+
+	rec, err := repo.RecoverTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if rec.GroupID != tasks.GlobalGroup {
+		t.Fatalf("GroupID = %q, want %q", rec.GroupID, tasks.GlobalGroup)
+	}
+	if rec.ProxyGroupID != nil {
+		t.Fatalf("ProxyGroupID = %q, want nil (inherit)", *rec.ProxyGroupID)
+	}
+	if !rec.CreatedAt.IsZero() || !rec.UpdatedAt.IsZero() {
+		t.Fatalf("legacy timestamps = %v/%v, want zero", rec.CreatedAt, rec.UpdatedAt)
+	}
+	ids, err := repo.TasksInGroup(ctx, tasks.GlobalGroup)
+	if err != nil || len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("TasksInGroup(global) = %v, err %v; want [t1], nil", ids, err)
 	}
 }
 

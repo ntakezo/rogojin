@@ -40,10 +40,11 @@ type Result struct {
 // one shared copy.
 type running struct {
 {{- if .Proxy}}
-	proxies *proxies.Manager
-	taskID  string
-	lease   *proxies.Lease
-	client  *http.Client
+	proxies      *proxies.Manager
+	taskID       string
+	proxyGroupID string
+	lease        *proxies.Lease
+	client       *http.Client
 {{- end}}
 	bus comms.Bus
 
@@ -66,8 +67,9 @@ func NewContext(input Input, deps workflows.Deps{{if .Proxy}}, manager *proxies.
 		input: input,
 		r: &running{
 {{- if .Proxy}}
-			proxies: manager,
-			taskID:  deps.TaskID,
+			proxies:      manager,
+			taskID:       deps.TaskID,
+			proxyGroupID: deps.ProxyGroupID,
 {{- end}}
 			bus: deps.Bus,
 		},
@@ -87,7 +89,10 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	if c.r.client != nil {
 		return c.r.client, nil
 	}
-	lease, err := c.r.proxies.Acquire(ctx, c.r.taskID)
+	if c.r.proxyGroupID == "" {
+		return nil, fmt.Errorf("task %s has no proxy group assigned", c.r.taskID)
+	}
+	lease, err := c.r.proxies.Acquire(ctx, c.r.taskID, c.r.proxyGroupID)
 	if err != nil {
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}

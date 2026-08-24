@@ -29,7 +29,8 @@ func (r *run) fetch(ctx context.Context) (*workflows.State, error) {
 Built-in modules cover the unglamorous parts of site automation:
 
 - **Durability** — every transition checkpointed; suspend, resume, kill, and recover at state boundaries.
-- **Proxies** — per-task leasing with round-robin or Thompson-sampling selection, concurrency caps, and sticky locks.
+- **Proxies** — per-task leasing with round-robin or Thompson-sampling selection, per-proxy and per-group holder caps, and sticky locks that outlive the process.
+- **Groups** — named sets of proxies and of tasks; a task or a whole task group leases only from the proxy group assigned to it, and each group rotates through its own selection strategy.
 - **Comms** — typed pub/sub bus for inter-task coordination.
 - **Persistence** — a small byte-store interface; SQLite adapters ship in the box, swap in anything else.
 
