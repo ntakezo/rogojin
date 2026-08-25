@@ -12,23 +12,21 @@ import (
 	"github.com/ntakezo/rogojin/workflows"
 )
 
-// A Record is the durable shape of one task: its workflow, its placement
-// (task group and optional proxy-group assignment), its last-checkpointed
-// status and resume state, and the snapshot taken there. ProxyGroupID nil
-// inherits the task group's assignment; "" runs proxyless; anything else
-// names the proxy group directly. ProxyID pins the task to one proxy within
-// that group, nil or "" leaving it to rotate. Status holds the lifecycle as of the last
-// checkpoint or, once the run exits, the terminal outcome. The framework
-// never deletes a record on its own.
+// A Record is the durable shape of one task: its workflow, its placement (task
+// group, plus a per-kind resource assignment), its last-checkpointed status and
+// resume state, and the snapshot taken there. A kind absent from Assignments
+// inherits the task group's assignment for that kind; see Assignment for what
+// a stored one means. Status holds the lifecycle as of the last checkpoint or,
+// once the run exits, the terminal outcome. The framework never deletes a
+// record on its own.
 type Record struct {
-	ID           string  `json:"id"`
-	WorkflowID   string  `json:"workflowId"`
-	GroupID      string  `json:"groupId"`
-	ProxyGroupID *string `json:"proxyGroupId,omitempty"`
-	ProxyID      *string `json:"proxyId,omitempty"`
-	State        string  `json:"state"`
-	Snapshot     []byte  `json:"snapshot,omitempty"`
-	Status       string  `json:"status"`
+	ID          string                `json:"id"`
+	WorkflowID  string                `json:"workflowId"`
+	GroupID     string                `json:"groupId"`
+	Assignments map[string]Assignment `json:"assignments,omitempty"`
+	State       string                `json:"state"`
+	Snapshot    []byte                `json:"snapshot,omitempty"`
+	Status      string                `json:"status"`
 	// Output is the workflow's result, persisted when the run completes cleanly;
 	// nil for tasks that have not finished or produce no output.
 	Output    []byte    `json:"output,omitempty"`
@@ -47,9 +45,10 @@ type Repository interface {
 	SaveCheckpoint(ctx context.Context, id string, status string, state string, snapshot []byte) error
 	MarkTerminal(ctx context.Context, id string, outcome string, output []byte) error
 	RecoverTask(ctx context.Context, id string) (Record, error)
-	// SaveAssignment repoints a task's proxy placement, leaving the rest of the
-	// record untouched. A nil field clears the stored value.
-	SaveAssignment(ctx context.Context, id string, proxyGroupID, proxyID *string) error
+	// SaveAssignment repoints a task's placement for one kind, leaving every
+	// other kind and the rest of the record untouched. A nil field clears the
+	// stored value.
+	SaveAssignment(ctx context.Context, id string, kind string, assignment Assignment) error
 	RecoverAll(ctx context.Context) ([]Record, error)
 	DeleteTask(ctx context.Context, id string) error
 	SaveGroup(ctx context.Context, group Group) error
@@ -60,9 +59,10 @@ type Repository interface {
 	DeleteGroup(ctx context.Context, id string) error
 	// TasksInGroup returns the ids of every task in the group.
 	TasksInGroup(ctx context.Context, groupID string) ([]string, error)
-	// TasksPinnedTo returns every task record pinned to proxyID. Whole records,
-	// not ids: which of them could still run is a rule this store does not own.
-	TasksPinnedTo(ctx context.Context, proxyID string) ([]Record, error)
+	// TasksPinnedTo returns every task record pinned to resourceID for the
+	// kind. Whole records, not ids: which of them could still run is a rule
+	// this store does not own.
+	TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]Record, error)
 }
 
 // A Service registers workflows and creates, recovers, groups, and deletes
@@ -71,8 +71,8 @@ type Service interface {
 	// RegisterWorkflow makes workflow available under id for task creation.
 	RegisterWorkflow(id string, workflow workflows.Workflow) error
 	// CreateTask validates input and returns a new unstarted Task of the
-	// workflow, placed by opts (the global group, inheriting its proxy-group
-	// assignment, when none are given).
+	// workflow, placed by opts (the global group, inheriting its resource
+	// assignments, when none are given).
 	CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (Task, error)
 	// RecoverTask rehydrates a persisted task and returns it unstarted, or the
 	// live task if it is already running. A task that never checkpointed is
@@ -85,13 +85,13 @@ type Service interface {
 	// DeleteTask removes a task from the registry and the repository, releasing
 	// its external resources first. It refuses a running task.
 	DeleteTask(ctx context.Context, id string) error
-	// AssignProxy repoints a task's proxy placement and releases any durable
-	// proxy lock the new placement no longer fits. Assignment is a deliberate
-	// act and outranks a lock, which is why this — not a lease — is what
-	// resolves the two disagreeing. It takes effect the next time the task is
-	// recovered: a live run keeps the placement it was wired with, and the
-	// lease it already holds.
-	AssignProxy(ctx context.Context, id string, assignment ProxyAssignment) error
+	// AssignResource repoints a task's placement for one resource kind and
+	// releases any durable lock of that kind the new placement no longer fits.
+	// Assignment is a deliberate act and outranks a lock, which is why this —
+	// not a lease — is what resolves the two disagreeing. It takes effect the
+	// next time the task is recovered: a live run keeps the placement it was
+	// wired with, and the lease it already holds. Other kinds are untouched.
+	AssignResource(ctx context.Context, id string, kind string, assignment Assignment) error
 	// CreateGroup persists a new task group. The global group needs no record
 	// and cannot be re-created.
 	CreateGroup(ctx context.Context, group Group) error
@@ -102,20 +102,22 @@ type Service interface {
 	// IsRunning reports whether a known task is started and not yet terminal.
 	// A suspended task counts: it is parked, not finished.
 	IsRunning(id string) bool
-	// RunningTasks returns the ids of every task actively running against
-	// proxyGroupID. With TaskIsRunning it satisfies the usage guard a proxy
-	// manager consults before deleting a proxy or a group, so a pool is never
-	// torn out from under a run.
-	RunningTasks(ctx context.Context, proxyGroupID string) ([]string, error)
+	// RunningTasks returns the ids of every task actively running against the
+	// kind's groupID. With TaskIsRunning it satisfies the usage guard a leasing
+	// manager consults before deleting a resource or a group, so a pool is
+	// never torn out from under a run. Each manager asks about its own kind, so
+	// a proxy group and an account group may share a name without colliding.
+	RunningTasks(ctx context.Context, kind, groupID string) ([]string, error)
 	// TaskIsRunning reports whether the named task is actively running. It
 	// answers the half of the usage guard that asks about one task rather than
-	// a whole group, for a proxy some task holds a durable lock on.
+	// a whole group, for a resource some task holds a durable lock on. The
+	// question is kind-agnostic: a task runs, or it does not.
 	TaskIsRunning(ctx context.Context, taskID string) (bool, error)
-	// PinnedTasks returns the ids of every task pinned to proxyID that could
-	// still run, running or not. It is the half of the usage guard a proxy
-	// manager cannot answer for itself: a durable lock lives on the proxy, but
-	// a pin lives here.
-	PinnedTasks(ctx context.Context, proxyID string) ([]string, error)
+	// PinnedTasks returns the ids of every task pinned to the kind's resourceID
+	// that could still run, running or not. It is the half of the usage guard a
+	// leasing manager cannot answer for itself: a durable lock lives on the
+	// resource, but a pin lives here.
+	PinnedTasks(ctx context.Context, kind, resourceID string) ([]string, error)
 }
 
 type service struct {
@@ -213,16 +215,8 @@ func (s *service) CreateTask(ctx context.Context, workflowID string, input any, 
 	if err != nil {
 		return nil, err
 	}
-	proxyGroupID := group.ProxyGroupID
-	if cfg.proxyGroupID != nil {
-		proxyGroupID = *cfg.proxyGroupID
-	}
-	proxyID := ""
-	if cfg.proxyID != nil {
-		proxyID = *cfg.proxyID
-	}
 
-	task, err := createTask(workflow, input, s.bus, s.repository, proxyGroupID, proxyID)
+	task, err := createTask(workflow, input, s.bus, s.repository, resolveAll(cfg.assignments, group))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create task: %w", err)
 	}
@@ -232,13 +226,12 @@ func (s *service) CreateTask(ctx context.Context, workflowID string, input any, 
 	if s.repository != nil {
 		now := time.Now().UTC()
 		record := Record{
-			ID:           task.ID(),
-			WorkflowID:   workflowID,
-			GroupID:      cfg.groupID,
-			ProxyGroupID: cfg.proxyGroupID,
-			ProxyID:      cfg.proxyID,
-			CreatedAt:    now,
-			UpdatedAt:    now,
+			ID:          task.ID(),
+			WorkflowID:  workflowID,
+			GroupID:     cfg.groupID,
+			Assignments: cfg.assignments,
+			CreatedAt:   now,
+			UpdatedAt:   now,
 		}
 		if err := s.repository.CreateTask(ctx, record); err != nil {
 			return nil, fmt.Errorf("failed to create task in repository: %w", err)
@@ -258,21 +251,21 @@ func (s *service) IsRunning(id string) bool {
 	return ok && t.IsRunning()
 }
 
-// RunningTasks reports which tasks are actively running against proxyGroupID,
-// reading the group each was actually wired to rather than what its record now
-// says: a task started before a reassignment is still running against the old
-// pool. A suspended task is excluded — it is parked between states with no
-// request in flight, which is what makes suspending a task the way to free its
-// proxies for deletion. It answers from this service's registry, so in a
-// multi-process deployment it sees only this process's runs. It never errors;
-// the signature matches the port it satisfies.
-func (s *service) RunningTasks(ctx context.Context, proxyGroupID string) ([]string, error) {
+// RunningTasks reports which tasks are actively running against the kind's
+// groupID, reading the group each was actually wired to rather than what its
+// record now says: a task started before a reassignment is still running
+// against the old pool. A suspended task is excluded — it is parked between
+// states with no request in flight, which is what makes suspending a task the
+// way to free its resources for deletion. It answers from this service's
+// registry, so in a multi-process deployment it sees only this process's runs.
+// It never errors; the signature matches the port it satisfies.
+func (s *service) RunningTasks(ctx context.Context, kind, groupID string) ([]string, error) {
 	s.taskRegistryMu.RLock()
 	defer s.taskRegistryMu.RUnlock()
 
 	ids := make([]string, 0)
 	for id, t := range s.taskRegistry {
-		if isActive(t) && t.ProxyGroupID() == proxyGroupID {
+		if wired, _ := t.Assignment(kind); isActive(t) && wired == groupID {
 			ids = append(ids, id)
 		}
 	}
@@ -297,16 +290,16 @@ func isActive(t *task) bool {
 	return t.Status() == workflows.StatusRunning
 }
 
-// PinnedTasks reports which tasks pinned to proxyID could still run, so a
-// deletion can be weighed before it happens rather than discovered at the
-// task's next lease. A task counts when it is resumable from a durable
+// PinnedTasks reports which tasks pinned to the kind's resourceID could still
+// run, so a deletion can be weighed before it happens rather than discovered at
+// the task's next lease. A task counts when it is resumable from a durable
 // checkpoint, or is live in this process's registry and not yet terminal.
 //
 // Tasks that finished, and tasks that ran without durability and so kept no
 // checkpoint to resume from, are left out: nothing can make them run again, and
 // warning about them is noise.
-func (s *service) PinnedTasks(ctx context.Context, proxyID string) ([]string, error) {
-	if proxyID == "" {
+func (s *service) PinnedTasks(ctx context.Context, kind, resourceID string) ([]string, error) {
+	if resourceID == "" {
 		return nil, nil
 	}
 
@@ -315,7 +308,7 @@ func (s *service) PinnedTasks(ctx context.Context, proxyID string) ([]string, er
 	s.taskRegistryMu.RLock()
 	counted := make(map[string]bool)
 	for id, t := range s.taskRegistry {
-		if t.ProxyID() == proxyID && !t.Status().Terminal() {
+		if _, pin := t.Assignment(kind); pin == resourceID && !t.Status().Terminal() {
 			counted[id] = true
 		}
 	}
@@ -327,9 +320,9 @@ func (s *service) PinnedTasks(ctx context.Context, proxyID string) ([]string, er
 	}
 
 	if s.repository != nil {
-		records, err := s.repository.TasksPinnedTo(ctx, proxyID)
+		records, err := s.repository.TasksPinnedTo(ctx, kind, resourceID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list tasks pinned to proxy %s: %w", proxyID, err)
+			return nil, fmt.Errorf("failed to list tasks pinned to %s %s: %w", kind, resourceID, err)
 		}
 		for _, record := range records {
 			if counted[record.ID] || !resumable(record) {
@@ -440,39 +433,59 @@ func groupOf(record Record) string {
 }
 
 // rehydrate rebuilds an unstarted task from a persisted record, resolving its
-// workflow from the registry and its effective proxy group from its own
-// assignment when set, else from group's; "" runs proxyless.
+// workflow from the registry and its effective placement per kind.
 func (s *service) rehydrate(record Record, group Group) (*task, error) {
 	workflow, err := s.getWorkflow(record.WorkflowID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workflow for recovery: %w", err)
 	}
-	proxyGroupID := group.ProxyGroupID
-	if record.ProxyGroupID != nil {
-		proxyGroupID = *record.ProxyGroupID
-	}
-	proxyID := ""
-	if record.ProxyID != nil {
-		proxyID = *record.ProxyID
-	}
-	return rehydrateTask(workflow, record.ID, record.Snapshot, workflows.State(record.State), workflows.Status(record.Status), s.bus, s.repository, proxyGroupID, proxyID), nil
+	return rehydrateTask(workflow, record.ID, record.Snapshot, workflows.State(record.State), workflows.Status(record.Status), s.bus, s.repository, resolveAll(record.Assignments, group)), nil
 }
 
-// AssignProxy repoints the task's proxy placement, then releases any durable
-// proxy lock the new placement no longer fits. The record is written first: a
-// released lock with an unwritten placement would send the task back to the
-// pool it was just moved off, while a written placement with a stale lock is
-// what the next AssignProxy — or a plain Unlock — can still repair.
+// resolve settles one kind's placement: the task's own assignment wherever it
+// sets a field, the task group's resource group otherwise. An unset field
+// inherits; one set to the empty string is an explicit "none" and does not.
+func resolve(own Assignment, group Group, kind string) workflows.Assignment {
+	resolved := workflows.Assignment{GroupID: group.ResourceGroups[kind]}
+	if own.GroupID != nil {
+		resolved.GroupID = *own.GroupID
+	}
+	if own.ResourceID != nil {
+		resolved.ResourceID = *own.ResourceID
+	}
+	return resolved
+}
+
+// resolveAll settles every kind either the task or its group names. A kind
+// neither names is absent, which reads as the zero Assignment — the same answer
+// resolving it would give.
+func resolveAll(assignments map[string]Assignment, group Group) map[string]workflows.Assignment {
+	resolved := make(map[string]workflows.Assignment, len(assignments)+len(group.ResourceGroups))
+	for kind := range group.ResourceGroups {
+		resolved[kind] = resolve(assignments[kind], group, kind)
+	}
+	for kind := range assignments {
+		resolved[kind] = resolve(assignments[kind], group, kind)
+	}
+	return resolved
+}
+
+// AssignResource repoints the task's placement for one kind, then releases any
+// durable lock of that kind the new placement no longer fits. The record is
+// written first: a released lock with an unwritten placement would send the
+// task back to the pool it was just moved off, while a written placement with a
+// stale lock is what the next AssignResource — or a plain Unlock — can still
+// repair.
 //
 // It refuses nothing. Reassigning a live task is legitimate and takes effect at
 // its next recovery, since a run is wired with its placement at start and keeps
 // the lease it already holds.
-func (s *service) AssignProxy(ctx context.Context, id string, assignment ProxyAssignment) error {
+func (s *service) AssignResource(ctx context.Context, id string, kind string, assignment Assignment) error {
 	s.taskRegistryMu.Lock()
 	defer s.taskRegistryMu.Unlock()
 
 	if s.repository == nil {
-		return errors.New("cannot assign a proxy: no repository configured")
+		return errors.New("cannot assign a resource: no repository configured")
 	}
 	record, err := s.repository.RecoverTask(ctx, id)
 	if err != nil {
@@ -483,8 +496,8 @@ func (s *service) AssignProxy(ctx context.Context, id string, assignment ProxyAs
 		return err
 	}
 
-	if err := s.repository.SaveAssignment(ctx, id, assignment.GroupID, assignment.ProxyID); err != nil {
-		return fmt.Errorf("failed to assign proxy placement of task %s: %w", id, err)
+	if err := s.repository.SaveAssignment(ctx, id, kind, assignment); err != nil {
+		return fmt.Errorf("failed to assign %s placement of task %s: %w", kind, id, err)
 	}
 	if s.reassign == nil {
 		return nil
@@ -492,16 +505,9 @@ func (s *service) AssignProxy(ctx context.Context, id string, assignment ProxyAs
 
 	// The releaser is told the placement as resolved, not as stored: a nil group
 	// inherits the task group's, which is what the task will actually lease from.
-	proxyGroupID := group.ProxyGroupID
-	if assignment.GroupID != nil {
-		proxyGroupID = *assignment.GroupID
-	}
-	proxyID := ""
-	if assignment.ProxyID != nil {
-		proxyID = *assignment.ProxyID
-	}
-	if err := s.reassign(ctx, id, proxyGroupID, proxyID); err != nil {
-		return fmt.Errorf("failed to release the stale lock of task %s: %w", id, err)
+	resolved := resolve(assignment, group, kind)
+	if err := s.reassign(ctx, id, kind, resolved.GroupID, resolved.ResourceID); err != nil {
+		return fmt.Errorf("failed to release the stale %s lock of task %s: %w", kind, id, err)
 	}
 	return nil
 }

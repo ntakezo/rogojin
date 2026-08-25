@@ -16,13 +16,20 @@ import (
 	"github.com/ntakezo/rogojin/workflows"
 )
 
+// The resource kinds this workflow leases under. A kind is just the key its
+// placement is filed on the task record; the framework defines none, so this is
+// the one place the two managers and the task service must agree.
+const (
+	ProxyKind   = "proxy"
+	AccountKind = "account"
+)
+
 // StaticContext is the immutable input the user supplies when creating the task.
-// AccountGroupID names the pool of site logins this task checks out as; the
-// task record carries no account placement, so the workflow asks for one itself.
+// Where the task leases its proxy and its site login from is placement, not
+// input: it lives on the task record and arrives through Deps.
 type StaticContext struct {
-	ProductURL     string
-	Size           string
-	AccountGroupID string
+	ProductURL string
+	Size       string
 }
 
 // Profile is this workflow's account shape. The accounts module stores it as
@@ -68,19 +75,20 @@ func NewContext(input StaticContext, deps workflows.Deps, manager *proxies.Manag
 		static: input,
 		running: &RunningContext{
 			proxies: manager,
-			// The whole placement travels together: the group to rotate within,
-			// or the one proxy pinned inside it. No branching here.
+			// Deps carries one placement per resource kind, keyed by whatever
+			// this program calls each manager. The whole placement travels
+			// together: the group to rotate within, or the one member pinned
+			// inside it. No branching here.
 			assignment: proxies.Assignment{
 				TaskID:  deps.TaskID,
-				GroupID: deps.ProxyGroupID,
-				ProxyID: deps.ProxyID,
+				GroupID: deps.Assignments[ProxyKind].GroupID,
+				ProxyID: deps.Assignments[ProxyKind].ResourceID,
 			},
 			accounts: accountManager,
-			// Accounts are not on the task record, so the placement comes from
-			// input. The durable lock is what makes it stick across a restart.
 			account: accounts.Assignment{
-				TaskID:  deps.TaskID,
-				GroupID: input.AccountGroupID,
+				TaskID:    deps.TaskID,
+				GroupID:   deps.Assignments[AccountKind].GroupID,
+				AccountID: deps.Assignments[AccountKind].ResourceID,
 			},
 			bus: deps.Bus,
 		},

@@ -12,6 +12,14 @@ import (
 	"github.com/ntakezo/rogojin/workflows"
 )
 
+// The resource kinds these tests place tasks under. This package stores kind
+// strings and never interprets them, so what a consumer calls its leasing
+// managers is exactly what appears here.
+const (
+	proxyKind   = "proxy"
+	accountKind = "account"
+)
+
 // TestNilRepositoryRunsInMemoryLifecycle verifies a Service built with a nil
 // repository supports the full in-memory lifecycle — create, start to completion,
 // and delete — without ever dereferencing a store. This is the purely in-memory
@@ -134,14 +142,21 @@ func (m *memStore) MarkTerminal(ctx context.Context, id, outcome string, output 
 	return nil
 }
 
-func (m *memStore) SaveAssignment(ctx context.Context, id string, proxyGroupID, proxyID *string) error {
+// SaveAssignment writes one kind and copies the rest, the same per-kind
+// isolation the SQLite store gets from json_set.
+func (m *memStore) SaveAssignment(ctx context.Context, id string, kind string, a Assignment) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rec, ok := m.records[id]
 	if !ok {
 		return errors.New("not found")
 	}
-	rec.ProxyGroupID, rec.ProxyID = proxyGroupID, proxyID
+	assignments := make(map[string]Assignment, len(rec.Assignments)+1)
+	for k, v := range rec.Assignments {
+		assignments[k] = v
+	}
+	assignments[kind] = a
+	rec.Assignments = assignments
 	m.records[id] = rec
 	return nil
 }
@@ -205,12 +220,12 @@ func (m *memStore) DeleteGroup(ctx context.Context, id string) error {
 	return nil
 }
 
-func (m *memStore) TasksPinnedTo(ctx context.Context, proxyID string) ([]Record, error) {
+func (m *memStore) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]Record, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]Record, 0)
 	for _, rec := range m.records {
-		if rec.ProxyID != nil && *rec.ProxyID == proxyID {
+		if pin := rec.Assignments[kind].ResourceID; pin != nil && *pin == resourceID {
 			out = append(out, rec)
 		}
 	}
@@ -242,7 +257,7 @@ func (m *memStore) record(t *testing.T, id string) Record {
 }
 
 // depsWorkflow captures the Deps injected into every instance it builds, so a
-// test can assert which proxy group a task was actually wired to.
+// test can assert which placement a task was actually wired with.
 type depsWorkflow struct {
 	mu   sync.Mutex
 	seen []workflows.Deps
@@ -267,19 +282,19 @@ func (w *depsWorkflow) capture(deps workflows.Deps) {
 	w.seen = append(w.seen, deps)
 }
 
-// proxyGroupOf returns the proxy group the instance built for taskID was wired
-// to, failing the test if no instance was built for it.
-func (w *depsWorkflow) proxyGroupOf(t *testing.T, taskID string) string {
+// wiredWith returns the kind's placement the instance built for taskID was
+// wired with, failing the test if no instance was built for it.
+func (w *depsWorkflow) wiredWith(t *testing.T, taskID, kind string) workflows.Assignment {
 	t.Helper()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, d := range w.seen {
 		if d.TaskID == taskID {
-			return d.ProxyGroupID
+			return d.Assignments[kind]
 		}
 	}
 	t.Fatalf("no instance built for task %s", taskID)
-	return ""
+	return workflows.Assignment{}
 }
 
 // newDepsService returns a service with a deps-capturing workflow registered,
@@ -304,10 +319,10 @@ func startAndCapture(t *testing.T, task Task) {
 	}
 }
 
-// TestUngroupedTaskLandsInGlobalAndRunsProxyless verifies a task created with
+// TestUngroupedTaskLandsInGlobalAndLeasesNothing verifies a task created with
 // no options is placed in the global group and, because nothing assigns it a
-// proxy group, runs without proxies — the documented default.
-func TestUngroupedTaskLandsInGlobalAndRunsProxyless(t *testing.T) {
+// resource group of any kind, leases none — the documented default.
+func TestUngroupedTaskLandsInGlobalAndLeasesNothing(t *testing.T) {
 	svc, store, wf := newDepsService(t)
 	ctx := context.Background()
 
@@ -321,24 +336,28 @@ func TestUngroupedTaskLandsInGlobalAndRunsProxyless(t *testing.T) {
 	if rec.GroupID != GlobalGroup {
 		t.Fatalf("GroupID = %q, want %q", rec.GroupID, GlobalGroup)
 	}
-	if rec.ProxyGroupID != nil {
-		t.Fatalf("ProxyGroupID = %q, want nil (inherit)", *rec.ProxyGroupID)
+	if len(rec.Assignments) != 0 {
+		t.Fatalf("Assignments = %v, want none (inherit every kind)", rec.Assignments)
 	}
 	if rec.CreatedAt.IsZero() || rec.UpdatedAt.IsZero() {
 		t.Fatal("timestamps not stamped at creation")
 	}
-	if got := wf.proxyGroupOf(t, task.ID()); got != "" {
-		t.Fatalf("wired proxy group = %q, want none", got)
+	if got := wf.wiredWith(t, task.ID(), proxyKind); got != (workflows.Assignment{}) {
+		t.Fatalf("wired proxy placement = %+v, want none", got)
 	}
 }
 
-// TestTaskInheritsGroupProxyAssignment verifies a task in a group with a proxy
-// group assigned leases from it, which is the point of assigning one to a group.
-func TestTaskInheritsGroupProxyAssignment(t *testing.T) {
+// TestTaskInheritsGroupResourceGroups verifies a task in a group leases from
+// every kind that group assigns, which is the point of assigning them to a
+// group: one placement decision covers every member and every kind at once.
+func TestTaskInheritsGroupResourceGroups(t *testing.T) {
 	svc, _, wf := newDepsService(t)
 	ctx := context.Background()
 
-	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ProxyGroupID: "residential"}); err != nil {
+	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{
+		proxyKind:   "residential",
+		accountKind: "shoppers",
+	}}); err != nil {
 		t.Fatalf("CreateGroup: %v", err)
 	}
 	task, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"))
@@ -347,57 +366,92 @@ func TestTaskInheritsGroupProxyAssignment(t *testing.T) {
 	}
 	startAndCapture(t, task)
 
-	if got := wf.proxyGroupOf(t, task.ID()); got != "residential" {
+	if got := wf.wiredWith(t, task.ID(), proxyKind).GroupID; got != "residential" {
 		t.Fatalf("wired proxy group = %q, want residential", got)
+	}
+	if got := wf.wiredWith(t, task.ID(), accountKind).GroupID; got != "shoppers" {
+		t.Fatalf("wired account group = %q, want shoppers", got)
 	}
 }
 
-// TestTaskProxyAssignmentOverridesGroup verifies a task's own assignment wins
-// over its group's, in both directions: naming a different group, and opting
-// out of proxies entirely.
-func TestTaskProxyAssignmentOverridesGroup(t *testing.T) {
+// TestAssignmentOverridesGroupOneKindAtATime verifies each kind resolves on its
+// own: overriding one, and opting out of another, leaves every other kind still
+// inheriting. Placement per kind is the whole reason this is a map rather than
+// a pair of fields.
+func TestAssignmentOverridesGroupOneKindAtATime(t *testing.T) {
 	svc, store, wf := newDepsService(t)
 	ctx := context.Background()
 
-	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ProxyGroupID: "residential"}); err != nil {
+	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{
+		proxyKind:   "residential",
+		accountKind: "shoppers",
+	}}); err != nil {
 		t.Fatalf("CreateGroup: %v", err)
 	}
 
-	override, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), WithProxyGroup("datacenter"))
+	override, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), WithResourceGroup(proxyKind, "datacenter"))
 	if err != nil {
 		t.Fatalf("CreateTask override: %v", err)
 	}
 	startAndCapture(t, override)
-	if got := wf.proxyGroupOf(t, override.ID()); got != "datacenter" {
-		t.Fatalf("override wired to %q, want datacenter", got)
+	if got := wf.wiredWith(t, override.ID(), proxyKind).GroupID; got != "datacenter" {
+		t.Fatalf("override wired to proxy group %q, want datacenter", got)
+	}
+	if got := wf.wiredWith(t, override.ID(), accountKind).GroupID; got != "shoppers" {
+		t.Fatalf("override wired to account group %q, want the inherited shoppers", got)
 	}
 
-	proxyless, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), WithoutProxies())
+	optedOut, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), Without(proxyKind))
 	if err != nil {
-		t.Fatalf("CreateTask proxyless: %v", err)
+		t.Fatalf("CreateTask opted out: %v", err)
 	}
-	startAndCapture(t, proxyless)
-	if got := wf.proxyGroupOf(t, proxyless.ID()); got != "" {
-		t.Fatalf("proxyless wired to %q, want none", got)
+	startAndCapture(t, optedOut)
+	if got := wf.wiredWith(t, optedOut.ID(), proxyKind).GroupID; got != "" {
+		t.Fatalf("opted-out task wired to proxy group %q, want none", got)
+	}
+	if got := wf.wiredWith(t, optedOut.ID(), accountKind).GroupID; got != "shoppers" {
+		t.Fatalf("opting out of proxies also dropped the account group %q", got)
 	}
 	// The opt-out must persist as an explicit empty assignment, not as nil:
 	// nil would inherit the group's proxies again on recovery.
-	rec := store.record(t, proxyless.ID())
-	if rec.ProxyGroupID == nil || *rec.ProxyGroupID != "" {
-		t.Fatalf("persisted ProxyGroupID = %v, want explicit empty", rec.ProxyGroupID)
+	rec := store.record(t, optedOut.ID())
+	if groupID := rec.Assignments[proxyKind].GroupID; groupID == nil || *groupID != "" {
+		t.Fatalf("persisted proxy group = %v, want explicit empty", groupID)
 	}
 }
 
-// TestProxyGroupShardedAcrossManyOwners verifies one proxy group can back
+// TestKindsDoNotCollide verifies a kind resolves only against its own
+// namespace. Two managers may name their groups alike — "residential" proxies
+// and "residential" accounts are unrelated pools — and a task assigned one must
+// never come out wired to the other.
+func TestKindsDoNotCollide(t *testing.T) {
+	svc, _, wf := newDepsService(t)
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(accountKind, "residential"))
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	startAndCapture(t, task)
+
+	if got := wf.wiredWith(t, task.ID(), accountKind).GroupID; got != "residential" {
+		t.Fatalf("wired account group = %q, want residential", got)
+	}
+	if got := wf.wiredWith(t, task.ID(), proxyKind).GroupID; got != "" {
+		t.Fatalf("wired proxy group = %q, want none: the name belongs to accounts", got)
+	}
+}
+
+// TestResourceGroupSharedAcrossManyOwners verifies one resource group can back
 // several task groups and several individually-assigned tasks at once. The
-// assignment is a reference, not ownership: nothing about naming a proxy group
-// may make it exclusive to the first task group that claimed it.
-func TestProxyGroupSharedAcrossManyOwners(t *testing.T) {
+// assignment is a reference, not ownership: nothing about naming a resource
+// group may make it exclusive to the first task group that claimed it.
+func TestResourceGroupSharedAcrossManyOwners(t *testing.T) {
 	svc, _, wf := newDepsService(t)
 	ctx := context.Background()
 
 	for _, id := range []string{"checkout", "restock"} {
-		if err := svc.CreateGroup(ctx, Group{ID: id, ProxyGroupID: "residential"}); err != nil {
+		if err := svc.CreateGroup(ctx, Group{ID: id, ResourceGroups: map[string]string{proxyKind: "residential"}}); err != nil {
 			t.Fatalf("CreateGroup %s: %v", id, err)
 		}
 	}
@@ -406,8 +460,8 @@ func TestProxyGroupSharedAcrossManyOwners(t *testing.T) {
 	for name, opts := range map[string][]CreateOption{
 		"viaCheckout":   {InGroup("checkout")},
 		"viaRestock":    {InGroup("restock")},
-		"direct":        {WithProxyGroup("residential")},
-		"directInGroup": {InGroup("restock"), WithProxyGroup("residential")},
+		"direct":        {WithResourceGroup(proxyKind, "residential")},
+		"directInGroup": {InGroup("restock"), WithResourceGroup(proxyKind, "residential")},
 	} {
 		task, err := svc.CreateTask(ctx, wf.ID(), nil, opts...)
 		if err != nil {
@@ -418,7 +472,7 @@ func TestProxyGroupSharedAcrossManyOwners(t *testing.T) {
 	}
 
 	for name, task := range created {
-		if got := wf.proxyGroupOf(t, task.ID()); got != "residential" {
+		if got := wf.wiredWith(t, task.ID(), proxyKind).GroupID; got != "residential" {
 			t.Fatalf("%s wired to %q, want residential", name, got)
 		}
 	}
@@ -435,14 +489,17 @@ func TestCreateTaskRejectsUnknownGroup(t *testing.T) {
 	}
 }
 
-// TestRecoveredTaskResolvesInheritedProxyGroup verifies recovery re-resolves a
-// task's proxy group from its group, so a group reassigned while the task was
-// offline takes effect on the next run.
-func TestRecoveredTaskResolvesInheritedProxyGroup(t *testing.T) {
+// TestRecoveredTaskResolvesInheritedResourceGroups verifies recovery
+// re-resolves every inherited kind from the task's group, so a group reassigned
+// while the task was offline takes effect on the next run.
+func TestRecoveredTaskResolvesInheritedResourceGroups(t *testing.T) {
 	svc, store, wf := newDepsService(t)
 	ctx := context.Background()
 
-	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ProxyGroupID: "residential"}); err != nil {
+	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{
+		proxyKind:   "residential",
+		accountKind: "shoppers",
+	}}); err != nil {
 		t.Fatalf("CreateGroup: %v", err)
 	}
 	task, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"))
@@ -450,9 +507,12 @@ func TestRecoveredTaskResolvesInheritedProxyGroup(t *testing.T) {
 		t.Fatalf("CreateTask: %v", err)
 	}
 
-	// Reassign the group, then recover: the record stores no proxy group of its
-	// own, so the new assignment must apply.
-	if err := store.SaveGroup(ctx, Group{ID: "checkout", ProxyGroupID: "datacenter"}); err != nil {
+	// Reassign the group, then recover: the record stores no assignment of its
+	// own for either kind, so both new assignments must apply.
+	if err := store.SaveGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{
+		proxyKind:   "datacenter",
+		accountKind: "resellers",
+	}}); err != nil {
 		t.Fatalf("SaveGroup: %v", err)
 	}
 	// Give the record a checkpoint so the recovered task is startable.
@@ -466,8 +526,11 @@ func TestRecoveredTaskResolvesInheritedProxyGroup(t *testing.T) {
 	}
 	startAndCapture(t, recovered)
 
-	if got := wf.proxyGroupOf(t, task.ID()); got != "datacenter" {
-		t.Fatalf("recovered task wired to %q, want the group's new datacenter", got)
+	if got := wf.wiredWith(t, task.ID(), proxyKind).GroupID; got != "datacenter" {
+		t.Fatalf("recovered task wired to proxy group %q, want the group's new datacenter", got)
+	}
+	if got := wf.wiredWith(t, task.ID(), accountKind).GroupID; got != "resellers" {
+		t.Fatalf("recovered task wired to account group %q, want the group's new resellers", got)
 	}
 }
 
@@ -495,8 +558,8 @@ func (r *releaseSpy) calls() []string {
 }
 
 // TestDeleteTaskReleasesResources verifies deleting a task releases its
-// external resources first. Proxy locks are durable and outlive the process,
-// so a delete that skipped this would strand a proxy bound to a task that no
+// external resources first. Leasing locks are durable and outlive the process,
+// so a delete that skipped this would strand a resource bound to a task that no
 // longer exists — unleasable forever.
 func TestDeleteTaskReleasesResources(t *testing.T) {
 	spy := &releaseSpy{}
@@ -723,16 +786,16 @@ func TestDeleteUnknownGroupFails(t *testing.T) {
 }
 
 // TestRecoverAllResolvesGroupAssignments verifies the bulk recovery path wires
-// each task to its group's proxy group, the same as single recovery.
+// each task to its group's resource groups, the same as single recovery.
 func TestRecoverAllResolvesGroupAssignments(t *testing.T) {
 	svc, store, wf := newDepsService(t)
 	ctx := context.Background()
 
-	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ProxyGroupID: "residential"}); err != nil {
+	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{proxyKind: "residential"}}); err != nil {
 		t.Fatalf("CreateGroup: %v", err)
 	}
 	inherits, _ := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"))
-	overrides, _ := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), WithoutProxies())
+	overrides, _ := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), Without(proxyKind))
 	global, _ := svc.CreateTask(ctx, wf.ID(), nil)
 
 	// Give every record a checkpoint so the recovered tasks are startable.
@@ -752,13 +815,13 @@ func TestRecoverAllResolvesGroupAssignments(t *testing.T) {
 	for _, task := range recovered {
 		startAndCapture(t, task)
 	}
-	if got := wf.proxyGroupOf(t, inherits.ID()); got != "residential" {
+	if got := wf.wiredWith(t, inherits.ID(), proxyKind).GroupID; got != "residential" {
 		t.Fatalf("inheriting task wired to %q, want residential", got)
 	}
-	if got := wf.proxyGroupOf(t, overrides.ID()); got != "" {
+	if got := wf.wiredWith(t, overrides.ID(), proxyKind).GroupID; got != "" {
 		t.Fatalf("opted-out task wired to %q, want none", got)
 	}
-	if got := wf.proxyGroupOf(t, global.ID()); got != "" {
+	if got := wf.wiredWith(t, global.ID(), proxyKind).GroupID; got != "" {
 		t.Fatalf("global-group task wired to %q, want none", got)
 	}
 }
@@ -829,10 +892,11 @@ func (i *blockingInstance) Graph() workflows.Graph {
 	})
 }
 
-// TestRunningTasksReportsOnlyLiveLeases verifies the guard a proxy manager
+// TestRunningTasksReportsOnlyLiveLeases verifies the guard a leasing manager
 // consults sees exactly the tasks that would be harmed by deleting a pool:
-// running ones leasing from that group. Created-but-unstarted and finished
-// tasks hold nothing, and other groups are none of its business.
+// running ones leasing from that group, of that kind. Created-but-unstarted and
+// finished tasks hold nothing; other groups, and other kinds, are none of its
+// business.
 func TestRunningTasksReportsOnlyLiveLeases(t *testing.T) {
 	store := newMemStore()
 	svc := NewService(store, comms.NewBus())
@@ -846,32 +910,37 @@ func TestRunningTasksReportsOnlyLiveLeases(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	live, _ := svc.CreateTask(ctx, blocking.ID(), nil, WithProxyGroup("residential"))
-	idle, _ := svc.CreateTask(ctx, quick.ID(), nil, WithProxyGroup("residential"))
-	other, _ := svc.CreateTask(ctx, blocking.ID(), nil, WithProxyGroup("datacenter"))
-	proxyless, _ := svc.CreateTask(ctx, quick.ID(), nil)
+	live, _ := svc.CreateTask(ctx, blocking.ID(), nil, WithResourceGroup(proxyKind, "residential"))
+	idle, _ := svc.CreateTask(ctx, quick.ID(), nil, WithResourceGroup(proxyKind, "residential"))
+	other, _ := svc.CreateTask(ctx, blocking.ID(), nil, WithResourceGroup(proxyKind, "datacenter"))
+	unplaced, _ := svc.CreateTask(ctx, quick.ID(), nil)
 
 	go live.Start(ctx)
 	<-blocking.entered
 
-	running, err := svc.RunningTasks(ctx, "residential")
+	running, err := svc.RunningTasks(ctx, proxyKind, "residential")
 	if err != nil {
 		t.Fatalf("RunningTasks: %v", err)
 	}
 	if len(running) != 1 || running[0] != live.ID() {
 		t.Fatalf("running = %v, want only the started %s, not the unstarted %s", running, live.ID(), idle.ID())
 	}
-	if got, _ := svc.RunningTasks(ctx, "datacenter"); len(got) != 0 {
+	if got, _ := svc.RunningTasks(ctx, proxyKind, "datacenter"); len(got) != 0 {
 		t.Fatalf("datacenter running = %v, want none: %s never started", got, other.ID())
 	}
-	if got, _ := svc.RunningTasks(ctx, ""); len(got) != 0 {
-		t.Fatalf("proxyless running = %v, want none: %s leases nothing", got, proxyless.ID())
+	if got, _ := svc.RunningTasks(ctx, proxyKind, ""); len(got) != 0 {
+		t.Fatalf("unplaced running = %v, want none: %s leases nothing", got, unplaced.ID())
+	}
+	// The live task leases residential proxies. An account manager deleting its
+	// own residential group must not be told this run would be harmed.
+	if got, _ := svc.RunningTasks(ctx, accountKind, "residential"); len(got) != 0 {
+		t.Fatalf("residential accounts running = %v, want none: the name belongs to proxies", got)
 	}
 
 	// A finished task releases its hold, so the group frees up.
 	close(blocking.release)
 	waitUntil(t, func() bool { return !svc.IsRunning(live.ID()) })
-	if got, _ := svc.RunningTasks(ctx, "residential"); len(got) != 0 {
+	if got, _ := svc.RunningTasks(ctx, proxyKind, "residential"); len(got) != 0 {
 		t.Fatalf("running after completion = %v, want none", got)
 	}
 }
@@ -902,7 +971,7 @@ func TestRunningTasksTracksWiredGroupNotRecord(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ProxyGroupID: "residential"}); err != nil {
+	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{proxyKind: "residential"}}); err != nil {
 		t.Fatalf("CreateGroup: %v", err)
 	}
 	task, _ := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"))
@@ -911,14 +980,14 @@ func TestRunningTasksTracksWiredGroupNotRecord(t *testing.T) {
 	defer close(wf.release)
 
 	// Reassign the task group mid-run: the live task still holds residential.
-	if err := store.SaveGroup(ctx, Group{ID: "checkout", ProxyGroupID: "datacenter"}); err != nil {
+	if err := store.SaveGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{proxyKind: "datacenter"}}); err != nil {
 		t.Fatalf("SaveGroup: %v", err)
 	}
-	running, _ := svc.RunningTasks(ctx, "residential")
+	running, _ := svc.RunningTasks(ctx, proxyKind, "residential")
 	if len(running) != 1 || running[0] != task.ID() {
 		t.Fatalf("residential running = %v, want [%s]", running, task.ID())
 	}
-	if got, _ := svc.RunningTasks(ctx, "datacenter"); len(got) != 0 {
+	if got, _ := svc.RunningTasks(ctx, proxyKind, "datacenter"); len(got) != 0 {
 		t.Fatalf("datacenter running = %v, want none: nothing leases it yet", got)
 	}
 }
@@ -955,9 +1024,9 @@ func TestGroupCreationRefusals(t *testing.T) {
 	}
 }
 
-// TestUsageGuardReadsSuspendedAsIdle verifies the guard a proxy manager
+// TestUsageGuardReadsSuspendedAsIdle verifies the guard a leasing manager
 // consults treats a suspended task as idle, both group-wide and per task. That
-// is the escape hatch a refused proxy deletion points at: a parked task holds
+// is the escape hatch a refused deletion points at: a parked task holds
 // no request in flight, so its pool can be edited without stranding one. The
 // task is still live — IsRunning keeps saying so — it is simply not advancing.
 func TestUsageGuardReadsSuspendedAsIdle(t *testing.T) {
@@ -970,14 +1039,14 @@ func TestUsageGuardReadsSuspendedAsIdle(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"))
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(proxyKind, "residential"))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
 	go task.Start(ctx)
 	<-wf.entered
 
-	if got, _ := svc.RunningTasks(ctx, "residential"); len(got) != 1 || got[0] != task.ID() {
+	if got, _ := svc.RunningTasks(ctx, proxyKind, "residential"); len(got) != 1 || got[0] != task.ID() {
 		t.Fatalf("running = %v, want [%s]", got, task.ID())
 	}
 	if live, _ := svc.TaskIsRunning(ctx, task.ID()); !live {
@@ -991,7 +1060,7 @@ func TestUsageGuardReadsSuspendedAsIdle(t *testing.T) {
 	close(wf.release)
 	waitUntil(t, func() bool { return task.Status() == workflows.StatusSuspended })
 
-	if got, _ := svc.RunningTasks(ctx, "residential"); len(got) != 0 {
+	if got, _ := svc.RunningTasks(ctx, proxyKind, "residential"); len(got) != 0 {
 		t.Fatalf("running while suspended = %v, want none: the pool is free to edit", got)
 	}
 	if live, _ := svc.TaskIsRunning(ctx, task.ID()); live {
@@ -1006,14 +1075,14 @@ func TestUsageGuardReadsSuspendedAsIdle(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 	waitUntil(t, func() bool { return !svc.IsRunning(task.ID()) })
-	if got, _ := svc.RunningTasks(ctx, "residential"); len(got) != 0 {
+	if got, _ := svc.RunningTasks(ctx, proxyKind, "residential"); len(got) != 0 {
 		t.Fatalf("running after completion = %v, want none", got)
 	}
 }
 
 // TestTaskIsRunningUnknownTask verifies an id this service never created — or
-// has already deleted — reads as idle, so a proxy left locked to a task that no
-// longer exists here does not block its own deletion forever.
+// has already deleted — reads as idle, so a resource left locked to a task that
+// no longer exists here does not block its own deletion forever.
 func TestTaskIsRunningUnknownTask(t *testing.T) {
 	svc := NewService(newMemStore(), comms.NewBus())
 	live, err := svc.TaskIsRunning(context.Background(), "never-created")
@@ -1025,10 +1094,11 @@ func TestTaskIsRunningUnknownTask(t *testing.T) {
 	}
 }
 
-// TestWithProxyPinsTaskThroughRecovery verifies a pin is durable placement, not
-// a runtime accident: it lands on the record, reaches the workflow through
-// Deps, and comes back on recovery alongside the group it narrows.
-func TestWithProxyPinsTaskThroughRecovery(t *testing.T) {
+// TestPinIsDurablePlacementThroughRecovery verifies a pin is durable placement,
+// not a runtime accident: it lands on the record, reaches the workflow through
+// Deps, and comes back on recovery alongside the group it narrows. Two kinds are
+// pinned at once, since each is stored under its own key.
+func TestPinIsDurablePlacementThroughRecovery(t *testing.T) {
 	store := newMemStore()
 	svc := NewService(store, comms.NewBus())
 	wf := &depsWorkflow{}
@@ -1037,23 +1107,27 @@ func TestWithProxyPinsTaskThroughRecovery(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"), WithProxy("p2"))
+	task, err := svc.CreateTask(ctx, wf.ID(), nil,
+		WithResourceGroup(proxyKind, "residential"), WithPin(proxyKind, "p2"),
+		WithResourceGroup(accountKind, "shoppers"), WithPin(accountKind, "buyer-1"))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	if task.ProxyGroupID() != "residential" || task.ProxyID() != "p2" {
-		t.Fatalf("placement = %q/%q, want residential/p2", task.ProxyGroupID(), task.ProxyID())
-	}
+	assertPlacement(t, task, proxyKind, "residential", "p2")
+	assertPlacement(t, task, accountKind, "shoppers", "buyer-1")
 
 	record, err := store.RecoverTask(ctx, task.ID())
 	if err != nil {
 		t.Fatalf("RecoverTask record: %v", err)
 	}
-	if record.ProxyID == nil || *record.ProxyID != "p2" {
-		t.Fatalf("record pin = %v, want p2", record.ProxyID)
+	if pin := record.Assignments[proxyKind].ResourceID; pin == nil || *pin != "p2" {
+		t.Fatalf("record proxy pin = %v, want p2", pin)
+	}
+	if pin := record.Assignments[accountKind].ResourceID; pin == nil || *pin != "buyer-1" {
+		t.Fatalf("record account pin = %v, want buyer-1", pin)
 	}
 
-	// The pin survives the trip through the store.
+	// Both pins survive the trip through the store.
 	if err := store.SaveCheckpoint(ctx, task.ID(), "running", "s1", nil); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
@@ -1061,14 +1135,24 @@ func TestWithProxyPinsTaskThroughRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverTask: %v", err)
 	}
-	if recovered.ProxyID() != "p2" || recovered.ProxyGroupID() != "residential" {
-		t.Fatalf("recovered placement = %q/%q, want residential/p2", recovered.ProxyGroupID(), recovered.ProxyID())
+	assertPlacement(t, recovered, proxyKind, "residential", "p2")
+	assertPlacement(t, recovered, accountKind, "shoppers", "buyer-1")
+}
+
+// assertPlacement fails the test unless the task resolves the kind to exactly
+// this group and pin.
+func assertPlacement(t *testing.T, task Task, kind, wantGroup, wantResource string) {
+	t.Helper()
+	groupID, resourceID := task.Assignment(kind)
+	if groupID != wantGroup || resourceID != wantResource {
+		t.Fatalf("%s placement = %q/%q, want %q/%q", kind, groupID, resourceID, wantGroup, wantResource)
 	}
 }
 
-// TestWithoutProxiesClearsThePin verifies a proxyless task carries no pin
-// either, so a group default cannot leave a stray proxy assigned.
-func TestWithoutProxiesClearsThePin(t *testing.T) {
+// TestWithoutClearsThePin verifies opting a kind out clears its pin too, so a
+// group default cannot leave a stray resource assigned — and that it clears only
+// that kind.
+func TestWithoutClearsThePin(t *testing.T) {
 	store := newMemStore()
 	svc := NewService(store, comms.NewBus())
 	wf := &depsWorkflow{}
@@ -1077,60 +1161,73 @@ func TestWithoutProxiesClearsThePin(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxy("p2"), WithoutProxies())
+	task, err := svc.CreateTask(ctx, wf.ID(), nil,
+		WithPin(proxyKind, "p2"), Without(proxyKind),
+		WithResourceGroup(accountKind, "shoppers"), WithPin(accountKind, "buyer-1"))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	if task.ProxyGroupID() != "" || task.ProxyID() != "" {
-		t.Fatalf("placement = %q/%q, want both empty", task.ProxyGroupID(), task.ProxyID())
+	assertPlacement(t, task, proxyKind, "", "")
+	assertPlacement(t, task, accountKind, "shoppers", "buyer-1")
+}
+
+// reassignSpy records what the reassigner was told, one entry per call.
+type reassignSpy struct {
+	calls []reassignCall
+	err   error
+}
+
+type reassignCall struct {
+	taskID, kind, groupID, resourceID string
+}
+
+func (r *reassignSpy) fn() ReassignFunc {
+	return func(ctx context.Context, taskID, kind, groupID, resourceID string) error {
+		r.calls = append(r.calls, reassignCall{taskID, kind, groupID, resourceID})
+		return r.err
 	}
 }
 
-// TestAssignProxyRepointsAndReleasesStaleLock verifies assignment is the
+// TestAssignResourceRepointsAndReleasesStaleLock verifies assignment is the
 // deliberate act that outranks a durable lock: it writes the new placement and
-// hands the releaser the placement as resolved, so the lock the task no longer
-// fits is dropped by the reassignment rather than by a lease.
-func TestAssignProxyRepointsAndReleasesStaleLock(t *testing.T) {
+// hands the releaser the placement as resolved — under the kind it applies to,
+// so each manager can tell whether the call is its own — and the lock the task
+// no longer fits is dropped by the reassignment rather than by a lease.
+func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 	store := newMemStore()
-	var got []string
-	svc := NewService(store, comms.NewBus(),
-		WithTaskReassigner(func(ctx context.Context, taskID, proxyGroupID, proxyID string) error {
-			got = append(got, taskID, proxyGroupID, proxyID)
-			return nil
-		}))
+	spy := &reassignSpy{}
+	svc := NewService(store, comms.NewBus(), WithTaskReassigner(spy.fn()))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
 	}
 	ctx := context.Background()
 
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"))
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(proxyKind, "residential"))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
 
 	group, pin := "datacenter", "p7"
-	if err := svc.AssignProxy(ctx, task.ID(), ProxyAssignment{GroupID: &group, ProxyID: &pin}); err != nil {
-		t.Fatalf("AssignProxy: %v", err)
+	if err := svc.AssignResource(ctx, task.ID(), proxyKind, Assignment{GroupID: &group, ResourceID: &pin}); err != nil {
+		t.Fatalf("AssignResource: %v", err)
 	}
 
 	record, _ := store.RecoverTask(ctx, task.ID())
-	if record.ProxyGroupID == nil || *record.ProxyGroupID != "datacenter" {
-		t.Fatalf("record group = %v, want datacenter", record.ProxyGroupID)
+	if groupID := record.Assignments[proxyKind].GroupID; groupID == nil || *groupID != "datacenter" {
+		t.Fatalf("record group = %v, want datacenter", groupID)
 	}
-	if record.ProxyID == nil || *record.ProxyID != "p7" {
-		t.Fatalf("record pin = %v, want p7", record.ProxyID)
+	if resourceID := record.Assignments[proxyKind].ResourceID; resourceID == nil || *resourceID != "p7" {
+		t.Fatalf("record pin = %v, want p7", resourceID)
 	}
-	want := []string{task.ID(), "datacenter", "p7"}
-	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
-		t.Fatalf("releaser told %v, want %v", got, want)
+	want := reassignCall{task.ID(), proxyKind, "datacenter", "p7"}
+	if len(spy.calls) != 1 || spy.calls[0] != want {
+		t.Fatalf("releaser told %v, want [%v]", spy.calls, want)
 	}
 
 	// The live handle keeps the placement it was wired with; the move lands on
 	// the next recovery.
-	if task.ProxyGroupID() != "residential" {
-		t.Fatalf("live task group = %q, want the wired residential", task.ProxyGroupID())
-	}
+	assertPlacement(t, task, proxyKind, "residential", "")
 	if err := store.SaveCheckpoint(ctx, task.ID(), "running", "s1", nil); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
@@ -1138,72 +1235,115 @@ func TestAssignProxyRepointsAndReleasesStaleLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverTask: %v", err)
 	}
-	if recovered.ProxyGroupID() != "datacenter" || recovered.ProxyID() != "p7" {
-		t.Fatalf("recovered placement = %q/%q, want datacenter/p7", recovered.ProxyGroupID(), recovered.ProxyID())
-	}
+	assertPlacement(t, recovered, proxyKind, "datacenter", "p7")
 }
 
-// TestAssignProxyInheritsGroupForTheReleaser verifies the releaser is told the
-// placement the task will actually lease from, not the nil that was stored: a
-// cleared assignment inherits the task group's, and a lock is stale or not
-// against that resolved group.
-func TestAssignProxyInheritsGroupForTheReleaser(t *testing.T) {
+// TestAssignResourceLeavesOtherKindsAlone verifies repointing one kind is not a
+// rewrite of the whole placement. A task moved to another proxy group must come
+// back on the same account it was halfway through a checkout as.
+func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 	store := newMemStore()
-	var gotGroup string
-	svc := NewService(store, comms.NewBus(),
-		WithTaskReassigner(func(ctx context.Context, taskID, proxyGroupID, proxyID string) error {
-			gotGroup = proxyGroupID
-			return nil
-		}))
+	spy := &reassignSpy{}
+	svc := NewService(store, comms.NewBus(), WithTaskReassigner(spy.fn()))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
 	}
 	ctx := context.Background()
 
-	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ProxyGroupID: "residential"}); err != nil {
+	task, err := svc.CreateTask(ctx, wf.ID(), nil,
+		WithResourceGroup(proxyKind, "residential"),
+		WithResourceGroup(accountKind, "shoppers"), WithPin(accountKind, "buyer-1"))
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	group := "datacenter"
+	if err := svc.AssignResource(ctx, task.ID(), proxyKind, Assignment{GroupID: &group}); err != nil {
+		t.Fatalf("AssignResource: %v", err)
+	}
+
+	if err := store.SaveCheckpoint(ctx, task.ID(), "running", "s1", nil); err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+	recovered, err := svc.RecoverTask(ctx, task.ID())
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	assertPlacement(t, recovered, proxyKind, "datacenter", "")
+	assertPlacement(t, recovered, accountKind, "shoppers", "buyer-1")
+
+	// Only the proxy manager is asked to drop a lock; the account lock stands.
+	want := reassignCall{task.ID(), proxyKind, "datacenter", ""}
+	if len(spy.calls) != 1 || spy.calls[0] != want {
+		t.Fatalf("releaser told %v, want [%v]", spy.calls, want)
+	}
+}
+
+// TestAssignResourceInheritsGroupForTheReleaser verifies the releaser is told
+// the placement the task will actually lease from, not the nil that was stored:
+// a cleared assignment inherits the task group's, and a lock is stale or not
+// against that resolved group.
+func TestAssignResourceInheritsGroupForTheReleaser(t *testing.T) {
+	store := newMemStore()
+	spy := &reassignSpy{}
+	svc := NewService(store, comms.NewBus(), WithTaskReassigner(spy.fn()))
+	wf := &depsWorkflow{}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{proxyKind: "residential"}}); err != nil {
 		t.Fatalf("CreateGroup: %v", err)
 	}
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), WithProxyGroup("datacenter"))
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"), WithResourceGroup(proxyKind, "datacenter"))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
 
 	// Clearing the task's own assignment falls back to the task group's.
-	if err := svc.AssignProxy(ctx, task.ID(), ProxyAssignment{}); err != nil {
-		t.Fatalf("AssignProxy: %v", err)
+	if err := svc.AssignResource(ctx, task.ID(), proxyKind, Assignment{}); err != nil {
+		t.Fatalf("AssignResource: %v", err)
 	}
-	if gotGroup != "residential" {
-		t.Fatalf("releaser told group %q, want the inherited residential", gotGroup)
+	if len(spy.calls) != 1 || spy.calls[0].groupID != "residential" {
+		t.Fatalf("releaser told %v, want the inherited residential", spy.calls)
 	}
 }
 
-// TestPinnedTasksCountsOnlyWhatCanStillRun verifies the warning a proxy
-// deletion carries names exactly the tasks it would strand. A task that
-// finished, and one that ran without ever checkpointing, can never run again —
-// warning about them is noise, not caution.
+// pinnedTo builds a record pinned to resourceID for the kind, the shape a
+// stored placement takes when a task names one resource and inherits its group.
+func pinnedTo(kind, resourceID string) map[string]Assignment {
+	return map[string]Assignment{kind: {ResourceID: &resourceID}}
+}
+
+// TestPinnedTasksCountsOnlyWhatCanStillRun verifies the warning a deletion
+// carries names exactly the tasks it would strand. A task that finished, and
+// one that ran without ever checkpointing, can never run again — warning about
+// them is noise, not caution. A task pinned under another kind is not the
+// deleter's business at all.
 func TestPinnedTasksCountsOnlyWhatCanStillRun(t *testing.T) {
 	store := newMemStore()
 	svc := NewService(store, comms.NewBus())
 	ctx := context.Background()
 
-	pin := "p1"
-	other := "p2"
+	failed := string(workflows.StatusFailed)
 	for _, rec := range []Record{
-		{ID: "resumable", WorkflowID: "wf", Status: string(workflows.StatusFailed), State: "s2", ProxyID: &pin},
-		{ID: "suspended", WorkflowID: "wf", Status: string(workflows.StatusSuspended), State: "s1", ProxyID: &pin},
-		{ID: "finished", WorkflowID: "wf", Status: string(workflows.StatusDone), State: "s3", ProxyID: &pin},
-		{ID: "killed", WorkflowID: "wf", Status: string(workflows.StatusKilled), State: "s1", ProxyID: &pin},
-		{ID: "no-checkpoint", WorkflowID: "wf", Status: string(workflows.StatusNotStarted), ProxyID: &pin},
-		{ID: "elsewhere", WorkflowID: "wf", Status: string(workflows.StatusFailed), State: "s1", ProxyID: &other},
-		{ID: "unpinned", WorkflowID: "wf", Status: string(workflows.StatusFailed), State: "s1"},
+		{ID: "resumable", WorkflowID: "wf", Status: failed, State: "s2", Assignments: pinnedTo(proxyKind, "p1")},
+		{ID: "suspended", WorkflowID: "wf", Status: string(workflows.StatusSuspended), State: "s1", Assignments: pinnedTo(proxyKind, "p1")},
+		{ID: "finished", WorkflowID: "wf", Status: string(workflows.StatusDone), State: "s3", Assignments: pinnedTo(proxyKind, "p1")},
+		{ID: "killed", WorkflowID: "wf", Status: string(workflows.StatusKilled), State: "s1", Assignments: pinnedTo(proxyKind, "p1")},
+		{ID: "no-checkpoint", WorkflowID: "wf", Status: string(workflows.StatusNotStarted), Assignments: pinnedTo(proxyKind, "p1")},
+		{ID: "elsewhere", WorkflowID: "wf", Status: failed, State: "s1", Assignments: pinnedTo(proxyKind, "p2")},
+		{ID: "other-kind", WorkflowID: "wf", Status: failed, State: "s1", Assignments: pinnedTo(accountKind, "p1")},
+		{ID: "unpinned", WorkflowID: "wf", Status: failed, State: "s1"},
 	} {
 		if err := store.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask %s: %v", rec.ID, err)
 		}
 	}
 
-	got, err := svc.PinnedTasks(ctx, "p1")
+	got, err := svc.PinnedTasks(ctx, proxyKind, "p1")
 	if err != nil {
 		t.Fatalf("PinnedTasks: %v", err)
 	}
@@ -1212,7 +1352,12 @@ func TestPinnedTasksCountsOnlyWhatCanStillRun(t *testing.T) {
 		t.Fatalf("PinnedTasks = %v, want %v", got, want)
 	}
 
-	if got, _ := svc.PinnedTasks(ctx, ""); len(got) != 0 {
+	// The account "p1" is a different resource that happens to share a name.
+	if got, _ := svc.PinnedTasks(ctx, accountKind, "p1"); len(got) != 1 || got[0] != "other-kind" {
+		t.Fatalf("account PinnedTasks = %v, want [other-kind]", got)
+	}
+
+	if got, _ := svc.PinnedTasks(ctx, proxyKind, ""); len(got) != 0 {
 		t.Fatalf("PinnedTasks(\"\") = %v, want none: an unpinned task pins nothing", got)
 	}
 }
@@ -1220,7 +1365,7 @@ func TestPinnedTasksCountsOnlyWhatCanStillRun(t *testing.T) {
 // TestPinnedTasksSeesUnstartedLiveTasks verifies a task created here and never
 // started still counts. It has no checkpoint, so the store alone would call it
 // unresumable — but it is sitting in the registry able to start, and deleting
-// its pin would break its very first lease.
+// the resource it pins would break its very first lease.
 func TestPinnedTasksSeesUnstartedLiveTasks(t *testing.T) {
 	store := newMemStore()
 	svc := NewService(store, comms.NewBus())
@@ -1230,12 +1375,12 @@ func TestPinnedTasksSeesUnstartedLiveTasks(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"), WithProxy("p1"))
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(proxyKind, "residential"), WithPin(proxyKind, "p1"))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
 
-	got, err := svc.PinnedTasks(ctx, "p1")
+	got, err := svc.PinnedTasks(ctx, proxyKind, "p1")
 	if err != nil {
 		t.Fatalf("PinnedTasks: %v", err)
 	}
@@ -1255,11 +1400,11 @@ func TestPinnedTasksWithoutRepository(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithProxyGroup("residential"), WithProxy("p1"))
+	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(proxyKind, "residential"), WithPin(proxyKind, "p1"))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	got, err := svc.PinnedTasks(ctx, "p1")
+	got, err := svc.PinnedTasks(ctx, proxyKind, "p1")
 	if err != nil {
 		t.Fatalf("PinnedTasks: %v", err)
 	}

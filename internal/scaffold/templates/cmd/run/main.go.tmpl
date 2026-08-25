@@ -47,18 +47,20 @@ func main() {
 {{- end}}
 
 	// The task service answers "is this proxy in use?", so the guard that keeps
-	// a live proxy or group from being deleted resolves svc at call time.
+	// a live proxy or group from being deleted resolves svc at call time. Every
+	// question is asked under this manager's kind, so a second resource kind
+	// added later answers for itself.
 	var svc tasks.Service
 	manager, err := proxies.NewManager(ctx, proxyRepo, nil,
 		proxies.WithUsagePolicy(proxies.Usage{
 			RunningInGroup: func(ctx context.Context, groupID string) ([]string, error) {
-				return svc.RunningTasks(ctx, groupID)
+				return svc.RunningTasks(ctx, "proxy", groupID)
 			},
 			TaskRunning: func(ctx context.Context, taskID string) (bool, error) {
 				return svc.TaskIsRunning(ctx, taskID)
 			},
 			PinnedToProxy: func(ctx context.Context, proxyID string) ([]string, error) {
-				return svc.PinnedTasks(ctx, proxyID)
+				return svc.PinnedTasks(ctx, "proxy", proxyID)
 			},
 		}))
 	if err != nil {
@@ -84,8 +86,11 @@ func main() {
 	// repointed task's new placement no longer fits. Nothing else ever clears them.
 	svc = tasks.NewService({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
 		tasks.WithTaskReleaser(manager.Unlock),
-		tasks.WithTaskReassigner(func(ctx context.Context, taskID, proxyGroupID, proxyID string) error {
-			return manager.ReleaseStaleLock(ctx, proxies.Assignment{TaskID: taskID, GroupID: proxyGroupID, ProxyID: proxyID})
+		tasks.WithTaskReassigner(func(ctx context.Context, taskID, kind, groupID, resourceID string) error {
+			if kind != "proxy" {
+				return nil
+			}
+			return manager.ReleaseStaleLock(ctx, proxies.Assignment{TaskID: taskID, GroupID: groupID, ProxyID: resourceID})
 		}))
 
 	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New(manager)); err != nil {
@@ -99,7 +104,7 @@ func main() {
 	}
 {{- end}}
 
-	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://example.com"}{{if .Proxy}}, tasks.WithProxyGroup(proxies.GlobalGroup){{end}})
+	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://example.com"}{{if .Proxy}}, tasks.WithResourceGroup("proxy", proxies.GlobalGroup){{end}})
 	if err != nil {
 		log.Fatal(err)
 	}
