@@ -50,10 +50,6 @@ func ensureSchema(db *sql.DB) error {
 // migrations is the ordered schema history of the tasks store. Append new steps
 // to the end; never edit or reorder shipped ones, since PRAGMA user_version pins
 // how many have already run on existing databases.
-//
-// The proxy_group_id and proxy_id columns are dead once the assignments backfill
-// runs, but stay: dropping a column already shipped in someone's database buys
-// nothing worth the risk.
 var migrations = []sqlitemigrate.Migration{
 	{
 		Name: "create tasks table",
@@ -74,10 +70,6 @@ var migrations = []sqlitemigrate.Migration{
 		SQL:  `ALTER TABLE tasks ADD COLUMN group_id TEXT NOT NULL DEFAULT 'global'`,
 	},
 	{
-		Name: "add nullable proxy_group_id column for per-task assignments",
-		SQL:  `ALTER TABLE tasks ADD COLUMN proxy_group_id TEXT`,
-	},
-	{
 		Name: "add created_at column to tasks",
 		SQL:  `ALTER TABLE tasks ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
 	},
@@ -86,16 +78,11 @@ var migrations = []sqlitemigrate.Migration{
 		SQL:  `ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
 	},
 	{
-		Name: "add nullable proxy_id column pinning a task to one proxy",
-		SQL:  `ALTER TABLE tasks ADD COLUMN proxy_id TEXT`,
-	},
-	{
 		Name: "create task_groups table",
 		SQL: `CREATE TABLE IF NOT EXISTS task_groups (
-			id             TEXT PRIMARY KEY,
-			proxy_group_id TEXT NOT NULL DEFAULT '',
-			created_at     TEXT NOT NULL DEFAULT '',
-			updated_at     TEXT NOT NULL DEFAULT ''
+			id         TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
 	},
 	{
@@ -103,23 +90,8 @@ var migrations = []sqlitemigrate.Migration{
 		SQL:  `ALTER TABLE tasks ADD COLUMN assignments TEXT NOT NULL DEFAULT ''`,
 	},
 	{
-		// SQL NULL survives as JSON null and reads back as a nil *string, which is
-		// what keeps the tri-state: inherit, explicitly none, or explicitly named.
-		Name: "backfill task assignments from the proxy columns",
-		SQL: `UPDATE tasks
-			SET assignments = json_object('proxy',
-				json_object('groupId', proxy_group_id, 'resourceId', proxy_id))
-			WHERE proxy_group_id IS NOT NULL OR proxy_id IS NOT NULL`,
-	},
-	{
 		Name: "add resource_groups column generalizing task group assignment",
 		SQL:  `ALTER TABLE task_groups ADD COLUMN resource_groups TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "backfill task group resource groups from the proxy column",
-		SQL: `UPDATE task_groups
-			SET resource_groups = json_object('proxy', proxy_group_id)
-			WHERE proxy_group_id != ''`,
 	},
 }
 
@@ -356,8 +328,7 @@ func (s *SQLite) TasksInGroup(ctx context.Context, groupID string) ([]string, er
 // a rule this store does not own.
 //
 // The NULLIF is load-bearing: json_extract rejects the empty string as
-// malformed, and a row that predates the assignments column and had no proxy
-// placement to backfill still carries the column default.
+// malformed, and a task placed nowhere stores the column default.
 func (s *SQLite) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]tasks.Record, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
