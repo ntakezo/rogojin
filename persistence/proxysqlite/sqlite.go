@@ -38,12 +38,12 @@ func NewSQLite(dsn string) (*SQLite, error) {
 // ensureSchema brings the database up to the latest schema version, applying any
 // migrations it has not yet seen.
 func ensureSchema(db *sql.DB) error {
-	return sqlitemigrate.Run(db, migrations)
+	return sqlitemigrate.Run(db, "proxies", migrations)
 }
 
 // migrations is the ordered schema history of the proxies store. Append new steps
-// to the end; never edit or reorder shipped ones, since PRAGMA user_version pins
-// how many have already run on existing databases.
+// to the end; never edit or reorder shipped ones: the ledger records which of
+// them have already run on existing databases by position.
 var migrations = []sqlitemigrate.Migration{
 	{
 		Name: "create proxies table",

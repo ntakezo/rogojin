@@ -31,9 +31,10 @@ Built-in modules cover the unglamorous parts of site automation:
 - **Durability** — every transition checkpointed; suspend, resume, kill, and recover at state boundaries.
 - **Proxies** — per-task leasing with round-robin or Thompson-sampling selection, per-proxy and per-group holder caps, and sticky locks that outlive the process.
 - **Accounts** — the same leasing, groups, holder caps, and sticky locks for site logins. What an account *is* belongs to the workflow: its fields travel as JSON, so a new workflow needs no schema change.
-- **Groups** — named sets of proxies, of accounts, and of tasks. A task carries one assignment per resource kind and inherits its task group's for any kind it names none of, so a pool is assigned once and every member follows; each proxy group rotates through its own selection strategy.
+- **Cards** — the same leasing again, for the payment instruments a checkout settles against: one holder at a time by default, so no two tasks charge the same card at once, and a sticky lock so a resumed checkout comes back to the instrument it started on. Card data travels as JSON the library never reads; encrypting it at rest is the store's job.
+- **Groups** — named sets of proxies, of accounts, of cards, and of tasks. A task carries one assignment per resource kind and inherits its task group's for any kind it names none of, so a pool is assigned once and every member follows; each proxy group rotates through its own selection strategy.
 - **Comms** — typed pub/sub bus for inter-task coordination.
-- **Persistence** — a small byte-store interface; SQLite adapters ship in the box, swap in anything else.
+- **Persistence** — a small byte-store interface; SQLite adapters ship in the box, swap in anything else. Each adapter records its migrations under its own name, so they can share one database file or take one each.
 
 ## Getting Started
 
@@ -67,7 +68,7 @@ cd _examples && go run ./workflows/example
 
 ### Learn the API
 
-The [API reference](https://pkg.go.dev/github.com/ntakezo/rogojin) documents each package: `workflows` (the programming model), `tasks` (the runtime), `comms`, `proxies`, `accounts`, and `persistence`. `proxies` and `accounts` are both thin layers over `leasing`, which owns the pooling, grouping, and locking they share — build a third resource kind on it the same way.
+The [API reference](https://pkg.go.dev/github.com/ntakezo/rogojin) documents each package: `workflows` (the programming model), `tasks` (the runtime), `comms`, `proxies`, `accounts`, `cards`, and `persistence`. `proxies`, `accounts`, and `cards` are all thin layers over `leasing`, which owns the pooling, grouping, and locking they share — build a fourth resource kind on it the same way.
 
 ## Contributing
 

@@ -1,23 +1,24 @@
-package accountsqlite
+package cardsqlite
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/ntakezo/rogojin/accounts"
+	"github.com/ntakezo/rogojin/cards"
+	"github.com/ntakezo/rogojin/persistence/accountsqlite"
 )
 
 // satisfiesRepositoryPort fails to compile if SQLite drifts from the persistence port it exists to implement.
-var _ accounts.Repository = (*SQLite)(nil)
+var _ cards.Repository = (*SQLite)(nil)
 
 // newTestRepo opens a SQLite repository backed by a fresh temp-file database.
 func newTestRepo(t *testing.T) *SQLite {
 	t.Helper()
-	dsn := filepath.Join(t.TempDir(), "accounts.db")
+	dsn := filepath.Join(t.TempDir(), "cards.db")
 	repo, err := NewSQLite(dsn)
 	if err != nil {
 		t.Fatalf("NewSQLite: %v", err)
@@ -37,23 +38,24 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 
 // TestSaveListRoundTrip verifies every field — the lock owner, the stats, and
 // the workflow's own JSON — survives storage, because lock reclamation and
-// login both read them back verbatim.
+// payment both read them back verbatim.
 func TestSaveListRoundTrip(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	locked := accounts.Account{
-		ID:      "a1",
-		GroupID: "site",
+	locked := cards.Card{
+		ID:      "c1",
+		GroupID: "bin",
 		OwnerID: "t1",
 		Fields: mustJSON(t, map[string]string{
-			"email":    "buyer@example.com",
-			"password": "hunter2",
+			"number": "4111111111111111",
+			"expiry": "12/29",
+			"cvv":    "737",
 		}),
 		Successes: 3,
 		Failures:  2,
 	}
-	free := accounts.Account{ID: "a2", GroupID: "site", MaxHolders: 2}
+	free := cards.Card{ID: "c2", GroupID: "bin", MaxHolders: 2}
 	if err := repo.Save(ctx, locked); err != nil {
 		t.Fatalf("save locked: %v", err)
 	}
@@ -66,78 +68,85 @@ func TestSaveListRoundTrip(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	if len(listed) != 2 {
-		t.Fatalf("got %d accounts, want 2", len(listed))
+		t.Fatalf("got %d cards, want 2", len(listed))
 	}
-	if listed[0].ID != "a1" || listed[1].ID != "a2" {
-		t.Fatalf("order = %s, %s; want a1, a2", listed[0].ID, listed[1].ID)
+	if listed[0].ID != "c1" || listed[1].ID != "c2" {
+		t.Fatalf("order = %s, %s; want c1, c2", listed[0].ID, listed[1].ID)
 	}
-	if got := listed[0]; got.OwnerID != "t1" || got.Successes != 3 || got.Failures != 2 || got.GroupID != "site" {
-		t.Fatalf("a1 round-trip: got %+v", got)
+	if got := listed[0]; got.OwnerID != "t1" || got.Successes != 3 || got.Failures != 2 || got.GroupID != "bin" {
+		t.Fatalf("c1 round-trip: got %+v", got)
 	}
 	if string(listed[0].Fields) != string(locked.Fields) {
 		t.Fatalf("fields = %s, want %s", listed[0].Fields, locked.Fields)
 	}
 	if listed[1].MaxHolders != 2 {
-		t.Fatalf("a2 max holders = %d, want 2", listed[1].MaxHolders)
+		t.Fatalf("c2 max holders = %d, want 2", listed[1].MaxHolders)
 	}
 	if listed[1].Fields != nil {
-		t.Fatalf("a2 fields = %s, want none", listed[1].Fields)
+		t.Fatalf("c2 fields = %s, want none", listed[1].Fields)
 	}
 }
 
-// TestFieldsAreOpaqueToTheSchema verifies the point of the JSON column: two
-// workflows with unrelated account shapes share one table and one migration
-// history.
+// TestFieldsAreOpaqueToTheSchema verifies the point of the JSON column: a raw
+// PAN, a gateway token, and a wrapped ciphertext are all just text here, so a
+// store that encrypts and one that does not share the same table and the same
+// migration history.
 func TestFieldsAreOpaqueToTheSchema(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	type checkout struct {
-		Email string `json:"email"`
-		Card  string `json:"card"`
+	type raw struct {
+		Number string `json:"number"`
+		Expiry string `json:"expiry"`
+		CVV    string `json:"cvv"`
 	}
-	type forum struct {
-		Handle string   `json:"handle"`
-		Token  string   `json:"token"`
-		Boards []string `json:"boards"`
+	type tokenized struct {
+		Token   string            `json:"token"`
+		Gateway string            `json:"gateway"`
+		Billing map[string]string `json:"billing"`
 	}
-	wantCheckout := checkout{Email: "buyer@example.com", Card: "4111"}
-	wantForum := forum{Handle: "ada", Token: "t0k", Boards: []string{"a", "b"}}
+	wantRaw := raw{Number: "4111111111111111", Expiry: "12/29", CVV: "737"}
+	wantTokenized := tokenized{
+		Token:   "tok_abc",
+		Gateway: "acquirer",
+		Billing: map[string]string{"zip": "10001", "country": "US"},
+	}
 
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", Fields: mustJSON(t, wantCheckout)}); err != nil {
-		t.Fatalf("save checkout account: %v", err)
+	if err := repo.Save(ctx, cards.Card{ID: "c1", Fields: mustJSON(t, wantRaw)}); err != nil {
+		t.Fatalf("save raw card: %v", err)
 	}
-	if err := repo.Save(ctx, accounts.Account{ID: "a2", Fields: mustJSON(t, wantForum)}); err != nil {
-		t.Fatalf("save forum account: %v", err)
+	if err := repo.Save(ctx, cards.Card{ID: "c2", Fields: mustJSON(t, wantTokenized)}); err != nil {
+		t.Fatalf("save tokenized card: %v", err)
 	}
 
 	listed, err := repo.List(ctx)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	gotCheckout, err := accounts.Bind[checkout](listed[0])
+	gotRaw, err := cards.Bind[raw](listed[0])
 	if err != nil {
-		t.Fatalf("bind checkout: %v", err)
+		t.Fatalf("bind raw: %v", err)
 	}
-	if gotCheckout != wantCheckout {
-		t.Fatalf("checkout = %+v, want %+v", gotCheckout, wantCheckout)
+	if gotRaw != wantRaw {
+		t.Fatalf("raw = %+v, want %+v", gotRaw, wantRaw)
 	}
-	gotForum, err := accounts.Bind[forum](listed[1])
+	gotTokenized, err := cards.Bind[tokenized](listed[1])
 	if err != nil {
-		t.Fatalf("bind forum: %v", err)
+		t.Fatalf("bind tokenized: %v", err)
 	}
-	if gotForum.Handle != wantForum.Handle || gotForum.Token != wantForum.Token || len(gotForum.Boards) != 2 {
-		t.Fatalf("forum = %+v, want %+v", gotForum, wantForum)
+	if gotTokenized.Token != wantTokenized.Token || gotTokenized.Billing["zip"] != "10001" {
+		t.Fatalf("tokenized = %+v, want %+v", gotTokenized, wantTokenized)
 	}
 }
 
 // TestSaveRejectsFieldsThatAreNotJSON verifies a bad payload is refused at the
-// write, not discovered as a decode failure inside a later run.
+// write, not discovered as a decode failure inside a later run — which for a
+// card is at the last state before payment.
 func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", Fields: json.RawMessage("not json")}); err == nil {
+	if err := repo.Save(ctx, cards.Card{ID: "c1", Fields: json.RawMessage("not json")}); err == nil {
 		t.Fatal("expected invalid JSON fields to be refused")
 	}
 	listed, err := repo.List(ctx)
@@ -145,23 +154,23 @@ func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	if len(listed) != 0 {
-		t.Fatalf("refused save still stored %d accounts", len(listed))
+		t.Fatalf("refused save still stored %d cards", len(listed))
 	}
 }
 
 // TestSavePreservesCreatedAt verifies a lock, an unlock, or a stat update does
-// not get to revise when the account was added.
+// not get to revise when the card was added.
 func TestSavePreservesCreatedAt(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", CreatedAt: created, UpdatedAt: created}); err != nil {
+	if err := repo.Save(ctx, cards.Card{ID: "c1", CreatedAt: created, UpdatedAt: created}); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 
 	updated := time.Now().UTC().Truncate(time.Millisecond)
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}); err != nil {
+	if err := repo.Save(ctx, cards.Card{ID: "c1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
 
@@ -183,13 +192,13 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, accounts.Account{ID: "a1"}); err != nil {
+	if err := repo.Save(ctx, cards.Card{ID: "c1"}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if err := repo.Delete(ctx, "a1"); err != nil {
+	if err := repo.Delete(ctx, "c1"); err != nil {
 		t.Fatalf("first delete: %v", err)
 	}
-	if err := repo.Delete(ctx, "a1"); err != nil {
+	if err := repo.Delete(ctx, "c1"); err != nil {
 		t.Fatalf("second delete: %v", err)
 	}
 	listed, err := repo.List(ctx)
@@ -197,7 +206,7 @@ func TestDeleteIsIdempotent(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	if len(listed) != 0 {
-		t.Fatalf("got %d accounts, want none", len(listed))
+		t.Fatalf("got %d cards, want none", len(listed))
 	}
 }
 
@@ -209,7 +218,7 @@ func TestGroupRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	created := time.Now().UTC().Truncate(time.Millisecond)
-	want := accounts.Group{ID: "site", MaxHolders: 2, CreatedAt: created, UpdatedAt: created}
+	want := cards.Group{ID: "bin", MaxHolders: 2, CreatedAt: created, UpdatedAt: created}
 	if err := repo.SaveGroup(ctx, want); err != nil {
 		t.Fatalf("save group: %v", err)
 	}
@@ -225,7 +234,7 @@ func TestGroupRoundTrip(t *testing.T) {
 		t.Fatalf("group round-trip: got %+v, want %+v", listed[0], want)
 	}
 
-	if err := repo.DeleteGroup(ctx, "site"); err != nil {
+	if err := repo.DeleteGroup(ctx, "bin"); err != nil {
 		t.Fatalf("delete group: %v", err)
 	}
 	if listed, err = repo.ListGroups(ctx); err != nil || len(listed) != 0 {
@@ -233,64 +242,59 @@ func TestGroupRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAdoptsAPreLedgerDatabase verifies the upgrade path for a database written
-// before migrations were recorded in a ledger, when progress lived in the
-// file-header counter. Its rows must survive and its schema must not be
-// re-migrated, since the store is opened by the same code on every start.
-func TestAdoptsAPreLedgerDatabase(t *testing.T) {
-	dsn := filepath.Join(t.TempDir(), "accounts.db")
+// TestCardsAndAccountsShareOneFile verifies two stores can be pointed at one
+// database file. Each records its migrations under its own name, so neither
+// reads the other's progress as its own — which under the per-file counter left
+// the second store with no tables at all.
+func TestCardsAndAccountsShareOneFile(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "rogojin.db")
 	ctx := context.Background()
 
-	// Hand-build what the old code left behind: both tables, the counter at 2,
-	// and no ledger.
-	raw, err := sql.Open("sqlite3", dsn)
+	accountStore, err := accountsqlite.NewSQLite(dsn)
 	if err != nil {
-		t.Fatalf("open raw: %v", err)
+		t.Fatalf("open accounts: %v", err)
 	}
-	for _, m := range migrations {
-		if _, err := raw.Exec(m.SQL); err != nil {
-			t.Fatalf("seed %s: %v", m.Name, err)
-		}
+	defer accountStore.Close()
+	cardStore, err := NewSQLite(dsn)
+	if err != nil {
+		t.Fatalf("open cards on the same file: %v", err)
 	}
-	if _, err := raw.Exec(`INSERT INTO accounts (id, group_id) VALUES ('a1', 'site')`); err != nil {
-		t.Fatalf("seed row: %v", err)
+	defer cardStore.Close()
+
+	if err := accountStore.Save(ctx, accounts.Account{ID: "a1", GroupID: "site"}); err != nil {
+		t.Fatalf("save account: %v", err)
 	}
-	if _, err := raw.Exec(`PRAGMA user_version = 2`); err != nil {
-		t.Fatalf("seed counter: %v", err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("close raw: %v", err)
+	if err := cardStore.Save(ctx, cards.Card{ID: "c1", GroupID: "bin"}); err != nil {
+		t.Fatalf("save card: %v", err)
 	}
 
-	repo, err := NewSQLite(dsn)
+	listedAccounts, err := accountStore.List(ctx)
 	if err != nil {
-		t.Fatalf("open a pre-ledger database: %v", err)
+		t.Fatalf("list accounts: %v", err)
 	}
-	defer repo.Close()
-
-	listed, err := repo.List(ctx)
+	if len(listedAccounts) != 1 || listedAccounts[0].ID != "a1" {
+		t.Fatalf("accounts = %+v, want the stored account", listedAccounts)
+	}
+	listedCards, err := cardStore.List(ctx)
 	if err != nil {
-		t.Fatalf("list: %v", err)
+		t.Fatalf("list cards: %v", err)
 	}
-	if len(listed) != 1 || listed[0].ID != "a1" {
-		t.Fatalf("got %+v, want the row the old database held", listed)
-	}
-	if err := repo.Save(ctx, accounts.Account{ID: "a2"}); err != nil {
-		t.Fatalf("save after adoption: %v", err)
+	if len(listedCards) != 1 || listedCards[0].ID != "c1" {
+		t.Fatalf("cards = %+v, want the stored card", listedCards)
 	}
 }
 
 // TestSchemaReopensCleanly verifies the migration counter holds: a second open
 // of the same file applies nothing and loses nothing.
 func TestSchemaReopensCleanly(t *testing.T) {
-	dsn := filepath.Join(t.TempDir(), "accounts.db")
+	dsn := filepath.Join(t.TempDir(), "cards.db")
 	ctx := context.Background()
 
 	first, err := NewSQLite(dsn)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := first.Save(ctx, accounts.Account{ID: "a1", Fields: mustJSON(t, map[string]string{"email": "a@b.c"})}); err != nil {
+	if err := first.Save(ctx, cards.Card{ID: "c1", Fields: mustJSON(t, map[string]string{"number": "4111111111111111"})}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := first.Close(); err != nil {
@@ -307,7 +311,7 @@ func TestSchemaReopensCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list after reopen: %v", err)
 	}
-	if len(listed) != 1 || listed[0].ID != "a1" {
-		t.Fatalf("got %+v, want the stored account", listed)
+	if len(listed) != 1 || listed[0].ID != "c1" {
+		t.Fatalf("got %+v, want the stored card", listed)
 	}
 }
