@@ -6,6 +6,7 @@ package tasksqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -49,6 +50,10 @@ func ensureSchema(db *sql.DB) error {
 // migrations is the ordered schema history of the tasks store. Append new steps
 // to the end; never edit or reorder shipped ones, since PRAGMA user_version pins
 // how many have already run on existing databases.
+//
+// The proxy_group_id and proxy_id columns are dead once the assignments backfill
+// runs, but stay: dropping a column already shipped in someone's database buys
+// nothing worth the risk.
 var migrations = []sqlitemigrate.Migration{
 	{
 		Name: "create tasks table",
@@ -93,6 +98,29 @@ var migrations = []sqlitemigrate.Migration{
 			updated_at     TEXT NOT NULL DEFAULT ''
 		)`,
 	},
+	{
+		Name: "add assignments column generalizing placement to any resource kind",
+		SQL:  `ALTER TABLE tasks ADD COLUMN assignments TEXT NOT NULL DEFAULT ''`,
+	},
+	{
+		// SQL NULL survives as JSON null and reads back as a nil *string, which is
+		// what keeps the tri-state: inherit, explicitly none, or explicitly named.
+		Name: "backfill task assignments from the proxy columns",
+		SQL: `UPDATE tasks
+			SET assignments = json_object('proxy',
+				json_object('groupId', proxy_group_id, 'resourceId', proxy_id))
+			WHERE proxy_group_id IS NOT NULL OR proxy_id IS NOT NULL`,
+	},
+	{
+		Name: "add resource_groups column generalizing task group assignment",
+		SQL:  `ALTER TABLE task_groups ADD COLUMN resource_groups TEXT NOT NULL DEFAULT ''`,
+	},
+	{
+		Name: "backfill task group resource groups from the proxy column",
+		SQL: `UPDATE task_groups
+			SET resource_groups = json_object('proxy', proxy_group_id)
+			WHERE proxy_group_id != ''`,
+	},
 }
 
 // Close closes the underlying database.
@@ -103,12 +131,14 @@ func (s *SQLite) Close() error {
 // CreateTask inserts a fresh task row from its record: workflow, placement,
 // and timestamps, with no checkpoint yet.
 func (s *SQLite) CreateTask(ctx context.Context, rec tasks.Record) error {
-	proxyGroup := nullable(rec.ProxyGroupID)
-	proxy := nullable(rec.ProxyID)
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO tasks (id, workflow_id, group_id, proxy_group_id, proxy_id, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		rec.ID, rec.WorkflowID, rec.GroupID, proxyGroup, proxy, formatTime(rec.CreatedAt), formatTime(rec.UpdatedAt))
+	assignments, err := encodeAssignments(rec.Assignments)
+	if err != nil {
+		return fmt.Errorf("create task %s: %w", rec.ID, err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO tasks (id, workflow_id, group_id, assignments, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		rec.ID, rec.WorkflowID, rec.GroupID, assignments, formatTime(rec.CreatedAt), formatTime(rec.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("create task %s: %w", rec.ID, err)
 	}
@@ -129,32 +159,32 @@ func (s *SQLite) SaveCheckpoint(ctx context.Context, id, status, state string, s
 	return errRowMissing("save checkpoint", id, res)
 }
 
-// SaveAssignment repoints a task's proxy placement, leaving the rest of the
-// record untouched. A nil field stores NULL: no group assignment of its own, or
-// no pin.
-func (s *SQLite) SaveAssignment(ctx context.Context, id string, proxyGroupID, proxyID *string) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE tasks SET proxy_group_id = ?, proxy_id = ?, updated_at = ? WHERE id = ?`,
-		nullable(proxyGroupID), nullable(proxyID), formatTime(time.Now().UTC()), id)
+// SaveAssignment repoints a task's placement for one kind, leaving every other
+// kind and the rest of the record untouched. A nil field stores JSON null: no
+// group assignment of its own, or no pin. json_set edits the stored object in
+// place, so one kind is rewritten without reading the others back first.
+func (s *SQLite) SaveAssignment(ctx context.Context, id string, kind string, a tasks.Assignment) error {
+	encoded, err := json.Marshal(a)
 	if err != nil {
-		return fmt.Errorf("assign proxy placement of task %s: %w", id, err)
+		return fmt.Errorf("assign %s placement of task %s: %w", kind, id, err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks
+		 SET assignments = json_set(COALESCE(NULLIF(assignments, ''), '{}'), '$.' || ?, json(?)),
+		     updated_at = ?
+		 WHERE id = ?`,
+		kind, string(encoded), formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("assign %s placement of task %s: %w", kind, id, err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("assign proxy placement of task %s: %w", id, err)
+		return fmt.Errorf("assign %s placement of task %s: %w", kind, id, err)
 	}
 	if affected == 0 {
-		return fmt.Errorf("assign proxy placement: task %s does not exist", id)
+		return fmt.Errorf("assign %s placement: task %s does not exist", kind, id)
 	}
 	return nil
-}
-
-// nullable renders an optional assignment as a SQL value: NULL when unset.
-func nullable(v *string) sql.NullString {
-	if v == nil {
-		return sql.NullString{}
-	}
-	return sql.NullString{String: *v, Valid: true}
 }
 
 // MarkTerminal stamps the terminal outcome and the run's output, refreshing
@@ -187,7 +217,7 @@ func errRowMissing(op, id string, res sql.Result) error {
 // RecoverTask returns the record for id, or ErrNotFound if none exists.
 func (s *SQLite) RecoverTask(ctx context.Context, id string) (tasks.Record, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, workflow_id, group_id, proxy_group_id, proxy_id, state, status, snapshot, output, created_at, updated_at
+		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
 		 FROM tasks WHERE id = ?`, id)
 	rec, err := scanRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -202,7 +232,7 @@ func (s *SQLite) RecoverTask(ctx context.Context, id string) (tasks.Record, erro
 // RecoverAll returns every persisted record, terminal ones included.
 func (s *SQLite) RecoverAll(ctx context.Context) ([]tasks.Record, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, workflow_id, group_id, proxy_group_id, proxy_id, state, status, snapshot, output, created_at, updated_at
+		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
 		 FROM tasks`)
 	if err != nil {
 		return nil, fmt.Errorf("recover all: %w", err)
@@ -236,12 +266,16 @@ func (s *SQLite) DeleteTask(ctx context.Context, id string) error {
 // and never overwritten: when a group was created is not something a later
 // save gets to revise.
 func (s *SQLite) SaveGroup(ctx context.Context, g tasks.Group) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO task_groups (id, proxy_group_id, created_at, updated_at)
+	resourceGroups, err := encodeResourceGroups(g.ResourceGroups)
+	if err != nil {
+		return fmt.Errorf("save task group %s: %w", g.ID, err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO task_groups (id, resource_groups, created_at, updated_at)
 		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET proxy_group_id = excluded.proxy_group_id,
+		 ON CONFLICT(id) DO UPDATE SET resource_groups = excluded.resource_groups,
 		 updated_at = excluded.updated_at`,
-		g.ID, g.ProxyGroupID, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
+		g.ID, resourceGroups, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save task group %s: %w", g.ID, err)
 	}
@@ -251,7 +285,7 @@ func (s *SQLite) SaveGroup(ctx context.Context, g tasks.Group) error {
 // GetGroup returns the group and whether a record exists for the id.
 func (s *SQLite) GetGroup(ctx context.Context, id string) (tasks.Group, bool, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, proxy_group_id, created_at, updated_at FROM task_groups WHERE id = ?`, id)
+		`SELECT id, resource_groups, created_at, updated_at FROM task_groups WHERE id = ?`, id)
 	g, err := scanGroup(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return tasks.Group{}, false, nil
@@ -265,7 +299,7 @@ func (s *SQLite) GetGroup(ctx context.Context, id string) (tasks.Group, bool, er
 // ListGroups returns every stored task group in stable id order.
 func (s *SQLite) ListGroups(ctx context.Context) ([]tasks.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, proxy_group_id, created_at, updated_at FROM task_groups ORDER BY id`)
+		`SELECT id, resource_groups, created_at, updated_at FROM task_groups ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list task groups: %w", err)
 	}
@@ -317,15 +351,21 @@ func (s *SQLite) TasksInGroup(ctx context.Context, groupID string) ([]string, er
 	return ids, nil
 }
 
-// TasksPinnedTo returns every task record pinned to proxyID. It reads whole
-// records because the caller decides which of them could still run, a rule this
-// store does not own.
-func (s *SQLite) TasksPinnedTo(ctx context.Context, proxyID string) ([]tasks.Record, error) {
+// TasksPinnedTo returns every task record pinned to resourceID for the kind. It
+// reads whole records because the caller decides which of them could still run,
+// a rule this store does not own.
+//
+// The NULLIF is load-bearing: json_extract rejects the empty string as
+// malformed, and a row that predates the assignments column and had no proxy
+// placement to backfill still carries the column default.
+func (s *SQLite) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]tasks.Record, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, workflow_id, group_id, proxy_group_id, proxy_id, state, status, snapshot, output, created_at, updated_at
-		 FROM tasks WHERE proxy_id = ? ORDER BY id`, proxyID)
+		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
+		 FROM tasks
+		 WHERE json_extract(NULLIF(assignments, ''), '$.' || ? || '.resourceId') = ?
+		 ORDER BY id`, kind, resourceID)
 	if err != nil {
-		return nil, fmt.Errorf("list tasks pinned to proxy %s: %w", proxyID, err)
+		return nil, fmt.Errorf("list tasks pinned to %s %s: %w", kind, resourceID, err)
 	}
 	defer rows.Close()
 
@@ -333,7 +373,7 @@ func (s *SQLite) TasksPinnedTo(ctx context.Context, proxyID string) ([]tasks.Rec
 	for rows.Next() {
 		record, err := scanRecord(rows)
 		if err != nil {
-			return nil, fmt.Errorf("list tasks pinned to proxy %s: %w", proxyID, err)
+			return nil, fmt.Errorf("list tasks pinned to %s %s: %w", kind, resourceID, err)
 		}
 		records = append(records, record)
 	}
@@ -348,18 +388,14 @@ type scanner interface {
 // scanRecord reads one row into a tasks.Record.
 func scanRecord(row scanner) (tasks.Record, error) {
 	var rec tasks.Record
-	var proxyGroup, proxy sql.NullString
-	var created, updated string
-	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &proxyGroup, &proxy, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated); err != nil {
+	var assignments, created, updated string
+	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &assignments, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated); err != nil {
 		return tasks.Record{}, err
 	}
-	if proxyGroup.Valid {
-		rec.ProxyGroupID = &proxyGroup.String
-	}
-	if proxy.Valid {
-		rec.ProxyID = &proxy.String
-	}
 	var err error
+	if rec.Assignments, err = decodeAssignments(assignments); err != nil {
+		return tasks.Record{}, err
+	}
 	if rec.CreatedAt, err = parseTime(created); err != nil {
 		return tasks.Record{}, err
 	}
@@ -372,16 +408,72 @@ func scanRecord(row scanner) (tasks.Record, error) {
 // scanGroup reads one row into a tasks.Group.
 func scanGroup(row scanner) (tasks.Group, error) {
 	var g tasks.Group
-	var created, updated string
-	if err := row.Scan(&g.ID, &g.ProxyGroupID, &created, &updated); err != nil {
+	var resourceGroups, created, updated string
+	if err := row.Scan(&g.ID, &resourceGroups, &created, &updated); err != nil {
 		return tasks.Group{}, err
 	}
 	var err error
+	if g.ResourceGroups, err = decodeResourceGroups(resourceGroups); err != nil {
+		return tasks.Group{}, err
+	}
 	if g.CreatedAt, err = parseTime(created); err != nil {
 		return tasks.Group{}, err
 	}
 	if g.UpdatedAt, err = parseTime(updated); err != nil {
 		return tasks.Group{}, err
+	}
+	return g, nil
+}
+
+// encodeAssignments renders a record's per-kind placement for its column. An
+// empty map stores as the column default, so a task placed nowhere reads back
+// alike whether it was written here or predates the column.
+func encodeAssignments(a map[string]tasks.Assignment) (string, error) {
+	if len(a) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(a)
+	if err != nil {
+		return "", fmt.Errorf("encode assignments: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// decodeAssignments is the inverse of encodeAssignments. A JSON null field
+// decodes to a nil *string, which is what carries "inherit" back out of the
+// store intact.
+func decodeAssignments(raw string) (map[string]tasks.Assignment, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var a map[string]tasks.Assignment
+	if err := json.Unmarshal([]byte(raw), &a); err != nil {
+		return nil, fmt.Errorf("decode assignments: %w", err)
+	}
+	return a, nil
+}
+
+// encodeResourceGroups renders a task group's per-kind assignment for its
+// column, empty storing as the column default.
+func encodeResourceGroups(g map[string]string) (string, error) {
+	if len(g) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(g)
+	if err != nil {
+		return "", fmt.Errorf("encode resource groups: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// decodeResourceGroups is the inverse of encodeResourceGroups.
+func decodeResourceGroups(raw string) (map[string]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var g map[string]string
+	if err := json.Unmarshal([]byte(raw), &g); err != nil {
+		return nil, fmt.Errorf("decode resource groups: %w", err)
 	}
 	return g, nil
 }

@@ -1,26 +1,28 @@
-// Package proxies allocates proxies to tasks. A consumer-provided Repository
-// stores the pool and its groups durably while the Manager owns all live
-// acquisition state, rotating unlocked proxies through per-group selection
-// strategies and honoring durable task-to-proxy locks.
+// Package proxies allocates proxies to tasks. It is the leasing package
+// specialized to one resource kind: a consumer-provided Repository stores the
+// pool and its groups durably while the Manager owns all live acquisition
+// state, rotating unlocked proxies through per-group selection strategies and
+// honoring durable task-to-proxy locks.
 package proxies
 
 import (
 	"context"
-	"errors"
 	"time"
+
+	"github.com/ntakezo/rogojin/leasing"
 )
 
 // GlobalGroup is the namespace proxies land in when added without a group.
 // The manager guarantees it exists; it cannot be deleted.
-const GlobalGroup = "global"
+const GlobalGroup = leasing.GlobalGroup
 
 // UnlimitedHolders marks a holder policy with no cap: any number of concurrent
 // leases is tolerated.
-const UnlimitedHolders = -1
+const UnlimitedHolders = leasing.UnlimitedHolders
 
 // Built-in selection strategy names a Group may reference.
 const (
-	StrategyRoundRobin = "roundrobin"
+	StrategyRoundRobin = leasing.StrategyRoundRobin
 	StrategyBayesian   = "bayesian"
 )
 
@@ -48,13 +50,7 @@ type Proxy struct {
 // MaxHolders is the default holder policy for members that set none: 0 means
 // the default of 1, 1 or more caps concurrent leases per proxy, and
 // UnlimitedHolders lifts the cap. A member proxy's own MaxHolders overrides it.
-type Group struct {
-	ID         string    `json:"id"`
-	Strategy   string    `json:"strategy"`
-	MaxHolders int       `json:"maxHolders"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
-}
+type Group = leasing.Group
 
 // Repository is the persistence port: a dumb durable store of proxies and
 // their groups. It tracks no leases — the Manager owns live state and stamps
@@ -92,15 +88,15 @@ type StrategyFactory func() Selection
 
 // A Decision is what a DeletionPolicy tells the Manager to do with the task a
 // deleted proxy was locked to.
-type Decision int
+type Decision = leasing.Decision
 
 const (
 	// Reassign locks the task to a freshly selected proxy from the same group.
-	Reassign Decision = iota
+	Reassign = leasing.Reassign
 	// Unbind leaves the task lockless; it rotates the pool on its next acquire.
-	Unbind
+	Unbind = leasing.Unbind
 	// Fail unbinds the task and surfaces ErrTaskOrphaned to the deleter.
-	Fail
+	Fail = leasing.Fail
 )
 
 // DeletionPolicy is the port a module implements to decide the fate of a task
@@ -128,23 +124,7 @@ type DeletionPolicy interface {
 // its own lock for the same reason a DeletionPolicy must not reach the task
 // service: that service holds its registry lock across the Unlock it calls
 // back into, so taking both locks in either order can deadlock.
-type UsagePolicy interface {
-	// RunningTasks returns the ids of every running task leasing from
-	// proxyGroupID.
-	RunningTasks(ctx context.Context, proxyGroupID string) ([]string, error)
-	// TaskIsRunning reports whether the named task is running. It answers for
-	// tasks bound to or leasing a single doomed proxy, which may run against
-	// some other group entirely — a durable lock outranks the group a task is
-	// assigned, so the group question alone would miss them.
-	TaskIsRunning(ctx context.Context, taskID string) (bool, error)
-	// PinnedTasks returns the ids of every task pinned to proxyID that could
-	// still run, whether or not it is running now. A pin lives on the task
-	// record, in a store this package does not own, so this is the one link the
-	// Manager cannot discover for itself — a durable lock it can see, a pin it
-	// cannot. Deleting a pinned proxy is allowed; DeletionImpact reports it so a
-	// deliberate deletion can be weighed first.
-	PinnedTasks(ctx context.Context, proxyID string) ([]string, error)
-}
+type UsagePolicy = leasing.UsagePolicy
 
 // Usage adapts plain functions to UsagePolicy. It exists for the wiring order a
 // consumer usually has — the manager is built first, the task service that
@@ -181,50 +161,92 @@ func (u Usage) PinnedTasks(ctx context.Context, proxyID string) ([]string, error
 	return u.PinnedToProxy(ctx, proxyID)
 }
 
+// An Impact is what deleting a proxy, or a whole group, would cost the tasks
+// linked to it. Running names the tasks the deletion is refused for; Pinned
+// names the resumable tasks that would keep their assignment and be unable to
+// run under it until they are reassigned. Pinned is a warning, not a refusal —
+// deleting a proxy is a deliberate act, and what it costs is the deleter's call.
+type Impact = leasing.Impact
+
 // ErrNoProxies is returned by acquires when the group has no proxies at all.
 // It fails rather than waiting for one to be added: an assignment to a group
 // that could be satisfied by a proxy freeing is worth blocking on, but an empty
 // group is a misconfiguration far more often than a swap in progress, and
 // blocking on it would hide the mistake as a hang.
-var ErrNoProxies = errors.New("no proxies available")
+var ErrNoProxies = leasing.ErrNoResources
 
 // ErrGroupNotFound is returned when an operation names a group the manager
 // does not know.
-var ErrGroupNotFound = errors.New("proxy group not found")
+var ErrGroupNotFound = leasing.ErrGroupNotFound
 
 // ErrGroupInUse is returned by DeleteGroup when a running task leases from the
 // group, or when a member is locked to or held by one. Suspend or kill the
 // task first.
-var ErrGroupInUse = errors.New("proxy group in use by a running task")
+var ErrGroupInUse = leasing.ErrGroupInUse
 
 // ErrProxyInUse is returned by DeleteProxy when a running task holds a lease on
 // the proxy, is locked to it, or leases from its group. Suspend or kill the
 // task first.
-var ErrProxyInUse = errors.New("proxy in use by a running task")
+var ErrProxyInUse = leasing.ErrResourceInUse
 
 // ErrProxyNotFound is returned when an assignment pins a proxy the manager does
 // not know — deleted while the task was down, or never added. It is the signal
 // a recovered task's fallback policy acts on: run proxyless, rotate the group
 // instead, or refuse to run at all.
-var ErrProxyNotFound = errors.New("pinned proxy not found")
+var ErrProxyNotFound = leasing.ErrResourceNotFound
 
 // ErrProxyNotInGroup is returned when an assignment pins a proxy that is not a
 // member of the group it names. Left to resolve itself either way it would
 // quietly move a task off its assigned pool, or off its pin.
-var ErrProxyNotInGroup = errors.New("pinned proxy is not in the assigned group")
+var ErrProxyNotInGroup = leasing.ErrResourceNotInGroup
 
 // ErrProxyLocked is returned when an assignment pins a proxy another task holds
 // a durable lock on. Nothing frees it on its own — unlike a lease, which the
 // acquire loop waits out — so this fails rather than blocking on a condition
 // that will not arrive.
-var ErrProxyLocked = errors.New("pinned proxy is locked to another task")
+var ErrProxyLocked = leasing.ErrResourceLocked
 
 // ErrPinConflict is returned when a task's durable lock names one proxy and its
 // assignment pins another. A lease must never drop a durable lock as a side
 // effect, so the fix is to reassign the task — see Manager.ReleaseStaleLock and
 // the task service's AssignProxy, which release the stale lock deliberately.
-var ErrPinConflict = errors.New("locked proxy conflicts with pinned proxy")
+var ErrPinConflict = leasing.ErrPinConflict
 
 // ErrTaskOrphaned is returned when a deletion's policy decides Fail, so the
 // deleter can kill or quarantine the named task.
-var ErrTaskOrphaned = errors.New("task orphaned by proxy deletion")
+var ErrTaskOrphaned = leasing.ErrTaskOrphaned
+
+// attrs is the proxy-specific payload the leasing core carries opaquely.
+type attrs struct {
+	url string
+}
+
+// toResource and fromResource translate between this package's Proxy and the
+// leasing core's resource record. The core owns every field but the payload.
+func toResource(p Proxy) leasing.Resource[attrs] {
+	return leasing.Resource[attrs]{
+		ID:         p.ID,
+		GroupID:    p.GroupID,
+		OwnerID:    p.OwnerID,
+		MaxHolders: p.MaxHolders,
+		Successes:  p.Successes,
+		Failures:   p.Failures,
+		Attrs:      attrs{url: p.URL},
+		CreatedAt:  p.CreatedAt,
+		UpdatedAt:  p.UpdatedAt,
+	}
+}
+
+func fromResource(r leasing.Resource[attrs]) Proxy {
+	return Proxy{
+		ID:         r.ID,
+		URL:        r.Attrs.url,
+		GroupID:    r.GroupID,
+		OwnerID:    r.OwnerID,
+		MaxHolders: r.MaxHolders,
+		Successes:  r.Successes,
+		Failures:   r.Failures,
+		CreatedAt:  r.CreatedAt,
+		UpdatedAt:  r.UpdatedAt,
+	}
+}
