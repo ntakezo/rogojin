@@ -26,6 +26,13 @@ func newTestRepo(t *testing.T) *SQLite {
 // satisfiesRepositoryPort fails to compile if SQLite drifts from the persistence port it exists to implement.
 var _ tasks.Repository = (*SQLite)(nil)
 
+// The resource kinds these tests store placements under. The store never
+// interprets a kind; it is only a key in the JSON column.
+const (
+	proxyKind   = "proxy"
+	accountKind = "account"
+)
+
 // seedTask inserts a task in the global group with fresh timestamps, the
 // placement most tests do not care about.
 func seedTask(t *testing.T, repo *SQLite, id, workflowID string) {
@@ -304,11 +311,12 @@ func TestMigratesLegacyDatabaseAddingOutput(t *testing.T) {
 	}
 }
 
-// TestProxyGroupAssignmentRoundTrips verifies the three distinct assignments a
-// task can carry survive storage: nil (inherit the task group's), "" (run
-// proxyless), and a named group. Collapsing nil and "" would silently turn an
-// inheriting task into a proxyless one.
-func TestProxyGroupAssignmentRoundTrips(t *testing.T) {
+// TestAssignmentTriStateRoundTrips verifies the three distinct assignments a
+// task can carry survive storage as JSON: nil (inherit the task group's), ""
+// (lease none of the kind), and a named group. JSON has one null but two empty
+// strings' worth of meaning here — collapsing nil and "" would silently turn an
+// inheriting task into an opted-out one.
+func TestAssignmentTriStateRoundTrips(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
@@ -318,10 +326,11 @@ func TestProxyGroupAssignmentRoundTrips(t *testing.T) {
 		assigned *string
 	}{
 		{"inherit", nil},
-		{"proxyless", &none},
+		{"opted-out", &none},
 		{"named", &named},
 	} {
-		rec := tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: "g1", ProxyGroupID: tc.assigned}
+		rec := tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: "g1",
+			Assignments: map[string]tasks.Assignment{proxyKind: {GroupID: tc.assigned}}}
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask %s: %v", tc.id, err)
 		}
@@ -329,17 +338,53 @@ func TestProxyGroupAssignmentRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RecoverTask %s: %v", tc.id, err)
 		}
+		stored := got.Assignments[proxyKind].GroupID
 		switch {
-		case tc.assigned == nil && got.ProxyGroupID != nil:
-			t.Fatalf("%s: ProxyGroupID = %q, want nil (inherit)", tc.id, *got.ProxyGroupID)
-		case tc.assigned != nil && got.ProxyGroupID == nil:
-			t.Fatalf("%s: ProxyGroupID = nil, want %q", tc.id, *tc.assigned)
-		case tc.assigned != nil && *got.ProxyGroupID != *tc.assigned:
-			t.Fatalf("%s: ProxyGroupID = %q, want %q", tc.id, *got.ProxyGroupID, *tc.assigned)
+		case tc.assigned == nil && stored != nil:
+			t.Fatalf("%s: group = %q, want nil (inherit)", tc.id, *stored)
+		case tc.assigned != nil && stored == nil:
+			t.Fatalf("%s: group = nil, want %q", tc.id, *tc.assigned)
+		case tc.assigned != nil && *stored != *tc.assigned:
+			t.Fatalf("%s: group = %q, want %q", tc.id, *stored, *tc.assigned)
 		}
 		if got.GroupID != "g1" {
 			t.Fatalf("%s: GroupID = %q, want g1", tc.id, got.GroupID)
 		}
+	}
+}
+
+// TestAssignmentsAreIndependentPerKind verifies one record carries a distinct
+// placement for each kind, each with its own tri-state. Nothing about storing
+// them in one column may let one kind read as another.
+func TestAssignmentsAreIndependentPerKind(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	proxyGroup, none, accountPin := "residential", "", "buyer-1"
+	rec := tasks.Record{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[string]tasks.Assignment{
+		proxyKind:   {GroupID: &proxyGroup, ResourceID: &none},
+		accountKind: {ResourceID: &accountPin},
+	}}
+	if err := repo.CreateTask(ctx, rec); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	got, err := repo.RecoverTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	proxy, account := got.Assignments[proxyKind], got.Assignments[accountKind]
+	if proxy.GroupID == nil || *proxy.GroupID != "residential" {
+		t.Fatalf("proxy group = %v, want residential", proxy.GroupID)
+	}
+	if proxy.ResourceID == nil || *proxy.ResourceID != "" {
+		t.Fatalf("proxy pin = %v, want explicit empty", proxy.ResourceID)
+	}
+	if account.GroupID != nil {
+		t.Fatalf("account group = %q, want nil (inherit)", *account.GroupID)
+	}
+	if account.ResourceID == nil || *account.ResourceID != "buyer-1" {
+		t.Fatalf("account pin = %v, want buyer-1", account.ResourceID)
 	}
 }
 
@@ -376,8 +421,8 @@ func TestTimestampsRoundTripAndRefresh(t *testing.T) {
 	}
 }
 
-// TestGroupCRUD verifies a task group round-trips with its proxy-group
-// assignment, that a missing group reports found=false rather than an error,
+// TestGroupCRUD verifies a task group round-trips with its per-kind resource
+// assignments, that a missing group reports found=false rather than an error,
 // and that deletion removes it.
 func TestGroupCRUD(t *testing.T) {
 	repo := newTestRepo(t)
@@ -388,7 +433,10 @@ func TestGroupCRUD(t *testing.T) {
 	}
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	g := tasks.Group{ID: "g1", ProxyGroupID: "residential", CreatedAt: now, UpdatedAt: now}
+	g := tasks.Group{ID: "g1", CreatedAt: now, UpdatedAt: now, ResourceGroups: map[string]string{
+		proxyKind:   "residential",
+		accountKind: "shoppers",
+	}}
 	if err := repo.SaveGroup(ctx, g); err != nil {
 		t.Fatalf("SaveGroup: %v", err)
 	}
@@ -397,8 +445,11 @@ func TestGroupCRUD(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GetGroup(g1) = found %v, err %v; want true, nil", found, err)
 	}
-	if got.ProxyGroupID != "residential" || !got.CreatedAt.Equal(now) {
-		t.Fatalf("got %+v, want proxy group residential created %v", got, now)
+	if got.ResourceGroups[proxyKind] != "residential" || got.ResourceGroups[accountKind] != "shoppers" {
+		t.Fatalf("resource groups = %v, want residential proxies and shoppers accounts", got.ResourceGroups)
+	}
+	if !got.CreatedAt.Equal(now) {
+		t.Fatalf("CreatedAt = %v, want %v", got.CreatedAt, now)
 	}
 
 	listed, err := repo.ListGroups(ctx)
@@ -478,8 +529,8 @@ func TestLegacyRowsLandInGlobalGroup(t *testing.T) {
 	if rec.GroupID != tasks.GlobalGroup {
 		t.Fatalf("GroupID = %q, want %q", rec.GroupID, tasks.GlobalGroup)
 	}
-	if rec.ProxyGroupID != nil {
-		t.Fatalf("ProxyGroupID = %q, want nil (inherit)", *rec.ProxyGroupID)
+	if len(rec.Assignments) != 0 {
+		t.Fatalf("Assignments = %v, want none (inherit every kind)", rec.Assignments)
 	}
 	if !rec.CreatedAt.IsZero() || !rec.UpdatedAt.IsZero() {
 		t.Fatalf("legacy timestamps = %v/%v, want zero", rec.CreatedAt, rec.UpdatedAt)
@@ -506,10 +557,10 @@ func TestWritesToMissingTaskFailLoud(t *testing.T) {
 	}
 }
 
-// TestProxyPinRoundTrips verifies a task's pin survives storage on the same
+// TestPinRoundTrips verifies a task's pin survives storage on the same
 // three-way distinction as its group: nil (unpinned, rotate), "" (explicitly
-// none), and a named proxy.
-func TestProxyPinRoundTrips(t *testing.T) {
+// none), and a named resource.
+func TestPinRoundTrips(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
@@ -522,7 +573,8 @@ func TestProxyPinRoundTrips(t *testing.T) {
 		{"cleared", &none},
 		{"pinned", &named},
 	} {
-		rec := tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: "g1", ProxyGroupID: &group, ProxyID: tc.pinned}
+		rec := tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: "g1",
+			Assignments: map[string]tasks.Assignment{proxyKind: {GroupID: &group, ResourceID: tc.pinned}}}
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask %s: %v", tc.id, err)
 		}
@@ -530,26 +582,32 @@ func TestProxyPinRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RecoverTask %s: %v", tc.id, err)
 		}
+		stored := got.Assignments[proxyKind].ResourceID
 		switch {
-		case tc.pinned == nil && got.ProxyID != nil:
-			t.Fatalf("%s: ProxyID = %q, want nil (unpinned)", tc.id, *got.ProxyID)
-		case tc.pinned != nil && got.ProxyID == nil:
-			t.Fatalf("%s: ProxyID = nil, want %q", tc.id, *tc.pinned)
-		case tc.pinned != nil && *got.ProxyID != *tc.pinned:
-			t.Fatalf("%s: ProxyID = %q, want %q", tc.id, *got.ProxyID, *tc.pinned)
+		case tc.pinned == nil && stored != nil:
+			t.Fatalf("%s: pin = %q, want nil (unpinned)", tc.id, *stored)
+		case tc.pinned != nil && stored == nil:
+			t.Fatalf("%s: pin = nil, want %q", tc.id, *tc.pinned)
+		case tc.pinned != nil && *stored != *tc.pinned:
+			t.Fatalf("%s: pin = %q, want %q", tc.id, *stored, *tc.pinned)
 		}
 	}
 }
 
-// TestSaveAssignmentRepointsPlacement verifies a reassignment rewrites both
-// halves of the placement and nothing else, and that it reports a task that
-// does not exist rather than silently updating no rows.
-func TestSaveAssignmentRepointsPlacement(t *testing.T) {
+// TestSaveAssignmentRepointsOneKind verifies a reassignment rewrites both
+// halves of one kind's placement, leaves every other kind and the checkpoint
+// alone, and reports a task that does not exist rather than silently updating
+// no rows. Editing one kind in place is what makes a stored map safe to
+// repoint without reading it back first.
+func TestSaveAssignmentRepointsOneKind(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	group, pin := "residential", "p1"
-	rec := tasks.Record{ID: "t1", WorkflowID: "wf1", GroupID: "g1", ProxyGroupID: &group, ProxyID: &pin}
+	group, pin, accountPin := "residential", "p1", "buyer-1"
+	rec := tasks.Record{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[string]tasks.Assignment{
+		proxyKind:   {GroupID: &group, ResourceID: &pin},
+		accountKind: {ResourceID: &accountPin},
+	}}
 	if err := repo.CreateTask(ctx, rec); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
@@ -558,49 +616,89 @@ func TestSaveAssignmentRepointsPlacement(t *testing.T) {
 	}
 
 	moved, repinned := "datacenter", "p9"
-	if err := repo.SaveAssignment(ctx, "t1", &moved, &repinned); err != nil {
+	if err := repo.SaveAssignment(ctx, "t1", proxyKind, tasks.Assignment{GroupID: &moved, ResourceID: &repinned}); err != nil {
 		t.Fatalf("SaveAssignment: %v", err)
 	}
 	got, err := repo.RecoverTask(ctx, "t1")
 	if err != nil {
 		t.Fatalf("RecoverTask: %v", err)
 	}
-	if got.ProxyGroupID == nil || *got.ProxyGroupID != "datacenter" {
-		t.Fatalf("ProxyGroupID = %v, want datacenter", got.ProxyGroupID)
+	proxy := got.Assignments[proxyKind]
+	if proxy.GroupID == nil || *proxy.GroupID != "datacenter" {
+		t.Fatalf("proxy group = %v, want datacenter", proxy.GroupID)
 	}
-	if got.ProxyID == nil || *got.ProxyID != "p9" {
-		t.Fatalf("ProxyID = %v, want p9", got.ProxyID)
+	if proxy.ResourceID == nil || *proxy.ResourceID != "p9" {
+		t.Fatalf("proxy pin = %v, want p9", proxy.ResourceID)
+	}
+	if account := got.Assignments[accountKind].ResourceID; account == nil || *account != "buyer-1" {
+		t.Fatalf("account pin = %v, want the untouched buyer-1", account)
 	}
 	if got.State != "s1" || got.Status != "running" || string(got.Snapshot) != `{"v":1}` {
 		t.Fatalf("reassignment disturbed the checkpoint: %+v", got)
 	}
 
-	// Clearing both halves stores NULL, not the empty string.
-	if err := repo.SaveAssignment(ctx, "t1", nil, nil); err != nil {
+	// Clearing both halves stores JSON null, not the empty string.
+	if err := repo.SaveAssignment(ctx, "t1", proxyKind, tasks.Assignment{}); err != nil {
 		t.Fatalf("SaveAssignment clearing: %v", err)
 	}
-	if got, _ = repo.RecoverTask(ctx, "t1"); got.ProxyGroupID != nil || got.ProxyID != nil {
-		t.Fatalf("cleared placement = %v/%v, want nil/nil", got.ProxyGroupID, got.ProxyID)
+	got, _ = repo.RecoverTask(ctx, "t1")
+	if cleared := got.Assignments[proxyKind]; cleared.GroupID != nil || cleared.ResourceID != nil {
+		t.Fatalf("cleared placement = %v/%v, want nil/nil", cleared.GroupID, cleared.ResourceID)
 	}
 
-	if err := repo.SaveAssignment(ctx, "missing", &moved, nil); err == nil {
+	// A kind the record never carried is added, not rejected.
+	fresh := "sms"
+	if err := repo.SaveAssignment(ctx, "t1", "phone", tasks.Assignment{GroupID: &fresh}); err != nil {
+		t.Fatalf("SaveAssignment new kind: %v", err)
+	}
+	got, _ = repo.RecoverTask(ctx, "t1")
+	if phone := got.Assignments["phone"].GroupID; phone == nil || *phone != "sms" {
+		t.Fatalf("phone group = %v, want sms", phone)
+	}
+
+	if err := repo.SaveAssignment(ctx, "missing", proxyKind, tasks.Assignment{GroupID: &moved}); err == nil {
 		t.Fatal("expected an error assigning a task that does not exist")
 	}
 }
 
-// TestTasksPinnedToSelectsByPin verifies the store answers the pin question the
-// deletion warning is built on: whole records for exactly the tasks naming the
-// proxy, so the caller can apply its own can-this-still-run rule.
-func TestTasksPinnedToSelectsByPin(t *testing.T) {
+// TestSaveAssignmentOnUnplacedTask verifies the first assignment on a task
+// stored with no placement lands, rather than failing on the empty column the
+// task was created with.
+func TestSaveAssignmentOnUnplacedTask(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	seedTask(t, repo, "t1", "wf1")
+	group := "residential"
+	if err := repo.SaveAssignment(ctx, "t1", proxyKind, tasks.Assignment{GroupID: &group}); err != nil {
+		t.Fatalf("SaveAssignment: %v", err)
+	}
+	got, _ := repo.RecoverTask(ctx, "t1")
+	if stored := got.Assignments[proxyKind].GroupID; stored == nil || *stored != "residential" {
+		t.Fatalf("proxy group = %v, want residential", stored)
+	}
+}
+
+// TestTasksPinnedToSelectsByKindAndPin verifies the store answers the pin
+// question the deletion warning is built on: whole records for exactly the
+// tasks naming that resource under that kind, so the caller can apply its own
+// can-this-still-run rule. A task with no placement at all must not break the
+// query — its column holds no JSON to look into.
+func TestTasksPinnedToSelectsByKindAndPin(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
 	group, pin, other := "residential", "p1", "p2"
+	pinned := func(kind, resourceID string) map[string]tasks.Assignment {
+		return map[string]tasks.Assignment{kind: {GroupID: &group, ResourceID: &resourceID}}
+	}
 	for _, rec := range []tasks.Record{
-		{ID: "a", WorkflowID: "wf", GroupID: "g1", ProxyGroupID: &group, ProxyID: &pin},
-		{ID: "b", WorkflowID: "wf", GroupID: "g1", ProxyGroupID: &group, ProxyID: &pin},
-		{ID: "c", WorkflowID: "wf", GroupID: "g1", ProxyGroupID: &group, ProxyID: &other},
-		{ID: "d", WorkflowID: "wf", GroupID: "g1", ProxyGroupID: &group},
+		{ID: "a", WorkflowID: "wf", GroupID: "g1", Assignments: pinned(proxyKind, pin)},
+		{ID: "b", WorkflowID: "wf", GroupID: "g1", Assignments: pinned(proxyKind, pin)},
+		{ID: "c", WorkflowID: "wf", GroupID: "g1", Assignments: pinned(proxyKind, other)},
+		{ID: "d", WorkflowID: "wf", GroupID: "g1", Assignments: map[string]tasks.Assignment{proxyKind: {GroupID: &group}}},
+		{ID: "e", WorkflowID: "wf", GroupID: "g1", Assignments: pinned(accountKind, pin)},
+		{ID: "f", WorkflowID: "wf", GroupID: "g1"},
 	} {
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask %s: %v", rec.ID, err)
@@ -610,7 +708,7 @@ func TestTasksPinnedToSelectsByPin(t *testing.T) {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 
-	got, err := repo.TasksPinnedTo(ctx, "p1")
+	got, err := repo.TasksPinnedTo(ctx, proxyKind, "p1")
 	if err != nil {
 		t.Fatalf("TasksPinnedTo: %v", err)
 	}
@@ -622,7 +720,139 @@ func TestTasksPinnedToSelectsByPin(t *testing.T) {
 		t.Fatalf("record a = %+v, want its checkpoint carried through", got[0])
 	}
 
-	if empty, err := repo.TasksPinnedTo(ctx, "nobody"); err != nil || len(empty) != 0 {
+	// The account "p1" is a different resource that happens to share a name.
+	if accounts, err := repo.TasksPinnedTo(ctx, accountKind, "p1"); err != nil || len(accounts) != 1 || accounts[0].ID != "e" {
+		t.Fatalf("account TasksPinnedTo = %v, %v, want record e", accounts, err)
+	}
+
+	if empty, err := repo.TasksPinnedTo(ctx, proxyKind, "nobody"); err != nil || len(empty) != 0 {
 		t.Fatalf("TasksPinnedTo(nobody) = %v, %v, want none", empty, err)
 	}
+}
+
+// TestMigratesProxyPlacementIntoAssignments verifies the backfill carries a
+// shipped database's proxy placement into the kinded column without losing the
+// distinction it was storing. SQL NULL, the empty string, and a named value are
+// three different instructions — inherit, lease none, lease this — and a
+// migration that flattened them would silently repoint live tasks.
+func TestMigratesProxyPlacementIntoAssignments(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "legacy.db")
+
+	// The schema as of the task_groups migration, stamped at that version so
+	// only the assignments migrations run on it.
+	raw, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE tasks (
+		id             TEXT PRIMARY KEY,
+		workflow_id    TEXT NOT NULL,
+		state          TEXT NOT NULL DEFAULT '',
+		status         TEXT NOT NULL DEFAULT '',
+		snapshot       BLOB,
+		output         BLOB,
+		group_id       TEXT NOT NULL DEFAULT 'global',
+		proxy_group_id TEXT,
+		created_at     TEXT NOT NULL DEFAULT '',
+		updated_at     TEXT NOT NULL DEFAULT '',
+		proxy_id       TEXT
+	)`); err != nil {
+		t.Fatalf("create legacy tasks: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE task_groups (
+		id             TEXT PRIMARY KEY,
+		proxy_group_id TEXT NOT NULL DEFAULT '',
+		created_at     TEXT NOT NULL DEFAULT '',
+		updated_at     TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("create legacy task_groups: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO tasks (id, workflow_id, group_id, proxy_group_id, proxy_id) VALUES
+		('inherits',  'wf1', 'checkout', NULL,          NULL),
+		('opted-out', 'wf1', 'checkout', '',            NULL),
+		('assigned',  'wf1', 'checkout', 'residential', NULL),
+		('pinned',    'wf1', 'checkout', 'residential', 'p7'),
+		('pin-only',  'wf1', 'checkout', NULL,          'p8')`); err != nil {
+		t.Fatalf("seed legacy tasks: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO task_groups (id, proxy_group_id) VALUES ('checkout', 'residential'), ('bare', '')`); err != nil {
+		t.Fatalf("seed legacy task_groups: %v", err)
+	}
+	if _, err := raw.Exec(`PRAGMA user_version = 8`); err != nil {
+		t.Fatalf("stamp legacy version: %v", err)
+	}
+	raw.Close()
+
+	repo, err := NewSQLite(dsn)
+	if err != nil {
+		t.Fatalf("NewSQLite on legacy db: %v", err)
+	}
+	t.Cleanup(func() { repo.Close() })
+
+	for _, tc := range []struct {
+		id          string
+		wantGroup   *string
+		wantPin     *string
+		description string
+	}{
+		{"inherits", nil, nil, "no placement of its own, so it must keep inheriting"},
+		{"opted-out", ptr(""), nil, "an explicit opt-out must not become an inherit"},
+		{"assigned", ptr("residential"), nil, "a named group must survive"},
+		{"pinned", ptr("residential"), ptr("p7"), "a pin must survive alongside its group"},
+		{"pin-only", nil, ptr("p8"), "a pin whose group is inherited must not gain an opt-out"},
+	} {
+		got, err := repo.RecoverTask(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("RecoverTask %s: %v", tc.id, err)
+		}
+		a := got.Assignments[proxyKind]
+		if !samePtr(a.GroupID, tc.wantGroup) {
+			t.Fatalf("%s: group = %v, want %v — %s", tc.id, show(a.GroupID), show(tc.wantGroup), tc.description)
+		}
+		if !samePtr(a.ResourceID, tc.wantPin) {
+			t.Fatalf("%s: pin = %v, want %v — %s", tc.id, show(a.ResourceID), show(tc.wantPin), tc.description)
+		}
+	}
+
+	// A wholly unplaced row leaves the column at its default, which the pin
+	// query must tolerate rather than reject as malformed JSON.
+	if got, err := repo.TasksPinnedTo(ctx, proxyKind, "p7"); err != nil || len(got) != 1 || got[0].ID != "pinned" {
+		t.Fatalf("TasksPinnedTo after migration = %v, %v, want the pinned record", got, err)
+	}
+
+	group, found, err := repo.GetGroup(ctx, "checkout")
+	if err != nil || !found {
+		t.Fatalf("GetGroup(checkout) = found %v, err %v", found, err)
+	}
+	if group.ResourceGroups[proxyKind] != "residential" {
+		t.Fatalf("group resource groups = %v, want residential proxies", group.ResourceGroups)
+	}
+	bare, _, err := repo.GetGroup(ctx, "bare")
+	if err != nil {
+		t.Fatalf("GetGroup(bare): %v", err)
+	}
+	if len(bare.ResourceGroups) != 0 {
+		t.Fatalf("bare group resource groups = %v, want none", bare.ResourceGroups)
+	}
+}
+
+// ptr takes the address of a string literal, for the optional halves of an
+// assignment.
+func ptr(s string) *string { return &s }
+
+// samePtr compares two optional assignment halves, nil included.
+func samePtr(got, want *string) bool {
+	if got == nil || want == nil {
+		return got == nil && want == nil
+	}
+	return *got == *want
+}
+
+// show renders an optional assignment half for a failure message.
+func show(v *string) string {
+	if v == nil {
+		return "nil"
+	}
+	return `"` + *v + `"`
 }

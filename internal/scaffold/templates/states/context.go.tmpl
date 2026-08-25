@@ -67,11 +67,13 @@ func NewContext(input Input, deps workflows.Deps{{if .Proxy}}, manager *proxies.
 		r: &running{
 {{- if .Proxy}}
 			proxies: manager,
-			// The whole placement travels together: group, or pin within it.
+			// Deps carries the task's placement per resource kind, under the key
+			// this program calls its proxy manager. The whole placement travels
+			// together: group, or pin within it.
 			assignment: proxies.Assignment{
 				TaskID:  deps.TaskID,
-				GroupID: deps.ProxyGroupID,
-				ProxyID: deps.ProxyID,
+				GroupID: deps.Assignments["proxy"].GroupID,
+				ProxyID: deps.Assignments["proxy"].ResourceID,
 			},
 {{- end}}
 			bus: deps.Bus,

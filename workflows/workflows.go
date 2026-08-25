@@ -120,12 +120,19 @@ func (s Status) Terminal() bool {
 type Deps struct {
 	TaskID string
 	Bus    comms.Bus
-	// ProxyGroupID names the proxy group the task's leases draw from, resolved
-	// from the task's own assignment or its task group's when it has none. It
-	// is "" for a task that runs without proxies.
-	ProxyGroupID string
-	// ProxyID pins the task's leases to one proxy within that group. It is ""
-	// for a task that rotates the group. Pass both to the proxy manager
-	// verbatim; it needs no branching here.
-	ProxyID string
+	// Assignments is the task's resolved placement per resource kind, keyed by
+	// the kind the consumer names its managers with ("proxy", "account"). A
+	// kind the task has no placement for is absent, which reads as the zero
+	// Assignment — so a lookup needs no branching.
+	Assignments map[string]Assignment
+}
+
+// An Assignment is a task's resolved placement for one resource kind: the
+// group its leases draw from, and the single member of that group it is pinned
+// to. Inheritance from the task group is already applied, so both fields are
+// final: "" means no group, or no pin. Pass both to that kind's manager
+// verbatim; it needs no branching here.
+type Assignment struct {
+	GroupID    string
+	ResourceID string
 }

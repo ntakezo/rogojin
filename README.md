@@ -31,7 +31,7 @@ Built-in modules cover the unglamorous parts of site automation:
 - **Durability** — every transition checkpointed; suspend, resume, kill, and recover at state boundaries.
 - **Proxies** — per-task leasing with round-robin or Thompson-sampling selection, per-proxy and per-group holder caps, and sticky locks that outlive the process.
 - **Accounts** — the same leasing, groups, holder caps, and sticky locks for site logins. What an account *is* belongs to the workflow: its fields travel as JSON, so a new workflow needs no schema change.
-- **Groups** — named sets of proxies, of accounts, and of tasks; a task or a whole task group leases only from the proxy group assigned to it, and each proxy group rotates through its own selection strategy.
+- **Groups** — named sets of proxies, of accounts, and of tasks. A task carries one assignment per resource kind and inherits its task group's for any kind it names none of, so a pool is assigned once and every member follows; each proxy group rotates through its own selection strategy.
 - **Comms** — typed pub/sub bus for inter-task coordination.
 - **Persistence** — a small byte-store interface; SQLite adapters ship in the box, swap in anything else.
 

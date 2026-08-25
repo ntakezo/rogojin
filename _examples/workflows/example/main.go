@@ -9,7 +9,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -35,62 +34,47 @@ func main() {
 	defer forward.Close()
 
 	// The manager is built first but the task service answers "is this in use?",
-	// so the usage guard closes over svc and resolves it at call time.
+	// so the guard reads svc at call time. It carries the kind, which is all
+	// that separates one manager's guard from another's.
 	var svc tasks.Service
 	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{ID: "local-1", URL: forward.URL}), nil,
-		proxies.WithUsagePolicy(proxies.Usage{
-			RunningInGroup: func(ctx context.Context, groupID string) ([]string, error) {
-				return svc.RunningTasks(ctx, groupID)
-			},
-			TaskRunning: func(ctx context.Context, taskID string) (bool, error) {
-				return svc.TaskIsRunning(ctx, taskID)
-			},
-			PinnedToProxy: func(ctx context.Context, proxyID string) ([]string, error) {
-				return svc.PinnedTasks(ctx, proxyID)
-			},
-		}))
+		proxies.WithUsagePolicy(tasks.NewGuard(&svc, states.ProxyKind)))
 	if err != nil {
 		log.Fatalf("proxy manager: %v", err)
 	}
 
-	// Accounts are the same machinery minus the rotation knob. Only TaskRunning
-	// is wired: the task record carries no account placement, so every link an
-	// account has — a live lease or a durable lock — is one the manager already
-	// sees for itself.
+	// Accounts are the same machinery minus the rotation knob, guarded the same
+	// way against the same service — only the kind differs, so the account group
+	// named "global" is never confused with the proxy group of the same name.
 	accountManager, err := accounts.NewManager(ctx, newMemAccountRepo(accounts.Account{
 		ID:      "buyer-1",
 		GroupID: accounts.GlobalGroup,
 		Fields:  profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
-	}), nil, accounts.WithUsagePolicy(accounts.Usage{
-		TaskRunning: func(ctx context.Context, taskID string) (bool, error) {
-			return svc.TaskIsRunning(ctx, taskID)
-		},
-	}))
+	}), nil, accounts.WithUsagePolicy(tasks.NewGuard(&svc, states.AccountKind)))
 	if err != nil {
 		log.Fatalf("account manager: %v", err)
 	}
 
-	// Both kinds of lock outlive the process, so deleting a task must free both
-	// — and repointing a task must drop the proxy lock its new placement no
-	// longer fits.
+	// Both kinds of lock outlive the process, so each manager registers under its
+	// kind: deleting a task unlocks both, while repointing one drops only the
+	// lock that moved — a task sent to other proxies must keep the account it is
+	// halfway through a checkout as.
 	svc = tasks.NewService(newMemRepo(), comms.NewBus(),
-		tasks.WithTaskReleaser(func(ctx context.Context, taskID string) error {
-			return errors.Join(manager.Unlock(ctx, taskID), accountManager.Unlock(ctx, taskID))
-		}),
-		tasks.WithTaskReassigner(func(ctx context.Context, taskID, proxyGroupID, proxyID string) error {
-			return manager.ReleaseStaleLock(ctx, proxies.Assignment{TaskID: taskID, GroupID: proxyGroupID, ProxyID: proxyID})
-		}))
+		tasks.WithResource(states.ProxyKind, manager.Unlock, proxies.StaleLockReleaser(manager)),
+		tasks.WithResource(states.AccountKind, accountManager.Unlock, accounts.StaleLockReleaser(accountManager)))
 	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager, accountManager)); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}
 
 	input := states.StaticContext{
-		ProductURL:     site.URL + "/product",
-		Size:           "M",
-		AccountGroupID: accounts.GlobalGroup,
+		ProductURL: site.URL + "/product",
+		Size:       "M",
 	}
 
-	task, err := svc.CreateTask(ctx, example_checkout.Name, input, tasks.WithProxyGroup(proxies.GlobalGroup))
+	// Placement, one option per kind: the workflow reads both back off Deps.
+	task, err := svc.CreateTask(ctx, example_checkout.Name, input,
+		tasks.WithResourceGroup(states.ProxyKind, proxies.GlobalGroup),
+		tasks.WithResourceGroup(states.AccountKind, accounts.GlobalGroup))
 	if err != nil {
 		log.Fatalf("create task: %v", err)
 	}
@@ -403,24 +387,31 @@ func (r *memRepo) TasksInGroup(ctx context.Context, groupID string) ([]string, e
 	return ids, nil
 }
 
-func (r *memRepo) SaveAssignment(ctx context.Context, id string, proxyGroupID, proxyID *string) error {
+// SaveAssignment rewrites one kind and copies the rest, so repointing a task's
+// proxies leaves its account placement alone.
+func (r *memRepo) SaveAssignment(ctx context.Context, id string, kind string, a tasks.Assignment) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rec, ok := r.records[id]
 	if !ok {
 		return fmt.Errorf("task %s not found", id)
 	}
-	rec.ProxyGroupID, rec.ProxyID = proxyGroupID, proxyID
+	assignments := make(map[string]tasks.Assignment, len(rec.Assignments)+1)
+	for k, v := range rec.Assignments {
+		assignments[k] = v
+	}
+	assignments[kind] = a
+	rec.Assignments = assignments
 	r.records[id] = rec
 	return nil
 }
 
-func (r *memRepo) TasksPinnedTo(ctx context.Context, proxyID string) ([]tasks.Record, error) {
+func (r *memRepo) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]tasks.Record, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	pinned := make([]tasks.Record, 0)
 	for _, rec := range r.records {
-		if rec.ProxyID != nil && *rec.ProxyID == proxyID {
+		if pin := rec.Assignments[kind].ResourceID; pin != nil && *pin == resourceID {
 			pinned = append(pinned, rec)
 		}
 	}

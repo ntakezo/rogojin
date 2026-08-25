@@ -149,6 +149,19 @@ func (m *Manager) ReleaseStaleLock(ctx context.Context, a Assignment) error {
 	return m.core.ReleaseStaleLock(ctx, toAssignment(a))
 }
 
+// StaleLockReleaser adapts m.ReleaseStaleLock to the plain strings a task
+// service hands each of its resource kinds, so wiring one is a single line:
+//
+//	tasks.WithResource("proxy", m.Unlock, proxies.StaleLockReleaser(m))
+//
+// An empty groupID means no group rather than the global one, exactly as it
+// does for ReleaseStaleLock.
+func StaleLockReleaser(m *Manager) func(ctx context.Context, taskID, groupID, proxyID string) error {
+	return func(ctx context.Context, taskID, groupID, proxyID string) error {
+		return m.ReleaseStaleLock(ctx, Assignment{TaskID: taskID, GroupID: groupID, ProxyID: proxyID})
+	}
+}
+
 // CheckAssignment reports whether a still resolves against the live pool,
 // returning ErrGroupNotFound, ErrProxyNotFound, ErrProxyNotInGroup, or
 // ErrProxyLocked when it does not. It is what a recovering task's fallback
