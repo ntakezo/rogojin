@@ -5,8 +5,8 @@
 // without that resource.
 //
 // A kind is just a string the consumer picks to name one leasing manager
-// ("proxy", "account"). This package stores and resolves placements under it
-// and never interprets it, so a new resource kind needs no change here.
+// ("proxy", "account", "card"). This package stores and resolves placements
+// under it and never interprets it, so a new resource kind needs no change here.
 package tasks
 
 import (

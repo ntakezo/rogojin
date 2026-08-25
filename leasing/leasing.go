@@ -1,11 +1,11 @@
 // Package leasing allocates pooled resources to tasks. It is the layer the
-// proxies and accounts modules are built on: a consumer-provided Repository
+// proxies, accounts, and cards modules are built on: a consumer-provided Repository
 // stores the pool and its groups durably while the Manager owns all live
 // acquisition state, rotating unlocked resources through per-group selection
 // strategies and honoring durable task-to-resource locks.
 //
 // The resource kind is a type parameter carrying whatever payload the module
-// needs — a proxy's URL, an account's credentials. This package never inspects
+// needs — a proxy's URL, an account's credentials, a card's number. This package never inspects
 // it; everything here is about who holds what, and for how long.
 package leasing
 

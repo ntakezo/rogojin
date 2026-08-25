@@ -18,10 +18,10 @@ const deleteAttempts = 3
 
 // A Config wires one Manager. Repository is required; Policy and Usage may be
 // nil, each degrading as their ports document. Noun is the word deletions and
-// refusals are phrased with ("proxy", "account"), and defaults to "resource".
-// Strategies are the selection algorithms groups may name, DefaultStrategy the
-// one a group naming none rotates through; a Manager with no Strategies at all
-// gets round robin under that name.
+// refusals are phrased with ("proxy", "account", "card"), and defaults to
+// "resource". Strategies are the selection algorithms groups may name,
+// DefaultStrategy the one a group naming none rotates through; a Manager with
+// no Strategies at all gets round robin under that name.
 type Config[T any] struct {
 	Noun            string
 	Repository      Repository[T]

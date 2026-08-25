@@ -32,7 +32,12 @@ func main() {
 
 {{- if .ProxyPersist}}
 
-	proxyRepo, err := proxysqlite.NewSQLite("{{.Package}}-proxies.db")
+{{- if .TaskPersist}}
+	// Every store records its migrations under its own name, so the proxy pool
+	// and the task history share one database file. Point them at separate
+	// files if you would rather keep them apart.
+{{- end}}
+	proxyRepo, err := proxysqlite.NewSQLite("{{.Package}}.db")
 	if err != nil {
 		log.Fatal(err)
 	}
