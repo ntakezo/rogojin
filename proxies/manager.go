@@ -2,291 +2,299 @@ package proxies
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"sync"
+
+	"github.com/ntakezo/rogojin/leasing"
 )
 
 // A Manager allocates proxies to tasks: locked proxies go only to their owner,
-// unlocked ones rotate through the selection strategy under the exclusivity
-// cap. It owns all live lease state; the Repository only stores bytes.
-// A Manager is safe for concurrent use.
+// unlocked ones rotate within their group through the group's selection
+// strategy under the effective holder cap (the proxy's own MaxHolders, else
+// its group's, else 1). It owns all live lease state; the Repository only
+// stores bytes. A Manager is safe for concurrent use.
 type Manager struct {
-	repo   Repository
-	sel    Selection
-	excl   Exclusivity
-	policy DeletionPolicy
-
-	mu       sync.Mutex
-	cond     *sync.Cond
-	pool     map[string]Proxy
-	order    []string          // stable candidate order for selection
-	holders  map[string]int    // live lease count per proxy
-	bindings map[string]string // taskID -> locked proxy ID
+	core *leasing.Manager[attrs]
 }
 
-// NewManager loads the pool from the repository; the pool is fixed for the
-// manager's lifetime apart from DeleteProxy.
-func NewManager(ctx context.Context, repo Repository, sel Selection, excl Exclusivity, policy DeletionPolicy) (*Manager, error) {
-	if repo == nil || sel == nil {
-		return nil, errors.New("repository and selection are required")
-	}
-	if excl.maxHolders < 1 {
-		return nil, errors.New("exclusivity capacity must be at least 1")
+// A ManagerOption configures a Manager at construction.
+type ManagerOption func(*managerConfig)
+
+// managerConfig collects what the options set before the core is built.
+type managerConfig struct {
+	strategies map[string]StrategyFactory
+	usage      UsagePolicy
+}
+
+// WithStrategy registers factory under name, so groups may reference custom
+// selection algorithms beyond the built-ins (or override a built-in).
+func WithStrategy(name string, factory StrategyFactory) ManagerOption {
+	return func(c *managerConfig) { c.strategies[name] = factory }
+}
+
+// WithUsagePolicy wires the guard DeleteProxy and DeleteGroup consult to
+// refuse deleting a proxy a running task is leasing, locked to, or rotating
+// through. Without one, neither can tell a running task from a parked one, so
+// both fall back to refusing any proxy with a live lease on it — safe, but
+// blind to a task that is merely assigned the group and between leases, and
+// unable to free a proxy by suspending its task.
+func WithUsagePolicy(usage UsagePolicy) ManagerOption {
+	return func(c *managerConfig) { c.usage = usage }
+}
+
+// NewManager loads the groups and pool from the repository, persisting the
+// global group if absent. Groups and pool change afterwards only through
+// CreateGroup, DeleteGroup, AddProxy, and DeleteProxy.
+func NewManager(ctx context.Context, repo Repository, policy DeletionPolicy, opts ...ManagerOption) (*Manager, error) {
+	cfg := managerConfig{strategies: make(map[string]StrategyFactory)}
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
-	listed, err := repo.List(ctx)
+	// Built-ins are installed first so a WithStrategy under the same name
+	// replaces one, which is the documented way to override a built-in.
+	strategies := map[string]leasing.StrategyFactory[attrs]{
+		StrategyRoundRobin: func() leasing.Selection[attrs] { return leasing.NewRoundRobin[attrs]() },
+		StrategyBayesian:   coreFactory(func() Selection { return NewBayesian() }),
+	}
+	for name, factory := range cfg.strategies {
+		strategies[name] = coreFactory(factory)
+	}
+
+	var repository leasing.Repository[attrs]
+	if repo != nil {
+		repository = repoAdapter{repo: repo}
+	}
+	var deletion leasing.DeletionPolicy[attrs]
+	if policy != nil {
+		deletion = policyAdapter{policy: policy}
+	}
+
+	core, err := leasing.NewManager(ctx, leasing.Config[attrs]{
+		Noun:            "proxy",
+		Repository:      repository,
+		Policy:          deletion,
+		Usage:           cfg.usage,
+		Strategies:      strategies,
+		DefaultStrategy: StrategyRoundRobin,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("load proxy pool: %w", err)
+		return nil, err
 	}
-
-	m := &Manager{
-		repo:     repo,
-		sel:      sel,
-		excl:     excl,
-		policy:   policy,
-		pool:     make(map[string]Proxy, len(listed)),
-		holders:  make(map[string]int),
-		bindings: make(map[string]string),
-	}
-	m.cond = sync.NewCond(&m.mu)
-
-	for _, p := range listed {
-		if _, dup := m.pool[p.ID]; dup {
-			return nil, fmt.Errorf("duplicate proxy id %s", p.ID)
-		}
-		m.pool[p.ID] = p
-		m.order = append(m.order, p.ID)
-		if p.OwnerID != "" {
-			if prior, bound := m.bindings[p.OwnerID]; bound {
-				return nil, fmt.Errorf("task %s locked to multiple proxies (%s, %s)", p.OwnerID, prior, p.ID)
-			}
-			m.bindings[p.OwnerID] = p.ID
-		}
-	}
-	return m, nil
+	return &Manager{core: core}, nil
 }
 
-// Acquire leases a proxy for taskID: its locked proxy if it has one, otherwise
-// one rotated from the unlocked pool. It blocks until a proxy frees or ctx is
-// done; an empty pool fails immediately with ErrNoProxies.
-func (m *Manager) Acquire(ctx context.Context, taskID string) (*Lease, error) {
-	return m.acquire(ctx, taskID, false)
+// CreateGroup persists and installs a new group. ID must be unset in the
+// manager; Strategy must be registered (empty selects round robin).
+func (m *Manager) CreateGroup(ctx context.Context, g Group) error {
+	return m.core.CreateGroup(ctx, g)
 }
 
-// Lock durably binds taskID to a proxy (selecting one if unbound, idempotent)
-// and leases it. The binding outlives the lease and the manager until Unlock
-// or DeleteProxy; no other task can ever acquire the proxy.
-func (m *Manager) Lock(ctx context.Context, taskID string) (*Lease, error) {
-	return m.acquire(ctx, taskID, true)
+// DeleteGroup cascade-deletes a group and every proxy in it. It refuses with
+// ErrGroupInUse while the usage policy reports a running task leasing from the
+// group, holding a lease on a member, or locked to one — suspend or kill those
+// tasks first. Locked members consult the deletion policy; because the whole
+// group is going away there is nothing in-group to reassign to, so a Reassign
+// decision degrades to Unbind and is reported in the returned (joined) error
+// alongside any ErrTaskOrphaned from Fail decisions. The global group cannot be
+// deleted. With locked members and no policy wired it refuses before mutating
+// anything. Tasks still assigned to the group are not rewritten — this package
+// owns no task store — so their next lease fails with ErrGroupNotFound.
+func (m *Manager) DeleteGroup(ctx context.Context, id string) error {
+	return m.core.DeleteGroup(ctx, id)
 }
 
-// acquire is the shared blocking loop behind Acquire and Lock. A bound task
-// only ever leases its own proxy, one lease at a time; an unbound task rotates
-// the unlocked pool, durably binding the pick first when lock is set.
-func (m *Manager) acquire(ctx context.Context, taskID string, lock bool) (*Lease, error) {
-	// cond.Wait cannot watch ctx, so a watcher wakes the loop on cancellation.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			m.mu.Lock()
-			m.cond.Broadcast()
-			m.mu.Unlock()
-		case <-stop:
-		}
-	}()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if len(m.pool) == 0 {
-			return nil, ErrNoProxies
-		}
-
-		if id, bound := m.bindings[taskID]; bound {
-			// a locked proxy is exclusive to its owner: one lease at a time.
-			if m.holders[id] == 0 {
-				m.holders[id]++
-				return &Lease{manager: m, proxy: m.pool[id]}, nil
-			}
-		} else if p, found, err := m.selectUnlocked(); err != nil {
-			return nil, err
-		} else if found {
-			if lock {
-				p.OwnerID = taskID
-				if err := m.repo.Save(ctx, p); err != nil {
-					return nil, fmt.Errorf("persist lock: %w", err)
-				}
-				m.pool[p.ID] = p
-				m.bindings[taskID] = p.ID
-			}
-			m.holders[p.ID]++
-			return &Lease{manager: m, proxy: p}, nil
-		}
-
-		m.cond.Wait()
-	}
+// AddProxy persists and installs a new unlocked proxy, defaulting an empty
+// GroupID to the global group. The group must exist.
+func (m *Manager) AddProxy(ctx context.Context, p Proxy) error {
+	return m.core.Add(ctx, toResource(p))
 }
 
-// selectUnlocked picks an unlocked, under-capacity proxy via the selection
-// strategy; found is false when there are no candidates. Callers hold m.mu.
-func (m *Manager) selectUnlocked() (Proxy, bool, error) {
-	candidates := make([]Proxy, 0, len(m.order))
-	for _, id := range m.order {
-		p := m.pool[id]
-		if p.OwnerID == "" && m.holders[id] < m.excl.maxHolders {
-			candidates = append(candidates, p)
-		}
-	}
-	if len(candidates) == 0 {
-		return Proxy{}, false, nil
-	}
+// Acquire leases a proxy under a: its locked proxy if it has one — a durable
+// binding outranks the requested group — otherwise the pinned member, else one
+// rotated from the group's unlocked members. It blocks until a proxy frees or
+// ctx is done; a group with no proxies fails immediately with ErrNoProxies, and
+// a pin that no longer resolves fails with ErrProxyNotFound.
+func (m *Manager) Acquire(ctx context.Context, a Assignment) (*Lease, error) {
+	return wrapLease(m.core.Acquire(ctx, toAssignment(a)))
+}
 
-	p, err := m.sel.Select(candidates)
-	if err != nil {
-		return Proxy{}, false, fmt.Errorf("selection: %w", err)
-	}
-	live, ok := m.pool[p.ID]
-	if !ok {
-		return Proxy{}, false, fmt.Errorf("selection returned unknown proxy %s", p.ID)
-	}
-	return live, true, nil
+// Lock durably binds a.TaskID to a proxy (the pinned one, or one selected from
+// the group when unpinned; idempotent) and leases it. The binding outlives the
+// lease and the manager until Unlock, a reassignment, or the proxy's deletion;
+// no other task can ever acquire the proxy.
+func (m *Manager) Lock(ctx context.Context, a Assignment) (*Lease, error) {
+	return wrapLease(m.core.Lock(ctx, toAssignment(a)))
 }
 
 // Unlock removes taskID's durable lock, returning its proxy to the rotating
 // pool. It is a no-op if taskID has no locked proxy.
 func (m *Manager) Unlock(ctx context.Context, taskID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	id, bound := m.bindings[taskID]
-	if !bound {
-		return nil
-	}
-
-	p := m.pool[id]
-	p.OwnerID = ""
-	if err := m.repo.Save(ctx, p); err != nil {
-		return fmt.Errorf("persist unlock: %w", err)
-	}
-	m.pool[id] = p
-	delete(m.bindings, taskID)
-	m.cond.Broadcast()
-	return nil
+	return m.core.Unlock(ctx, taskID)
 }
 
-// DeleteProxy removes a proxy from the pool and the repository. Deleting a
-// locked proxy runs the deletion policy and executes its decision; a Fail
-// decision returns ErrTaskOrphaned naming the task so the deleter can act.
+// ReleaseStaleLock drops a.TaskID's durable lock when its new placement no
+// longer fits: a pin naming a different proxy, a group the locked proxy is not
+// in, or no placement at all. A lock the placement still fits is kept, so
+// repointing a task at the proxy it already holds does not briefly return that
+// proxy to the pool for another task to take.
+//
+// It is the reassignment counterpart to Unlock — wire it into a task service
+// the same way — and the sanctioned resolution of ErrPinConflict: a reassign is
+// a deliberate act and outranks a lock, while a lease is not and must not.
+//
+// A live lease on the released proxy is untouched: the run holding it keeps it
+// to completion, and the new placement takes effect at the task's next lock.
+// Unlike Acquire, an empty GroupID here means no group rather than the global
+// one, since a task reassigned to no proxies at all must lose its lock.
+func (m *Manager) ReleaseStaleLock(ctx context.Context, a Assignment) error {
+	return m.core.ReleaseStaleLock(ctx, toAssignment(a))
+}
+
+// StaleLockReleaser adapts m.ReleaseStaleLock to the plain strings a task
+// service hands each of its resource kinds, so wiring one is a single line:
+//
+//	tasks.WithResource("proxy", m.Unlock, proxies.StaleLockReleaser(m))
+//
+// An empty groupID means no group rather than the global one, exactly as it
+// does for ReleaseStaleLock.
+func StaleLockReleaser(m *Manager) func(ctx context.Context, taskID, groupID, proxyID string) error {
+	return func(ctx context.Context, taskID, groupID, proxyID string) error {
+		return m.ReleaseStaleLock(ctx, Assignment{TaskID: taskID, GroupID: groupID, ProxyID: proxyID})
+	}
+}
+
+// CheckAssignment reports whether a still resolves against the live pool,
+// returning ErrGroupNotFound, ErrProxyNotFound, ErrProxyNotInGroup, or
+// ErrProxyLocked when it does not. It is what a recovering task's fallback
+// policy asks before deciding whether to run, run proxyless, or refuse; the
+// acquire loop asks the same question, so there is one rule, not two.
+func (m *Manager) CheckAssignment(a Assignment) error {
+	return m.core.CheckAssignment(toAssignment(a))
+}
+
+// DeleteProxy removes a proxy from the pool and the repository. It refuses
+// with ErrProxyInUse while the usage policy reports a running task holding a
+// lease on it, locked to it, or leasing from its group — suspend or kill those
+// tasks first. Deleting an idle but locked proxy runs the deletion policy and
+// executes its decision — Reassign selects the replacement from the deleted
+// proxy's group; a Fail decision returns ErrTaskOrphaned naming the task so
+// the deleter can act.
 func (m *Manager) DeleteProxy(ctx context.Context, id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	p, ok := m.pool[id]
-	if !ok {
-		return m.repo.Delete(ctx, id)
-	}
-	if p.OwnerID == "" {
-		return m.remove(ctx, p)
-	}
-
-	if m.policy == nil {
-		return fmt.Errorf("proxy %s is locked to task %s and no deletion policy is set", id, p.OwnerID)
-	}
-	switch decision := m.policy.OnProxyDeleted(ctx, p.OwnerID, p); decision {
-	case Reassign:
-		next, found, err := m.selectUnlocked()
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("reassign task %s: %w", p.OwnerID, ErrNoProxies)
-		}
-		next.OwnerID = p.OwnerID
-		if err := m.repo.Save(ctx, next); err != nil {
-			return fmt.Errorf("persist reassign: %w", err)
-		}
-		m.pool[next.ID] = next
-		m.bindings[p.OwnerID] = next.ID
-		return m.remove(ctx, p)
-	case Unbind:
-		delete(m.bindings, p.OwnerID)
-		return m.remove(ctx, p)
-	case Fail:
-		delete(m.bindings, p.OwnerID)
-		if err := m.remove(ctx, p); err != nil {
-			return err
-		}
-		return fmt.Errorf("%w: %s", ErrTaskOrphaned, p.OwnerID)
-	default:
-		return fmt.Errorf("unknown deletion decision %d", decision)
-	}
+	return m.core.Delete(ctx, id)
 }
 
-// remove deletes p from the live pool and the repository, waking waiters.
-// Callers hold m.mu.
-func (m *Manager) remove(ctx context.Context, p Proxy) error {
-	delete(m.pool, p.ID)
-	delete(m.holders, p.ID)
-	for i, id := range m.order {
-		if id == p.ID {
-			m.order = append(m.order[:i], m.order[i+1:]...)
-			break
-		}
-	}
-	m.cond.Broadcast()
-	return m.repo.Delete(ctx, p.ID)
+// DeletionImpact reports what deleting the proxy would cost, without deleting
+// anything: which running tasks would refuse it, and which resumable tasks are
+// pinned to it and would be stranded until reassigned. Render it as the warning
+// a deliberate deletion deserves, then call DeleteProxy — which enforces only
+// the Running half.
+//
+// A proxy the manager does not know disturbs nothing, and without a usage
+// policy wired it reports nothing: the same blindness that lets DeleteProxy
+// delete anything.
+func (m *Manager) DeletionImpact(ctx context.Context, proxyID string) (Impact, error) {
+	return m.core.DeletionImpact(ctx, proxyID)
+}
+
+// GroupDeletionImpact reports what cascade-deleting the group would cost,
+// pooling the impact of every member. See DeletionImpact.
+func (m *Manager) GroupDeletionImpact(ctx context.Context, groupID string) (Impact, error) {
+	return m.core.GroupDeletionImpact(ctx, groupID)
+}
+
+// toAssignment renames the pin for the core, which knows no proxies.
+func toAssignment(a Assignment) leasing.Assignment {
+	return leasing.Assignment{TaskID: a.TaskID, GroupID: a.GroupID, ResourceID: a.ProxyID}
 }
 
 // Lease is a live hold on one proxy. Release it exactly once when done.
 type Lease struct {
-	manager *Manager
-	proxy   Proxy
-	once    sync.Once
+	core *leasing.Lease[attrs]
+}
+
+// wrapLease adapts a core lease, leaving a failed acquire's nil lease nil.
+func wrapLease(core *leasing.Lease[attrs], err error) (*Lease, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &Lease{core: core}, nil
 }
 
 // Proxy returns the leased proxy as of acquisition.
 func (l *Lease) Proxy() Proxy {
-	return l.proxy
+	return fromResource(l.core.Resource())
 }
 
 // Release frees the proxy, records the outcome the bayesian strategy learns
 // from, and persists it. Only the first call acts; later calls return nil.
 func (l *Lease) Release(success bool) error {
-	var err error
-	l.once.Do(func() { err = l.manager.release(l.proxy.ID, success) })
-	return err
+	return l.core.Release(success)
 }
 
-// release updates stats, frees the holder slot, wakes waiters, and persists the
-// updated record before dropping the lock — a save made outside it could land
-// after a concurrent Unlock's and resurrect the stale owner durably. The save
-// uses a background context so it lands even when the caller's context is gone.
-func (m *Manager) release(id string, success bool) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// repoAdapter presents a proxies.Repository to the core as a store of leasing
+// resources. The consumer's store stays proxy-shaped; the translation is here.
+type repoAdapter struct {
+	repo Repository
+}
 
-	p, ok := m.pool[id]
-	if ok {
-		if success {
-			p.Successes++
-		} else {
-			p.Failures++
-		}
-		m.pool[id] = p
+func (a repoAdapter) List(ctx context.Context) ([]leasing.Resource[attrs], error) {
+	listed, err := a.repo.List(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if m.holders[id] > 0 {
-		m.holders[id]--
+	resources := make([]leasing.Resource[attrs], len(listed))
+	for i, p := range listed {
+		resources[i] = toResource(p)
 	}
-	m.cond.Broadcast()
+	return resources, nil
+}
 
-	if !ok {
-		return nil // proxy was deleted while leased; nothing to persist
+func (a repoAdapter) Save(ctx context.Context, r leasing.Resource[attrs]) error {
+	return a.repo.Save(ctx, fromResource(r))
+}
+
+func (a repoAdapter) Delete(ctx context.Context, id string) error {
+	return a.repo.Delete(ctx, id)
+}
+
+func (a repoAdapter) ListGroups(ctx context.Context) ([]Group, error) {
+	return a.repo.ListGroups(ctx)
+}
+
+func (a repoAdapter) SaveGroup(ctx context.Context, g Group) error {
+	return a.repo.SaveGroup(ctx, g)
+}
+
+func (a repoAdapter) DeleteGroup(ctx context.Context, id string) error {
+	return a.repo.DeleteGroup(ctx, id)
+}
+
+// policyAdapter presents a proxies.DeletionPolicy to the core.
+type policyAdapter struct {
+	policy DeletionPolicy
+}
+
+func (a policyAdapter) OnDeleted(ctx context.Context, taskID string, deleted leasing.Resource[attrs]) leasing.Decision {
+	return a.policy.OnProxyDeleted(ctx, taskID, fromResource(deleted))
+}
+
+// coreFactory presents a proxy-shaped strategy to the core, which selects over
+// resources. The core validates the pick by ID, so the round trip is safe.
+func coreFactory(factory StrategyFactory) leasing.StrategyFactory[attrs] {
+	return func() leasing.Selection[attrs] { return selectionAdapter{selection: factory()} }
+}
+
+type selectionAdapter struct {
+	selection Selection
+}
+
+func (a selectionAdapter) Select(candidates []leasing.Resource[attrs]) (leasing.Resource[attrs], error) {
+	proxied := make([]Proxy, len(candidates))
+	for i, c := range candidates {
+		proxied[i] = fromResource(c)
 	}
-	return m.repo.Save(context.Background(), p)
+	picked, err := a.selection.Select(proxied)
+	if err != nil {
+		return leasing.Resource[attrs]{}, err
+	}
+	return toResource(picked), nil
 }

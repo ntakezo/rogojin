@@ -22,6 +22,9 @@ type engine struct {
 	state  workflows.Status
 	cancel context.CancelFunc
 	output []byte
+	// sealed latches the engine closed for deletion: Start refuses, so a task
+	// cannot begin running out from under the sweep that is removing it.
+	sealed bool
 }
 
 func newEngine(workflow workflows.Workflow, deps workflows.Deps, repo Repository) *engine {
@@ -61,6 +64,10 @@ func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows
 // suspend resumes paused exactly where it left off.
 func (e *engine) run(ctx context.Context, instance workflows.Instance, start *workflows.State, suspended bool) (err error) {
 	e.mu.Lock()
+	if e.sealed {
+		e.mu.Unlock()
+		return ErrTaskDeleted
+	}
 	if e.state != workflows.StatusNotStarted {
 		// a kill latched before the first Start wins: the task never runs.
 		killed := e.state == workflows.StatusKilled
@@ -201,6 +208,27 @@ func (e *engine) Output() []byte {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.output
+}
+
+// seal latches the engine closed so a later Start refuses, reporting false —
+// and sealing nothing — if the engine is live. Deletion seals every task it is
+// about to remove, because Start never goes through the service and could
+// otherwise begin a run mid-sweep.
+func (e *engine) seal() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.state == workflows.StatusRunning || e.state == workflows.StatusSuspended {
+		return false
+	}
+	e.sealed = true
+	return true
+}
+
+// unseal reopens an engine sealed for a deletion that was abandoned.
+func (e *engine) unseal() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sealed = false
 }
 
 // Status reports the engine's current lifecycle status.

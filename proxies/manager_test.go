@@ -3,23 +3,28 @@ package proxies
 import (
 	"context"
 	"errors"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
+
+	"github.com/ntakezo/rogojin/leasing"
 )
 
-// fakeRepo is an in-memory Repository recording saves so tests can assert
-// persistence without sqlite.
+// The leasing behaviour these tests used to cover — pooling, groups, holder
+// caps, durable locks, pins, deletion policies, the usage guard — moved to the
+// leasing package along with the code, where it is exercised once for every
+// resource kind. What is left here is what is actually proxy-specific: the URL
+// payload, the strategy registry, and the translation between this package's
+// shapes and the core's.
+
+// fakeRepo is an in-memory Repository recording what the manager stores, so a
+// test can assert the consumer's store is handed proxy-shaped records.
 type fakeRepo struct {
-	mu      sync.Mutex
 	order   []string
 	records map[string]Proxy
+	groups  map[string]Group
 }
 
 func newFakeRepo(seed ...Proxy) *fakeRepo {
-	r := &fakeRepo{records: map[string]Proxy{}}
+	r := &fakeRepo{records: map[string]Proxy{}, groups: map[string]Group{}}
 	for _, p := range seed {
 		r.records[p.ID] = p
 		r.order = append(r.order, p.ID)
@@ -28,8 +33,6 @@ func newFakeRepo(seed ...Proxy) *fakeRepo {
 }
 
 func (r *fakeRepo) List(ctx context.Context) ([]Proxy, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	out := make([]Proxy, 0, len(r.order))
 	for _, id := range r.order {
 		if p, ok := r.records[id]; ok {
@@ -40,8 +43,6 @@ func (r *fakeRepo) List(ctx context.Context) ([]Proxy, error) {
 }
 
 func (r *fakeRepo) Save(ctx context.Context, p Proxy) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, ok := r.records[p.ID]; !ok {
 		r.order = append(r.order, p.ID)
 	}
@@ -50,618 +51,265 @@ func (r *fakeRepo) Save(ctx context.Context, p Proxy) error {
 }
 
 func (r *fakeRepo) Delete(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	delete(r.records, id)
 	return nil
 }
 
-func (r *fakeRepo) get(t *testing.T, id string) Proxy {
-	t.Helper()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	p, ok := r.records[id]
-	if !ok {
-		t.Fatalf("proxy %s not in repo", id)
+func (r *fakeRepo) ListGroups(ctx context.Context) ([]Group, error) {
+	out := make([]Group, 0, len(r.groups))
+	for _, g := range r.groups {
+		out = append(out, g)
 	}
-	return p
+	return out, nil
 }
 
-func (r *fakeRepo) has(id string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, ok := r.records[id]
-	return ok
+func (r *fakeRepo) SaveGroup(ctx context.Context, g Group) error {
+	r.groups[g.ID] = g
+	return nil
 }
 
-// firstSelection always picks the first candidate, isolating manager mechanics
-// from strategy behavior (which the strategy tests cover).
-type firstSelection struct{}
-
-func (firstSelection) Select(candidates []Proxy) (Proxy, error) {
-	return candidates[0], nil
+func (r *fakeRepo) DeleteGroup(ctx context.Context, id string) error {
+	delete(r.groups, id)
+	return nil
 }
 
-// fixedPolicy returns a fixed decision and records what it was asked about.
-type fixedPolicy struct {
-	decision Decision
-	taskID   string
-	deleted  Proxy
-	calls    int
-}
-
-func (p *fixedPolicy) OnProxyDeleted(ctx context.Context, taskID string, deleted Proxy) Decision {
-	p.calls++
-	p.taskID = taskID
-	p.deleted = deleted
-	return p.decision
-}
-
-func newTestManager(t *testing.T, repo Repository, excl Exclusivity, policy DeletionPolicy) *Manager {
+func newTestManager(t *testing.T, repo Repository, policy DeletionPolicy, opts ...ManagerOption) *Manager {
 	t.Helper()
-	m, err := NewManager(context.Background(), repo, firstSelection{}, excl, policy)
+	m, err := NewManager(context.Background(), repo, policy, opts...)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
 	return m
 }
 
-type acquireResult struct {
-	lease *Lease
-	err   error
-}
-
-// acquireAsync runs Acquire in a goroutine so tests can observe blocking.
-func acquireAsync(ctx context.Context, m *Manager, taskID string) chan acquireResult {
-	ch := make(chan acquireResult, 1)
-	go func() {
-		l, err := m.Acquire(ctx, taskID)
-		ch <- acquireResult{l, err}
-	}()
-	return ch
-}
-
-func mustBlock(t *testing.T, ch chan acquireResult) {
-	t.Helper()
-	select {
-	case res := <-ch:
-		t.Fatalf("expected acquire to block, got lease=%+v err=%v", res.lease, res.err)
-	case <-time.After(50 * time.Millisecond):
-	}
-}
-
-func mustComplete(t *testing.T, ch chan acquireResult) acquireResult {
-	t.Helper()
-	select {
-	case res := <-ch:
-		return res
-	case <-time.After(2 * time.Second):
-		t.Fatal("acquire did not complete")
-		return acquireResult{}
-	}
-}
-
-// TestAcquireEmptyPool verifies an empty pool fails immediately with ErrNoProxies
-// rather than blocking, because waiting can never be satisfied with nothing to rotate.
-func TestAcquireEmptyPool(t *testing.T) {
-	m := newTestManager(t, newFakeRepo(), Exclusive(), nil)
-	if _, err := m.Acquire(context.Background(), "t1"); !errors.Is(err, ErrNoProxies) {
-		t.Fatalf("err = %v, want ErrNoProxies", err)
-	}
-}
-
-// TestNewManagerRejectsInvalidCap verifies a capacity below 1 fails loud at
-// construction, because it would silently deadlock every Acquire.
-func TestNewManagerRejectsInvalidCap(t *testing.T) {
-	if _, err := NewManager(context.Background(), newFakeRepo(), firstSelection{}, Capped(0), nil); err == nil {
-		t.Fatal("expected error for Capped(0)")
-	}
-}
-
-// TestNewManagerRejectsDoubleBinding verifies a repo claiming one task owns two
-// proxies is rejected, because the lock contract is at most one proxy per task.
-func TestNewManagerRejectsDoubleBinding(t *testing.T) {
-	repo := newFakeRepo(
-		Proxy{ID: "p1", OwnerID: "t1"},
-		Proxy{ID: "p2", OwnerID: "t1"},
-	)
-	if _, err := NewManager(context.Background(), repo, firstSelection{}, Exclusive(), nil); err == nil {
-		t.Fatal("expected error for double binding")
-	}
-}
-
-// TestExclusiveBlocksUntilRelease verifies a second task cannot lease an
-// exclusively held proxy until it is released, because Exclusive guarantees one
-// holder at a time.
-func TestExclusiveBlocksUntilRelease(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1", URL: "http://p1"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-
-	lease, err := m.Acquire(context.Background(), "t1")
-	if err != nil {
-		t.Fatalf("first acquire: %v", err)
-	}
-
-	ch := acquireAsync(context.Background(), m, "t2")
-	mustBlock(t, ch)
-
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	res := mustComplete(t, ch)
-	if res.err != nil {
-		t.Fatalf("second acquire: %v", res.err)
-	}
-	if res.lease.Proxy().ID != "p1" {
-		t.Fatalf("got %s, want p1", res.lease.Proxy().ID)
-	}
-}
-
-// TestCappedAllowsConcurrentHolders verifies Capped(2) admits two concurrent
-// leases and blocks the third, because the cap bounds concurrent use per proxy.
-func TestCappedAllowsConcurrentHolders(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	m := newTestManager(t, repo, Capped(2), nil)
+// TestURLTravelsThroughThePool verifies the one field this package adds to the
+// core's record survives everything the core does to it: a store round trip, a
+// lease, a durable lock, and a restart. The core carries it opaquely, so
+// nothing else proves the translation is wired both ways.
+func TestURLTravelsThroughThePool(t *testing.T) {
+	repo := newFakeRepo()
 	ctx := context.Background()
+	m := newTestManager(t, repo, nil)
 
-	l1, err := m.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("first acquire: %v", err)
+	if err := m.AddProxy(ctx, Proxy{ID: "p1", URL: "http://u:p@h1:80"}); err != nil {
+		t.Fatalf("AddProxy: %v", err)
 	}
-	if _, err := m.Acquire(ctx, "t2"); err != nil {
-		t.Fatalf("second acquire under cap: %v", err)
-	}
-
-	ch := acquireAsync(ctx, m, "t3")
-	mustBlock(t, ch)
-
-	if err := l1.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	if res := mustComplete(t, ch); res.err != nil {
-		t.Fatalf("third acquire after release: %v", res.err)
-	}
-}
-
-// TestAcquireHonorsContextCancel verifies a blocked Acquire returns the
-// context's error on cancellation, because blocking must always be escapable.
-func TestAcquireHonorsContextCancel(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-
-	if _, err := m.Acquire(context.Background(), "t1"); err != nil {
-		t.Fatalf("first acquire: %v", err)
+	if stored := repo.records["p1"]; stored.URL != "http://u:p@h1:80" {
+		t.Fatalf("stored URL = %q, want the one added", stored.URL)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := acquireAsync(ctx, m, "t2")
-	mustBlock(t, ch)
-
-	cancel()
-	res := mustComplete(t, ch)
-	if !errors.Is(res.err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", res.err)
-	}
-}
-
-// TestReleaseRecordsOutcomeAndPersists verifies Release(success) feeds the
-// stats bayesian selection learns from and writes them through to the repo so
-// learning survives restarts.
-func TestReleaseRecordsOutcomeAndPersists(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-	ctx := context.Background()
-
-	l1, err := m.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if err := l1.Release(true); err != nil {
-		t.Fatalf("release success: %v", err)
-	}
-	l2, err := m.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if err := l2.Release(false); err != nil {
-		t.Fatalf("release failure: %v", err)
-	}
-
-	p := repo.get(t, "p1")
-	if p.Successes != 1 || p.Failures != 1 {
-		t.Fatalf("persisted stats = %d/%d, want 1/1", p.Successes, p.Failures)
-	}
-}
-
-// TestDoubleReleaseFreesOnce verifies a second Release does not free a slot it
-// no longer holds, or a later acquire could over-admit past the cap.
-func TestDoubleReleaseFreesOnce(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-	ctx := context.Background()
-
-	l, err := m.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if err := l.Release(true); err != nil {
-		t.Fatalf("first release: %v", err)
-	}
-	if err := l.Release(true); err != nil {
-		t.Fatalf("second release should be a no-op, got %v", err)
-	}
-
-	if _, err := m.Acquire(ctx, "t2"); err != nil {
-		t.Fatalf("acquire after release: %v", err)
-	}
-	// if the double release had leaked a slot, this would succeed instead of block.
-	ch := acquireAsync(ctx, m, "t3")
-	mustBlock(t, ch)
-}
-
-// TestLockExcludesProxyFromRotation verifies a locked proxy can never be leased
-// by another task even while idle, because the lock is owner-exclusive past runtime.
-func TestLockExcludesProxyFromRotation(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-
-	l, err := m.Lock(context.Background(), "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	if err := l.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := acquireAsync(ctx, m, "t2")
-	mustBlock(t, ch)
-	cancel()
-	if res := mustComplete(t, ch); !errors.Is(res.err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", res.err)
-	}
-}
-
-// TestLockPersistsBinding verifies the lock lands in the repo as OwnerID,
-// because the binding must be durable past the task's runtime.
-func TestLockPersistsBinding(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-
-	l, err := m.Lock(context.Background(), "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	l.Release(true)
-
-	if owner := repo.get(t, "p1").OwnerID; owner != "t1" {
-		t.Fatalf("persisted OwnerID = %q, want t1", owner)
-	}
-}
-
-// TestAcquireReturnsLockedProxy verifies the owner's Acquire always returns its
-// locked proxy rather than rotating, because reuse is the point of locking.
-func TestAcquireReturnsLockedProxy(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"}, Proxy{ID: "p2"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-	ctx := context.Background()
-
-	l, err := m.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	if l.Proxy().ID != "p1" {
-		t.Fatalf("locked %s, want p1", l.Proxy().ID)
-	}
-	l.Release(true)
-
-	got, err := m.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if got.Proxy().ID != "p1" {
-		t.Fatalf("owner acquired %s, want its locked p1", got.Proxy().ID)
-	}
-}
-
-// TestLockIdempotent verifies a second Lock returns the existing binding
-// instead of binding a second proxy.
-func TestLockIdempotent(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"}, Proxy{ID: "p2"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-	ctx := context.Background()
-
-	l1, err := m.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("first lock: %v", err)
-	}
-	l1.Release(true)
-
-	l2, err := m.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("second lock: %v", err)
-	}
-	if l2.Proxy().ID != "p1" {
-		t.Fatalf("second lock got %s, want p1", l2.Proxy().ID)
-	}
-	if owner := repo.get(t, "p2").OwnerID; owner != "" {
-		t.Fatalf("p2 OwnerID = %q, want unbound", owner)
-	}
-}
-
-// TestReclaimAcrossRestart verifies a manager rebuilt from the same repo hands
-// the owner its locked proxy back, because the binding's durability is the
-// requirement locking exists for.
-func TestReclaimAcrossRestart(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"}, Proxy{ID: "p2"})
-	ctx := context.Background()
-
-	m1 := newTestManager(t, repo, Exclusive(), nil)
-	l, err := m1.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	l.Release(true)
-
-	m2 := newTestManager(t, repo, Exclusive(), nil)
-	got, err := m2.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("acquire after restart: %v", err)
-	}
-	if got.Proxy().ID != "p1" {
-		t.Fatalf("reclaimed %s, want p1", got.Proxy().ID)
-	}
-}
-
-// TestUnlockReturnsProxyToPool verifies Unlock clears the durable binding so
-// other tasks can rotate onto the proxy again.
-func TestUnlockReturnsProxyToPool(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-	ctx := context.Background()
-
-	l, err := m.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	l.Release(true)
-
-	if err := m.Unlock(ctx, "t1"); err != nil {
-		t.Fatalf("unlock: %v", err)
-	}
-	if owner := repo.get(t, "p1").OwnerID; owner != "" {
-		t.Fatalf("persisted OwnerID = %q, want cleared", owner)
-	}
-
-	got, err := m.Acquire(ctx, "t2")
-	if err != nil {
-		t.Fatalf("acquire after unlock: %v", err)
-	}
-	if got.Proxy().ID != "p1" {
-		t.Fatalf("acquired %s, want p1", got.Proxy().ID)
-	}
-}
-
-// TestUnlockWithoutBinding verifies Unlock for an unbound task is a no-op, so
-// callers can unlock defensively.
-func TestUnlockWithoutBinding(t *testing.T) {
-	m := newTestManager(t, newFakeRepo(Proxy{ID: "p1"}), Exclusive(), nil)
-	if err := m.Unlock(context.Background(), "t1"); err != nil {
-		t.Fatalf("unlock without binding: %v", err)
-	}
-}
-
-// TestDeleteUnlockedProxy verifies deleting an unbound proxy removes it without
-// consulting the policy, because no task's fate is in question.
-func TestDeleteUnlockedProxy(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"}, Proxy{ID: "p2"})
-	policy := &fixedPolicy{decision: Reassign}
-	m := newTestManager(t, repo, Exclusive(), policy)
-	ctx := context.Background()
-
-	if err := m.DeleteProxy(ctx, "p1"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if policy.calls != 0 {
-		t.Fatalf("policy consulted %d times for unbound proxy, want 0", policy.calls)
-	}
-	if repo.has("p1") {
-		t.Fatal("p1 still in repo after delete")
-	}
-	got, err := m.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if got.Proxy().ID != "p2" {
-		t.Fatalf("acquired %s, want p2", got.Proxy().ID)
-	}
-}
-
-// TestDeleteLockedProxyReassign verifies the Reassign decision durably rebinds
-// the orphaned task to a freshly selected proxy, even though the task may be offline.
-func TestDeleteLockedProxyReassign(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"}, Proxy{ID: "p2"})
-	policy := &fixedPolicy{decision: Reassign}
-	m := newTestManager(t, repo, Exclusive(), policy)
-	ctx := context.Background()
-
-	l, err := m.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	l.Release(true)
-
-	if err := m.DeleteProxy(ctx, "p1"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if policy.calls != 1 || policy.taskID != "t1" || policy.deleted.ID != "p1" {
-		t.Fatalf("policy saw calls=%d task=%q deleted=%q, want 1/t1/p1", policy.calls, policy.taskID, policy.deleted.ID)
-	}
-	if owner := repo.get(t, "p2").OwnerID; owner != "t1" {
-		t.Fatalf("p2 OwnerID = %q, want rebound to t1", owner)
-	}
-	if repo.has("p1") {
-		t.Fatal("p1 still in repo after delete")
-	}
-
-	got, err := m.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if got.Proxy().ID != "p2" {
-		t.Fatalf("owner acquired %s, want reassigned p2", got.Proxy().ID)
-	}
-}
-
-// TestDeleteLockedProxyUnbind verifies the Unbind decision returns the task to
-// the rotating pool with no replacement binding.
-func TestDeleteLockedProxyUnbind(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"}, Proxy{ID: "p2"})
-	policy := &fixedPolicy{decision: Unbind}
-	m := newTestManager(t, repo, Exclusive(), policy)
-	ctx := context.Background()
-
-	l, err := m.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	l.Release(true)
-
-	if err := m.DeleteProxy(ctx, "p1"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if owner := repo.get(t, "p2").OwnerID; owner != "" {
-		t.Fatalf("p2 OwnerID = %q, want unbound", owner)
-	}
-
-	got, err := m.Acquire(ctx, "t1")
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if got.Proxy().ID != "p2" {
-		t.Fatalf("acquired %s, want rotation onto p2", got.Proxy().ID)
-	}
-}
-
-// TestDeleteLockedProxyFail verifies the Fail decision surfaces ErrTaskOrphaned
-// naming the task, so the deleter can kill or quarantine it.
-func TestDeleteLockedProxyFail(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	policy := &fixedPolicy{decision: Fail}
-	m := newTestManager(t, repo, Exclusive(), policy)
-	ctx := context.Background()
-
-	l, err := m.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	l.Release(true)
-
-	err = m.DeleteProxy(ctx, "p1")
-	if !errors.Is(err, ErrTaskOrphaned) {
-		t.Fatalf("err = %v, want ErrTaskOrphaned", err)
-	}
-	if !strings.Contains(err.Error(), "t1") {
-		t.Fatalf("error %q does not name the orphaned task", err)
-	}
-	if repo.has("p1") {
-		t.Fatal("p1 still in repo after delete")
-	}
-}
-
-// TestDeleteLockedProxyWithoutPolicy verifies deleting a locked proxy with no
-// policy wired fails loud and leaves the proxy intact, because the framework
-// must not orphan a task silently.
-func TestDeleteLockedProxyWithoutPolicy(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1"})
-	m := newTestManager(t, repo, Exclusive(), nil)
-	ctx := context.Background()
-
-	l, err := m.Lock(ctx, "t1")
-	if err != nil {
-		t.Fatalf("lock: %v", err)
-	}
-	l.Release(true)
-
-	if err := m.DeleteProxy(ctx, "p1"); err == nil {
-		t.Fatal("expected error deleting locked proxy without a policy")
-	}
-	if !repo.has("p1") {
-		t.Fatal("p1 deleted despite missing policy")
-	}
-}
-
-// gateRepo wraps fakeRepo to park exactly one armed Save until the gate opens,
-// so a test can force a specific interleaving of concurrent saves.
-type gateRepo struct {
-	*fakeRepo
-	arm     atomic.Bool
-	entered chan struct{}
-	gate    chan struct{}
-}
-
-func (r *gateRepo) Save(ctx context.Context, p Proxy) error {
-	if r.arm.CompareAndSwap(true, false) {
-		close(r.entered)
-		<-r.gate
-	}
-	return r.fakeRepo.Save(ctx, p)
-}
-
-// TestReleaseCannotResurrectStaleLock verifies Release persists atomically with
-// its in-memory update. A Release whose save raced ahead of a concurrent
-// Unlock's could land last with the stale owner still set, so a restart would
-// load a durable lock no live task holds — the proxy would be leased to a
-// ghost forever.
-func TestReleaseCannotResurrectStaleLock(t *testing.T) {
-	repo := &gateRepo{
-		fakeRepo: newFakeRepo(Proxy{ID: "p1", URL: "http://p1"}),
-		entered:  make(chan struct{}),
-		gate:     make(chan struct{}),
-	}
-	m := newTestManager(t, repo, Exclusive(), nil)
-	ctx := context.Background()
-
-	lease, err := m.Lock(ctx, "t1")
+	lease, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("Lock: %v", err)
 	}
-
-	// Arm the gate so Release's save parks mid-flight, then race an Unlock.
-	repo.arm.Store(true)
-	releaseDone := make(chan error, 1)
-	go func() { releaseDone <- lease.Release(true) }()
-	<-repo.entered
-
-	unlockDone := make(chan error, 1)
-	go func() { unlockDone <- m.Unlock(ctx, "t1") }()
-
-	// Give a racy Unlock time to finish before the parked save lands; a correct
-	// Release holds the manager lock across its save, so Unlock cannot pass it.
-	var unlockErr error
-	unlockFinished := false
-	select {
-	case unlockErr = <-unlockDone:
-		unlockFinished = true
-	case <-time.After(100 * time.Millisecond):
+	if lease.Proxy().URL != "http://u:p@h1:80" {
+		t.Fatalf("leased URL = %q, want the one added", lease.Proxy().URL)
 	}
-	close(repo.gate)
-
-	if err := <-releaseDone; err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	if !unlockFinished {
-		unlockErr = <-unlockDone
-	}
-	if unlockErr != nil {
-		t.Fatalf("Unlock: %v", unlockErr)
+	if err := lease.Release(true); err != nil {
+		t.Fatalf("release: %v", err)
 	}
 
-	stored := repo.get(t, "p1")
-	if stored.OwnerID != "" {
-		t.Fatalf("stored owner = %q, want unlocked: a stale Release save must not resurrect the lock", stored.OwnerID)
+	restarted := newTestManager(t, repo, nil)
+	regained, err := restarted.Acquire(ctx, Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("acquire after restart: %v", err)
 	}
-	if stored.Successes != 1 {
-		t.Fatalf("stored successes = %d, want 1: the release outcome must survive the unlock", stored.Successes)
+	if regained.Proxy().URL != "http://u:p@h1:80" {
+		t.Fatalf("URL after restart = %q, want the one added", regained.Proxy().URL)
+	}
+}
+
+// recordingPolicy captures the proxy it is handed, so a test can prove the
+// policy port speaks this package's shape rather than the core's.
+type recordingPolicy struct {
+	deleted Proxy
+	taskID  string
+}
+
+func (p *recordingPolicy) OnProxyDeleted(ctx context.Context, taskID string, deleted Proxy) Decision {
+	p.taskID = taskID
+	p.deleted = deleted
+	return Unbind
+}
+
+// TestDeletionPolicySeesAProxy verifies the port a consumer implements is handed
+// a Proxy with its URL, not the core's record. A policy deciding what to do
+// about a deleted proxy usually wants to log or report which one it was.
+func TestDeletionPolicySeesAProxy(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", URL: "http://h1:80", GroupID: GlobalGroup, OwnerID: "t1"})
+	policy := &recordingPolicy{}
+	ctx := context.Background()
+	m := newTestManager(t, repo, policy, WithUsagePolicy(Usage{}))
+
+	if err := m.DeleteProxy(ctx, "p1"); err != nil {
+		t.Fatalf("DeleteProxy: %v", err)
+	}
+	if policy.taskID != "t1" {
+		t.Fatalf("policy asked about %q, want t1", policy.taskID)
+	}
+	if policy.deleted.ID != "p1" || policy.deleted.URL != "http://h1:80" {
+		t.Fatalf("policy saw %+v, want the full proxy", policy.deleted)
+	}
+}
+
+// urlSelection picks by URL, which only works if the strategy port is handed
+// proxies rather than the core's records.
+type urlSelection struct{ want string }
+
+func (s urlSelection) Select(candidates []Proxy) (Proxy, error) {
+	for _, p := range candidates {
+		if p.URL == s.want {
+			return p, nil
+		}
+	}
+	return Proxy{}, errors.New("no candidate with the wanted URL")
+}
+
+// TestStrategiesSeeProxiesAndTheirPickIsHonored verifies a consumer's selection
+// algorithm receives proxies, and that the proxy it names is the one leased.
+// The core validates the pick by id against its own candidates, so this is what
+// proves the round trip through the adapter keeps them the same records.
+func TestStrategiesSeeProxiesAndTheirPickIsHonored(t *testing.T) {
+	repo := newFakeRepo(
+		Proxy{ID: "p1", URL: "http://h1:80", GroupID: GlobalGroup},
+		Proxy{ID: "p2", URL: "http://h2:80", GroupID: GlobalGroup},
+	)
+	ctx := context.Background()
+	m := newTestManager(t, repo, nil,
+		WithStrategy("by-url", func() Selection { return urlSelection{want: "http://h2:80"} }))
+	if err := m.CreateGroup(ctx, Group{ID: "picky", Strategy: "by-url"}); err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	if err := m.AddProxy(ctx, Proxy{ID: "p3", URL: "http://h2:80", GroupID: "picky"}); err != nil {
+		t.Fatalf("AddProxy: %v", err)
+	}
+	if err := m.AddProxy(ctx, Proxy{ID: "p4", URL: "http://h4:80", GroupID: "picky"}); err != nil {
+		t.Fatalf("AddProxy: %v", err)
+	}
+
+	lease, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "picky"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if lease.Proxy().ID != "p3" {
+		t.Fatalf("leased %s, want p3 — the one the strategy chose by URL", lease.Proxy().ID)
+	}
+}
+
+// TestBuiltInStrategiesAreRegistered verifies both names this package documents
+// resolve, that an unknown one is refused, and that WithStrategy can replace a
+// built-in — the documented way to make bayesian deterministic.
+func TestBuiltInStrategiesAreRegistered(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{StrategyRoundRobin, StrategyBayesian, ""} {
+		repo := newFakeRepo(Proxy{ID: "p1", URL: "http://h1:80", GroupID: "g"})
+		repo.SaveGroup(ctx, Group{ID: "g", Strategy: name})
+		m := newTestManager(t, repo, nil)
+		if _, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "g"}); err != nil {
+			t.Fatalf("acquire under strategy %q: %v", name, err)
+		}
+	}
+
+	repo := newFakeRepo()
+	repo.SaveGroup(ctx, Group{ID: "g", Strategy: "retired"})
+	if _, err := NewManager(ctx, repo, nil); err == nil {
+		t.Fatal("expected a group naming an unregistered strategy to be refused")
+	}
+
+	// Overriding a built-in is how a consumer seeds the sampler for a test.
+	overridden := newFakeRepo(Proxy{ID: "p1", URL: "http://h1:80", GroupID: "g"})
+	overridden.SaveGroup(ctx, Group{ID: "g", Strategy: StrategyBayesian})
+	m := newTestManager(t, overridden, nil,
+		WithStrategy(StrategyBayesian, func() Selection { return NewBayesian(WithSeed(1)) }))
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "g"}); err != nil {
+		t.Fatalf("acquire under an overridden built-in: %v", err)
+	}
+}
+
+// TestAssignmentPinTravelsAsTheProxyID verifies this package's ProxyID reaches
+// the core as its ResourceID: the two structs are spelled differently, and a
+// pin silently dropped in translation would look like ordinary rotation.
+func TestAssignmentPinTravelsAsTheProxyID(t *testing.T) {
+	repo := newFakeRepo(
+		Proxy{ID: "p1", URL: "http://h1:80", GroupID: GlobalGroup},
+		Proxy{ID: "p2", URL: "http://h2:80", GroupID: GlobalGroup},
+	)
+	ctx := context.Background()
+	m := newTestManager(t, repo, nil)
+
+	lease, err := m.Acquire(ctx, Assignment{TaskID: "t1", ProxyID: "p2"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if lease.Proxy().ID != "p2" {
+		t.Fatalf("leased %s, want the pinned p2", lease.Proxy().ID)
+	}
+	if err := m.CheckAssignment(Assignment{TaskID: "t1", ProxyID: "p2"}); err != nil {
+		t.Fatalf("CheckAssignment on a good pin: %v", err)
+	}
+	if err := m.CheckAssignment(Assignment{TaskID: "t1", ProxyID: "ghost"}); !errors.Is(err, ErrProxyNotFound) {
+		t.Fatalf("err = %v, want ErrProxyNotFound", err)
+	}
+}
+
+// TestSentinelsAliasTheCore verifies every error this package documents is the
+// core's, so errors.Is answers the same question either side of the boundary. A
+// sentinel that drifted into a private copy would silently stop matching.
+func TestSentinelsAliasTheCore(t *testing.T) {
+	for _, pair := range []struct {
+		name  string
+		here  error
+		there error
+	}{
+		{"ErrNoProxies", ErrNoProxies, leasing.ErrNoResources},
+		{"ErrGroupNotFound", ErrGroupNotFound, leasing.ErrGroupNotFound},
+		{"ErrGroupInUse", ErrGroupInUse, leasing.ErrGroupInUse},
+		{"ErrProxyInUse", ErrProxyInUse, leasing.ErrResourceInUse},
+		{"ErrProxyNotFound", ErrProxyNotFound, leasing.ErrResourceNotFound},
+		{"ErrProxyNotInGroup", ErrProxyNotInGroup, leasing.ErrResourceNotInGroup},
+		{"ErrProxyLocked", ErrProxyLocked, leasing.ErrResourceLocked},
+		{"ErrPinConflict", ErrPinConflict, leasing.ErrPinConflict},
+		{"ErrTaskOrphaned", ErrTaskOrphaned, leasing.ErrTaskOrphaned},
+	} {
+		if pair.here != pair.there {
+			t.Fatalf("%s is not the core sentinel", pair.name)
+		}
+	}
+}
+
+// TestUsageWiresEachQuestionToItsOwnFunc verifies the three closures land on the
+// three questions the guard asks, and that a nil one reports nothing rather
+// than panicking — the state a consumer with only a task service has.
+func TestUsageWiresEachQuestionToItsOwnFunc(t *testing.T) {
+	repo := newFakeRepo(Proxy{ID: "p1", URL: "http://h1:80", GroupID: GlobalGroup})
+	ctx := context.Background()
+	asked := map[string]string{}
+	m := newTestManager(t, repo, nil, WithUsagePolicy(Usage{
+		RunningInGroup: func(ctx context.Context, groupID string) ([]string, error) {
+			asked["group"] = groupID
+			return nil, nil
+		},
+		PinnedToProxy: func(ctx context.Context, proxyID string) ([]string, error) {
+			asked["pinned"] = proxyID
+			return []string{"t9"}, nil
+		},
+	}))
+
+	impact, err := m.DeletionImpact(ctx, "p1")
+	if err != nil {
+		t.Fatalf("DeletionImpact: %v", err)
+	}
+	if asked["group"] != GlobalGroup {
+		t.Fatalf("RunningInGroup asked about %q, want the global group", asked["group"])
+	}
+	if asked["pinned"] != "p1" {
+		t.Fatalf("PinnedToProxy asked about %q, want p1", asked["pinned"])
+	}
+	if len(impact.Pinned) != 1 || impact.Pinned[0] != "t9" {
+		t.Fatalf("pinned = %v, want [t9]", impact.Pinned)
+	}
+	// TaskRunning was left nil, and the guard neither panicked nor refused.
+	if len(impact.Running) != 0 {
+		t.Fatalf("running = %v, want none", impact.Running)
 	}
 }

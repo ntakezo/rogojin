@@ -2,8 +2,10 @@ package proxysqlite
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ntakezo/rogojin/proxies"
 )
@@ -115,6 +117,198 @@ func TestListEmpty(t *testing.T) {
 	}
 	if len(listed) != 0 {
 		t.Fatalf("got %d proxies, want 0", len(listed))
+	}
+}
+
+// TestGroupAndHolderPolicyRoundTrip verifies a proxy's group and holder policy
+// survive storage, including UnlimitedHolders — a negative sentinel a naive
+// unsigned column would mangle into a cap nobody asked for.
+func TestGroupAndHolderPolicyRoundTrip(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	for _, p := range []proxies.Proxy{
+		{ID: "inherit", GroupID: "residential"},
+		{ID: "capped", GroupID: "residential", MaxHolders: 4},
+		{ID: "unlimited", GroupID: "datacenter", MaxHolders: proxies.UnlimitedHolders},
+	} {
+		if err := repo.Save(ctx, p); err != nil {
+			t.Fatalf("save %s: %v", p.ID, err)
+		}
+	}
+
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	byID := map[string]proxies.Proxy{}
+	for _, p := range listed {
+		byID[p.ID] = p
+	}
+	if got := byID["inherit"]; got.GroupID != "residential" || got.MaxHolders != 0 {
+		t.Fatalf("inherit = %+v, want group residential, policy 0", got)
+	}
+	if got := byID["capped"]; got.MaxHolders != 4 {
+		t.Fatalf("capped MaxHolders = %d, want 4", got.MaxHolders)
+	}
+	if got := byID["unlimited"]; got.MaxHolders != proxies.UnlimitedHolders || got.GroupID != "datacenter" {
+		t.Fatalf("unlimited = %+v, want group datacenter, policy %d", got, proxies.UnlimitedHolders)
+	}
+}
+
+// TestProxyTimestampsRoundTrip verifies stamped times survive storage to the
+// millisecond, so a consumer can tell when a proxy was added and last used.
+func TestProxyTimestampsRoundTrip(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	updated := time.Now().UTC().Truncate(time.Millisecond)
+	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", CreatedAt: created, UpdatedAt: updated}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !listed[0].CreatedAt.Equal(created) || !listed[0].UpdatedAt.Equal(updated) {
+		t.Fatalf("timestamps = %v/%v, want %v/%v", listed[0].CreatedAt, listed[0].UpdatedAt, created, updated)
+	}
+}
+
+// TestCreatedAtSurvivesUpserts verifies a re-save never revises creation time.
+// Every lease outcome re-saves its proxy, so a Save that carried created_at
+// through would let routine stat updates rewrite when a proxy was added.
+func TestCreatedAtSurvivesUpserts(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	created := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Millisecond)
+	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", CreatedAt: created, UpdatedAt: created}); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	later := time.Now().UTC().Truncate(time.Millisecond)
+	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", Successes: 1, CreatedAt: later, UpdatedAt: later}); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !listed[0].CreatedAt.Equal(created) {
+		t.Fatalf("CreatedAt = %v, want the original %v", listed[0].CreatedAt, created)
+	}
+	if !listed[0].UpdatedAt.Equal(later) {
+		t.Fatalf("UpdatedAt = %v, want %v", listed[0].UpdatedAt, later)
+	}
+
+	if err := repo.SaveGroup(ctx, proxies.Group{ID: "g", CreatedAt: created, UpdatedAt: created}); err != nil {
+		t.Fatalf("first SaveGroup: %v", err)
+	}
+	if err := repo.SaveGroup(ctx, proxies.Group{ID: "g", MaxHolders: 3, CreatedAt: later, UpdatedAt: later}); err != nil {
+		t.Fatalf("second SaveGroup: %v", err)
+	}
+	groups, _ := repo.ListGroups(ctx)
+	if !groups[0].CreatedAt.Equal(created) {
+		t.Fatalf("group CreatedAt = %v, want the original %v", groups[0].CreatedAt, created)
+	}
+	if groups[0].MaxHolders != 3 {
+		t.Fatalf("group MaxHolders = %d, want the updated 3", groups[0].MaxHolders)
+	}
+}
+
+// TestGroupCRUD verifies a proxy group round-trips with its strategy and
+// holder policy, lists in id order, and deletes cleanly.
+func TestGroupCRUD(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	if listed, err := repo.ListGroups(ctx); err != nil || len(listed) != 0 {
+		t.Fatalf("ListGroups on empty store = %v, err %v; want empty, nil", listed, err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	g := proxies.Group{ID: "residential", Strategy: proxies.StrategyBayesian, MaxHolders: 3, CreatedAt: now, UpdatedAt: now}
+	if err := repo.SaveGroup(ctx, g); err != nil {
+		t.Fatalf("SaveGroup: %v", err)
+	}
+	if err := repo.SaveGroup(ctx, proxies.Group{ID: "datacenter", MaxHolders: proxies.UnlimitedHolders}); err != nil {
+		t.Fatalf("SaveGroup datacenter: %v", err)
+	}
+
+	listed, err := repo.ListGroups(ctx)
+	if err != nil || len(listed) != 2 {
+		t.Fatalf("ListGroups = %d groups, err %v; want 2, nil", len(listed), err)
+	}
+	if listed[0].ID != "datacenter" || listed[1].ID != "residential" {
+		t.Fatalf("groups not in id order: %+v", listed)
+	}
+	if listed[0].MaxHolders != proxies.UnlimitedHolders {
+		t.Fatalf("datacenter MaxHolders = %d, want %d", listed[0].MaxHolders, proxies.UnlimitedHolders)
+	}
+	if got := listed[1]; got.Strategy != proxies.StrategyBayesian || got.MaxHolders != 3 || !got.CreatedAt.Equal(now) {
+		t.Fatalf("residential = %+v, want bayesian/3/%v", got, now)
+	}
+
+	if err := repo.DeleteGroup(ctx, "residential"); err != nil {
+		t.Fatalf("DeleteGroup: %v", err)
+	}
+	listed, _ = repo.ListGroups(ctx)
+	if len(listed) != 1 || listed[0].ID != "datacenter" {
+		t.Fatalf("after delete: %+v, want [datacenter]", listed)
+	}
+}
+
+// TestLegacyProxiesLandInGlobalGroup verifies the group migration places
+// pre-group proxies in the global namespace, so an upgraded pool keeps
+// rotating instead of referencing a group that does not exist.
+func TestLegacyProxiesLandInGlobalGroup(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "legacy.db")
+
+	raw, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE proxies (
+		id        TEXT PRIMARY KEY,
+		url       TEXT NOT NULL DEFAULT '',
+		owner_id  TEXT NOT NULL DEFAULT '',
+		successes INTEGER NOT NULL DEFAULT 0,
+		failures  INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO proxies (id, url, owner_id, successes, failures)
+		VALUES ('p1', 'http://h:80', 't1', 7, 3)`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	raw.Close()
+
+	repo, err := NewSQLite(dsn)
+	if err != nil {
+		t.Fatalf("NewSQLite on legacy db: %v", err)
+	}
+	t.Cleanup(func() { repo.Close() })
+
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("got %d proxies, want 1", len(listed))
+	}
+	got := listed[0]
+	if got.GroupID != proxies.GlobalGroup {
+		t.Fatalf("GroupID = %q, want %q", got.GroupID, proxies.GlobalGroup)
+	}
+	if got.OwnerID != "t1" || got.Successes != 7 || got.Failures != 3 || got.URL != "http://h:80" {
+		t.Fatalf("legacy row not preserved: %+v", got)
+	}
+	if got.MaxHolders != 0 {
+		t.Fatalf("MaxHolders = %d, want 0 (inherit the group's policy)", got.MaxHolders)
 	}
 }
 

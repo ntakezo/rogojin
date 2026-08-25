@@ -1,5 +1,12 @@
-// Package tasks creates and manages tasks: long-running processes that
-// execute workflow graphs with durable checkpoints and recovery.
+// Package tasks creates and manages tasks: long-running processes that execute
+// workflow graphs with durable checkpoints and recovery. Tasks are collected
+// into named groups, and a task or a whole group may be assigned, per resource
+// kind, the group its runs lease from — a task assigned none of a kind runs
+// without that resource.
+//
+// A kind is just a string the consumer picks to name one leasing manager
+// ("proxy", "account", "card"). This package stores and resolves placements
+// under it and never interprets it, so a new resource kind needs no change here.
 package tasks
 
 import (
@@ -18,6 +25,11 @@ import (
 // deleted and re-created.
 var ErrNoCheckpoint = errors.New("task has no checkpoint to resume from")
 
+// ErrTaskDeleted is returned by Start on a task the service has deleted, or is
+// in the middle of deleting. Its record is gone, so a run would checkpoint into
+// nothing; the handle is dead and the task must be re-created.
+var ErrTaskDeleted = errors.New("task deleted")
+
 // ErrAlreadyTerminal is returned by Start on a task recovered with a terminal
 // outcome (done or killed): its run is over, and re-executing the final state
 // would duplicate side effects. A failed task is not terminal and may be
@@ -27,6 +39,11 @@ var ErrAlreadyTerminal = errors.New("task already reached a terminal outcome")
 // A Task is a long-running process executing one workflow's graph.
 type Task interface {
 	ID() string
+	// Assignment reports the placement this task leases the kind under: the
+	// group, and the one resource it is pinned to within it. Both are resolved
+	// at creation or recovery from the task's own assignment or its task
+	// group's, and are "" for a kind the task leases nothing of.
+	Assignment(kind string) (groupID, resourceID string)
 	// Start executes the task synchronously until completion, error, or kill,
 	// returning the workflow's output on clean completion. The output is nil if
 	// the workflow produces none, or if the run errors or is killed. A run whose
@@ -52,9 +69,10 @@ type Task interface {
 }
 
 type task struct {
-	id     string
-	input  any
-	engine *engine
+	id          string
+	input       any
+	assignments map[string]workflows.Assignment
+	engine      *engine
 
 	// recovered marks a task rebuilt from a snapshot; Start resumes at
 	// resumeAt with snapshot instead of executing input from the beginning.
@@ -65,26 +83,29 @@ type task struct {
 }
 
 // createTask validates input against the workflow and returns a new unstarted
-// Task. The caller must not modify input after creation.
-func createTask(workflow workflows.Workflow, input any, bus comms.Bus, repo Repository) (Task, error) {
+// task whose instance leases each kind under assignments, already resolved.
+// The caller must not modify input or assignments after creation.
+func createTask(workflow workflows.Workflow, input any, bus comms.Bus, repo Repository, assignments map[string]workflows.Assignment) (*task, error) {
 	if err := workflow.ValidateInput(input); err != nil {
 		return nil, fmt.Errorf("task input validation error: %w", err)
 	}
 
 	id := uuid.NewString()
 	return &task{
-		id:     id,
-		input:  input,
-		engine: newEngine(workflow, workflows.Deps{TaskID: id, Bus: bus}, repo),
+		id:          id,
+		input:       input,
+		assignments: assignments,
+		engine:      newEngine(workflow, workflows.Deps{TaskID: id, Bus: bus, Assignments: assignments}, repo),
 	}, nil
 }
 
 // rehydrateTask rebuilds a task from a persisted snapshot so Start resumes at
 // resumeAt. status is the persisted lifecycle reported until the task starts.
-func rehydrateTask(workflow workflows.Workflow, id string, snapshot []byte, resumeAt workflows.State, status workflows.Status, bus comms.Bus, repo Repository) Task {
+func rehydrateTask(workflow workflows.Workflow, id string, snapshot []byte, resumeAt workflows.State, status workflows.Status, bus comms.Bus, repo Repository, assignments map[string]workflows.Assignment) *task {
 	return &task{
 		id:              id,
-		engine:          newEngine(workflow, workflows.Deps{TaskID: id, Bus: bus}, repo),
+		assignments:     assignments,
+		engine:          newEngine(workflow, workflows.Deps{TaskID: id, Bus: bus, Assignments: assignments}, repo),
 		recovered:       true,
 		snapshot:        snapshot,
 		resumeAt:        resumeAt,
@@ -94,6 +115,21 @@ func rehydrateTask(workflow workflows.Workflow, id string, snapshot []byte, resu
 
 func (t *task) ID() string {
 	return t.id
+}
+
+func (t *task) Assignment(kind string) (groupID, resourceID string) {
+	a := t.assignments[kind]
+	return a.GroupID, a.ResourceID
+}
+
+// seal latches the task closed for deletion, reporting false if it is live.
+func (t *task) seal() bool {
+	return t.engine.seal()
+}
+
+// unseal reopens a task sealed for a deletion that was abandoned.
+func (t *task) unseal() {
+	t.engine.unseal()
 }
 
 func (t *task) Start(ctx context.Context) ([]byte, error) {
