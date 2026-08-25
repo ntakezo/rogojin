@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1181,8 +1182,10 @@ type reassignCall struct {
 	taskID, kind, groupID, resourceID string
 }
 
-func (r *reassignSpy) fn() ReassignFunc {
-	return func(ctx context.Context, taskID, kind, groupID, resourceID string) error {
+// forKind returns the stale-lock release to register under kind, tagging each
+// call with it so a test can tell which kind's manager was asked.
+func (r *reassignSpy) forKind(kind string) StaleLockFunc {
+	return func(ctx context.Context, taskID, groupID, resourceID string) error {
 		r.calls = append(r.calls, reassignCall{taskID, kind, groupID, resourceID})
 		return r.err
 	}
@@ -1196,7 +1199,9 @@ func (r *reassignSpy) fn() ReassignFunc {
 func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 	store := newMemStore()
 	spy := &reassignSpy{}
-	svc := NewService(store, comms.NewBus(), WithTaskReassigner(spy.fn()))
+	svc := NewService(store, comms.NewBus(),
+		WithResource(proxyKind, nil, spy.forKind(proxyKind)),
+		WithResource(accountKind, nil, spy.forKind(accountKind)))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1244,7 +1249,9 @@ func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 	store := newMemStore()
 	spy := &reassignSpy{}
-	svc := NewService(store, comms.NewBus(), WithTaskReassigner(spy.fn()))
+	svc := NewService(store, comms.NewBus(),
+		WithResource(proxyKind, nil, spy.forKind(proxyKind)),
+		WithResource(accountKind, nil, spy.forKind(accountKind)))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1287,7 +1294,9 @@ func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 func TestAssignResourceInheritsGroupForTheReleaser(t *testing.T) {
 	store := newMemStore()
 	spy := &reassignSpy{}
-	svc := NewService(store, comms.NewBus(), WithTaskReassigner(spy.fn()))
+	svc := NewService(store, comms.NewBus(),
+		WithResource(proxyKind, nil, spy.forKind(proxyKind)),
+		WithResource(accountKind, nil, spy.forKind(accountKind)))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1386,6 +1395,127 @@ func TestPinnedTasksSeesUnstartedLiveTasks(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != task.ID() {
 		t.Fatalf("PinnedTasks = %v, want [%s]", got, task.ID())
+	}
+}
+
+// unlockSpy records which kinds were asked to unlock a task, in order, and can
+// be made to fail for one of them.
+type unlockSpy struct {
+	mu      sync.Mutex
+	kinds   []string
+	failFor string
+}
+
+func (u *unlockSpy) forKind(kind string) ReleaseFunc {
+	return func(ctx context.Context, taskID string) error {
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		u.kinds = append(u.kinds, kind)
+		if kind == u.failFor {
+			return errors.New("store down")
+		}
+		return nil
+	}
+}
+
+func (u *unlockSpy) asked() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.kinds...)
+}
+
+// TestDeleteUnlocksEveryRegisteredKind verifies a deletion frees every kind's
+// durable lock, not just the first. A lock nothing releases is unleasable
+// forever, so a task holding a proxy and an account must give back both.
+func TestDeleteUnlocksEveryRegisteredKind(t *testing.T) {
+	unlocks := &unlockSpy{}
+	general := &releaseSpy{}
+	svc, _, wf := newDepsService(t,
+		WithTaskReleaser(general.release),
+		WithResource(proxyKind, unlocks.forKind(proxyKind), nil),
+		WithResource(accountKind, unlocks.forKind(accountKind), nil))
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := svc.DeleteTask(ctx, task.ID()); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+
+	if got := unlocks.asked(); len(got) != 2 || got[0] != proxyKind || got[1] != accountKind {
+		t.Fatalf("unlocked %v, want both kinds in registration order", got)
+	}
+	// The general releaser is for whatever no resource kind describes, so it
+	// runs alongside them rather than instead of them.
+	if len(general.calls()) != 1 {
+		t.Fatalf("general releaser ran %d times, want 1", len(general.calls()))
+	}
+}
+
+// TestReleaseAttemptsEveryKindDespiteAFailure verifies one broken manager does
+// not strand the locks the others would have freed. Every unlock is attempted,
+// the error names the kind that failed, and the deletion still aborts — a task
+// whose locks are only partly freed must not lose the record that says so.
+func TestReleaseAttemptsEveryKindDespiteAFailure(t *testing.T) {
+	unlocks := &unlockSpy{failFor: proxyKind}
+	svc, store, wf := newDepsService(t,
+		WithResource(proxyKind, unlocks.forKind(proxyKind), nil),
+		WithResource(accountKind, unlocks.forKind(accountKind), nil))
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	err = svc.DeleteTask(ctx, task.ID())
+	if err == nil {
+		t.Fatal("DeleteTask succeeded, want the proxy unlock failure surfaced")
+	}
+	if !strings.Contains(err.Error(), proxyKind) {
+		t.Fatalf("error = %v, want the failing kind named", err)
+	}
+	if got := unlocks.asked(); len(got) != 2 {
+		t.Fatalf("unlocked %v, want both attempted despite the failure", got)
+	}
+	if _, err := store.RecoverTask(ctx, task.ID()); err != nil {
+		t.Fatalf("record gone after an aborted deletion: %v", err)
+	}
+}
+
+// TestRegisteringAKindTwicePanics verifies the one wiring mistake WithResource
+// can detect. Two registrations of a kind could only unlock it twice, and the
+// second unlock would land on whatever task took the resource next.
+func TestRegisteringAKindTwicePanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("no panic: a kind registered twice would be unlocked twice")
+		}
+	}()
+	NewService(newMemStore(), comms.NewBus(),
+		WithResource(proxyKind, nil, nil),
+		WithResource(proxyKind, nil, nil))
+}
+
+// TestAssignResourceWithoutARegisteredKind verifies placement still lands for a
+// kind no manager is wired for. The record is the service's to write; releasing
+// a lock is the manager's, and there is no manager here to hold one.
+func TestAssignResourceWithoutARegisteredKind(t *testing.T) {
+	svc, store, wf := newDepsService(t)
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	group := "residential"
+	if err := svc.AssignResource(ctx, task.ID(), proxyKind, Assignment{GroupID: &group}); err != nil {
+		t.Fatalf("AssignResource: %v", err)
+	}
+	record := store.record(t, task.ID())
+	if stored := record.Assignments[proxyKind].GroupID; stored == nil || *stored != "residential" {
+		t.Fatalf("stored group = %v, want residential", stored)
 	}
 }
 

@@ -131,7 +131,7 @@ type service struct {
 
 	release ReleaseFunc
 
-	reassign ReassignFunc
+	resources []resource
 
 	workflowRegistryMu sync.RWMutex
 	taskRegistryMu     sync.RWMutex
@@ -499,14 +499,15 @@ func (s *service) AssignResource(ctx context.Context, id string, kind string, as
 	if err := s.repository.SaveAssignment(ctx, id, kind, assignment); err != nil {
 		return fmt.Errorf("failed to assign %s placement of task %s: %w", kind, id, err)
 	}
-	if s.reassign == nil {
+	stale := s.staleLockReleaser(kind)
+	if stale == nil {
 		return nil
 	}
 
 	// The releaser is told the placement as resolved, not as stored: a nil group
 	// inherits the task group's, which is what the task will actually lease from.
 	resolved := resolve(assignment, group, kind)
-	if err := s.reassign(ctx, id, kind, resolved.GroupID, resolved.ResourceID); err != nil {
+	if err := stale(ctx, id, resolved.GroupID, resolved.ResourceID); err != nil {
 		return fmt.Errorf("failed to release the stale %s lock of task %s: %w", kind, id, err)
 	}
 	return nil
@@ -541,13 +542,38 @@ func (s *service) deleteTaskLocked(ctx context.Context, id string) error {
 	return s.repository.DeleteTask(ctx, id)
 }
 
-// releaseTask runs the configured releaser for the task, if any.
+// releaseTask frees everything bound to the task: the general releaser, then
+// every registered kind's unlock. All of them run even when one fails — a lock
+// left held is unleasable forever, so one broken store must not strand the
+// locks the other managers would have freed.
 func (s *service) releaseTask(ctx context.Context, id string) error {
-	if s.release == nil {
+	var errs []error
+	if s.release != nil {
+		if err := s.release(ctx, id); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, r := range s.resources {
+		if r.unlock == nil {
+			continue
+		}
+		if err := r.unlock(ctx, id); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", r.kind, err))
+		}
+	}
+	if len(errs) == 0 {
 		return nil
 	}
-	if err := s.release(ctx, id); err != nil {
-		return fmt.Errorf("failed to release resources of task %s: %w", id, err)
+	return fmt.Errorf("failed to release resources of task %s: %w", id, errors.Join(errs...))
+}
+
+// staleLockReleaser returns the registered stale-lock release for the kind, or
+// nil when no manager of that kind is wired.
+func (s *service) staleLockReleaser(kind string) StaleLockFunc {
+	for _, r := range s.resources {
+		if r.kind == kind {
+			return r.stale
+		}
 	}
 	return nil
 }

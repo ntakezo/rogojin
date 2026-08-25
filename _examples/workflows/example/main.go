@@ -9,7 +9,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -35,64 +34,34 @@ func main() {
 	defer forward.Close()
 
 	// The manager is built first but the task service answers "is this in use?",
-	// so the usage guard closes over svc and resolves it at call time.
+	// so the guard reads svc at call time. It carries the kind, which is all
+	// that separates one manager's guard from another's.
 	var svc tasks.Service
 	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{ID: "local-1", URL: forward.URL}), nil,
-		proxies.WithUsagePolicy(proxies.Usage{
-			RunningInGroup: func(ctx context.Context, groupID string) ([]string, error) {
-				return svc.RunningTasks(ctx, states.ProxyKind, groupID)
-			},
-			TaskRunning: func(ctx context.Context, taskID string) (bool, error) {
-				return svc.TaskIsRunning(ctx, taskID)
-			},
-			PinnedToProxy: func(ctx context.Context, proxyID string) ([]string, error) {
-				return svc.PinnedTasks(ctx, states.ProxyKind, proxyID)
-			},
-		}))
+		proxies.WithUsagePolicy(tasks.NewGuard(&svc, states.ProxyKind)))
 	if err != nil {
 		log.Fatalf("proxy manager: %v", err)
 	}
 
-	// Accounts are the same machinery minus the rotation knob, and — because the
-	// task record now files a placement under every kind — the same three-part
-	// guard. Each half asks under its own kind, so the account group named
-	// "global" is never confused with the proxy group of the same name.
+	// Accounts are the same machinery minus the rotation knob, guarded the same
+	// way against the same service — only the kind differs, so the account group
+	// named "global" is never confused with the proxy group of the same name.
 	accountManager, err := accounts.NewManager(ctx, newMemAccountRepo(accounts.Account{
 		ID:      "buyer-1",
 		GroupID: accounts.GlobalGroup,
 		Fields:  profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
-	}), nil, accounts.WithUsagePolicy(accounts.Usage{
-		RunningInGroup: func(ctx context.Context, groupID string) ([]string, error) {
-			return svc.RunningTasks(ctx, states.AccountKind, groupID)
-		},
-		TaskRunning: func(ctx context.Context, taskID string) (bool, error) {
-			return svc.TaskIsRunning(ctx, taskID)
-		},
-		PinnedToAccount: func(ctx context.Context, accountID string) ([]string, error) {
-			return svc.PinnedTasks(ctx, states.AccountKind, accountID)
-		},
-	}))
+	}), nil, accounts.WithUsagePolicy(tasks.NewGuard(&svc, states.AccountKind)))
 	if err != nil {
 		log.Fatalf("account manager: %v", err)
 	}
 
-	// Both kinds of lock outlive the process, so deleting a task must free both.
-	// The reassigner is told which kind moved, so each manager drops only the
-	// lock its own new placement no longer fits — repointing a task's proxies
-	// must not cost it the account it is halfway through a checkout as.
+	// Both kinds of lock outlive the process, so each manager registers under its
+	// kind: deleting a task unlocks both, while repointing one drops only the
+	// lock that moved — a task sent to other proxies must keep the account it is
+	// halfway through a checkout as.
 	svc = tasks.NewService(newMemRepo(), comms.NewBus(),
-		tasks.WithTaskReleaser(func(ctx context.Context, taskID string) error {
-			return errors.Join(manager.Unlock(ctx, taskID), accountManager.Unlock(ctx, taskID))
-		}),
-		tasks.WithTaskReassigner(func(ctx context.Context, taskID, kind, groupID, resourceID string) error {
-			switch kind {
-			case states.ProxyKind:
-				return manager.ReleaseStaleLock(ctx, proxies.Assignment{TaskID: taskID, GroupID: groupID, ProxyID: resourceID})
-			case states.AccountKind:
-				return accountManager.ReleaseStaleLock(ctx, accounts.Assignment{TaskID: taskID, GroupID: groupID, AccountID: resourceID})
-			}
-			return nil
-		}))
+		tasks.WithResource(states.ProxyKind, manager.Unlock, proxies.StaleLockReleaser(manager)),
+		tasks.WithResource(states.AccountKind, accountManager.Unlock, accounts.StaleLockReleaser(accountManager)))
 	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager, accountManager)); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}

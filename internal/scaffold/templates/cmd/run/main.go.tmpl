@@ -47,22 +47,11 @@ func main() {
 {{- end}}
 
 	// The task service answers "is this proxy in use?", so the guard that keeps
-	// a live proxy or group from being deleted resolves svc at call time. Every
-	// question is asked under this manager's kind, so a second resource kind
-	// added later answers for itself.
+	// a live proxy or group from being deleted reads svc at call time. It
+	// carries the resource kind, so a second kind added later gets its own.
 	var svc tasks.Service
 	manager, err := proxies.NewManager(ctx, proxyRepo, nil,
-		proxies.WithUsagePolicy(proxies.Usage{
-			RunningInGroup: func(ctx context.Context, groupID string) ([]string, error) {
-				return svc.RunningTasks(ctx, "proxy", groupID)
-			},
-			TaskRunning: func(ctx context.Context, taskID string) (bool, error) {
-				return svc.TaskIsRunning(ctx, taskID)
-			},
-			PinnedToProxy: func(ctx context.Context, proxyID string) ([]string, error) {
-				return svc.PinnedTasks(ctx, "proxy", proxyID)
-			},
-		}))
+		proxies.WithUsagePolicy(tasks.NewGuard(&svc, "proxy")))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -81,17 +70,12 @@ func main() {
 	// recovery. Swap in tasksqlite (or your own Repository) for durability.
 {{- end}}
 {{- if .Proxy}}
-	// Proxy locks outlive the process, so deleting a task must free its own.
-	// Releaser frees a deleted task's durable proxy lock; reassigner drops one a
-	// repointed task's new placement no longer fits. Nothing else ever clears them.
+	// Proxy locks outlive the process, so the manager registers under its kind:
+	// deleting a task frees its lock, and repointing one drops the lock its new
+	// placement no longer fits. Nothing else ever clears them. Add a second kind
+	// the same way.
 	svc = tasks.NewService({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
-		tasks.WithTaskReleaser(manager.Unlock),
-		tasks.WithTaskReassigner(func(ctx context.Context, taskID, kind, groupID, resourceID string) error {
-			if kind != "proxy" {
-				return nil
-			}
-			return manager.ReleaseStaleLock(ctx, proxies.Assignment{TaskID: taskID, GroupID: groupID, ProxyID: resourceID})
-		}))
+		tasks.WithResource("proxy", manager.Unlock, proxies.StaleLockReleaser(manager)))
 
 	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New(manager)); err != nil {
 		log.Fatal(err)
