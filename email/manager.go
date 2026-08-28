@@ -28,9 +28,10 @@ func WithListenerErrorHandler(fn func(emailID string, err error)) Option {
 	return func(m *Manager) { m.errHandler = fn }
 }
 
-// withDialer substitutes the IMAP dialer, so tests can serve scripted
-// mailboxes without a server.
-func withDialer(d dialer) Option {
+// WithDialer substitutes how listeners and backfills open their sessions,
+// so tests and examples can serve scripted mail without a vendor. Left
+// alone, the manager dials the vendor's IMAP endpoint.
+func WithDialer(d Dialer) Option {
 	return func(m *Manager) { m.dial = d }
 }
 
@@ -40,7 +41,7 @@ func withDialer(d dialer) Option {
 // whose filter matches. A Manager is safe for concurrent use.
 type Manager struct {
 	repo        Repository
-	dial        dialer
+	dial        Dialer
 	dropHandler func(emailID, taskID string, dropped uint64)
 	errHandler  func(emailID string, err error)
 

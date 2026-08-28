@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"time"
 
 	example_checkout "github.com/ntakezo/rogojin/_examples/workflows/example/checkout"
 	"github.com/ntakezo/rogojin/_examples/workflows/example/checkout/states"
@@ -28,7 +29,12 @@ import (
 func main() {
 	ctx := context.Background()
 
-	site := newSite()
+	// The mail server stands in for the vendor: the site's login handler
+	// "sends" the verification mail by delivering into it, and the email
+	// manager's listeners dial it instead of imap.gmail.com.
+	mailServer := newMemMailServer()
+
+	site := newSite(mailServer.deliver)
 	defer site.Close()
 
 	forward := newForwardProxy()
@@ -49,7 +55,7 @@ func main() {
 		ID:      "inbox-1",
 		Address: "orders@example.com",
 		Inbox:   &email.Inbox{Vendor: email.Gmail, Auth: email.Auth{Kind: email.AuthPassword, Password: "app-password"}},
-	}))
+	}), email.WithDialer(mailServer.dial))
 	if err != nil {
 		log.Fatalf("email manager: %v", err)
 	}
@@ -80,7 +86,7 @@ func main() {
 	svc := tasks.NewService(newMemRepo(), comms.NewBus(),
 		tasks.WithResource(states.ProxyKind, manager),
 		tasks.WithResource(states.AccountKind, accountManager))
-	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager, accountManager)); err != nil {
+	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager, accountManager, emailManager)); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}
 
@@ -173,11 +179,25 @@ func newForwardProxy() *httptest.Server {
 	}))
 }
 
-// newSite serves the canned product, cart, and checkout responses the workflow drives against.
-func newSite() *httptest.Server {
+// newSite serves the canned product, login, cart, and checkout responses the
+// workflow drives against. The login handler answers by mail: it delivers
+// the verification message — link and all — into the forwarding inbox.
+func newSite(deliver func(email.Message)) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/product", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"variantID": "variant-M", "csrfToken": "csrf-abc"})
+	})
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		deliver(email.Message{
+			From:    states.VerificationSender,
+			Subject: "confirm your sign-in",
+			Text:    "Follow http://" + r.Host + "/follow?token=tok-123 to finish signing in.",
+			Date:    time.Now(),
+		})
+		json.NewEncoder(w).Encode(map[string]string{"status": "mail-sent"})
+	})
+	mux.HandleFunc("/follow", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "verified"})
 	})
 	mux.HandleFunc("/cart", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"cartID": "cart-123"})
@@ -186,6 +206,97 @@ func newSite() *httptest.Server {
 		json.NewEncoder(w).Encode(map[string]string{"orderID": "order-999", "status": "confirmed"})
 	})
 	return httptest.NewServer(mux)
+}
+
+// memMailServer stands in for the vendor's IMAP host: it holds the inbox's
+// mail and serves email.Mailbox sessions to the manager's listeners and
+// backfills, waking idlers as mail lands.
+type memMailServer struct {
+	mu      sync.Mutex
+	nextUID uint32
+	msgs    []email.Message
+	wakes   map[chan struct{}]struct{}
+}
+
+func newMemMailServer() *memMailServer {
+	return &memMailServer{nextUID: 1, wakes: make(map[chan struct{}]struct{})}
+}
+
+// deliver lands one message on the server and wakes every idling session.
+func (s *memMailServer) deliver(msg email.Message) {
+	s.mu.Lock()
+	msg.UID = s.nextUID
+	s.nextUID++
+	if msg.Date.IsZero() {
+		msg.Date = time.Now()
+	}
+	s.msgs = append(s.msgs, msg)
+	for wake := range s.wakes {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *memMailServer) dial(e email.Email) (email.Mailbox, error) {
+	wake := make(chan struct{}, 1)
+	s.mu.Lock()
+	s.wakes[wake] = struct{}{}
+	s.mu.Unlock()
+	return &mailSession{server: s, wake: wake}, nil
+}
+
+type mailSession struct {
+	server *memMailServer
+	wake   chan struct{}
+}
+
+func (m *mailSession) Select(ctx context.Context) (uint32, uint32, error) {
+	m.server.mu.Lock()
+	defer m.server.mu.Unlock()
+	return 1, m.server.nextUID - 1, nil
+}
+
+func (m *mailSession) FetchSince(ctx context.Context, uid uint32) ([]email.Message, error) {
+	m.server.mu.Lock()
+	defer m.server.mu.Unlock()
+	out := make([]email.Message, 0)
+	for _, msg := range m.server.msgs {
+		if msg.UID > uid {
+			out = append(out, msg)
+		}
+	}
+	return out, nil
+}
+
+func (m *mailSession) FetchSinceDate(ctx context.Context, since time.Time) ([]email.Message, error) {
+	m.server.mu.Lock()
+	defer m.server.mu.Unlock()
+	out := make([]email.Message, 0)
+	for _, msg := range m.server.msgs {
+		if !msg.Date.Before(since) {
+			out = append(out, msg)
+		}
+	}
+	return out, nil
+}
+
+func (m *mailSession) Idle(ctx context.Context) error {
+	select {
+	case <-m.wake:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *mailSession) Close() error {
+	m.server.mu.Lock()
+	delete(m.server.wakes, m.wake)
+	m.server.mu.Unlock()
+	return nil
 }
 
 // memProxyRepo is a minimal in-memory proxies.Repository seeded with a fixed

@@ -7,13 +7,14 @@ import (
 	"time"
 )
 
-// mailbox is what the listener loop needs from an IMAP session; the real
-// implementation wraps go-imap, tests substitute a scripted fake. Select
-// reports the mailbox's UIDVALIDITY and its current last UID, FetchSince
-// returns messages with UIDs strictly above uid, FetchSinceDate returns
-// messages dated on or after since (the backfill path), and Idle returns
-// nil when new mail may exist or an error when the session broke.
-type mailbox interface {
+// A Mailbox is one authenticated session against an inbox — the seam
+// between a listener and the wire. The production implementation wraps
+// go-imap; tests and examples substitute scripted fakes through WithDialer.
+// Select reports the mailbox's UIDVALIDITY and its current last UID,
+// FetchSince returns messages with UIDs strictly above uid, FetchSinceDate
+// returns messages dated on or after since (the backfill path), and Idle
+// returns nil when new mail may exist or an error when the session broke.
+type Mailbox interface {
 	Select(ctx context.Context) (uidValidity, lastUID uint32, err error)
 	FetchSince(ctx context.Context, uid uint32) ([]Message, error)
 	FetchSinceDate(ctx context.Context, since time.Time) ([]Message, error)
@@ -21,8 +22,8 @@ type mailbox interface {
 	Close() error
 }
 
-// A dialer opens an authenticated mailbox session for one email.
-type dialer func(e Email) (mailbox, error)
+// A Dialer opens an authenticated Mailbox session for one email.
+type Dialer func(e Email) (Mailbox, error)
 
 // Reconnect backoff bounds: doubling from backoffFloor, capped at
 // backoffCeil, reset after a serve that stayed up healthyAfter.

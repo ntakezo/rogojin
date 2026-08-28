@@ -101,7 +101,7 @@ func (f *fakeServer) deliver(msg Message) {
 	f.mu.Unlock()
 }
 
-func (f *fakeServer) dial(e Email) (mailbox, error) {
+func (f *fakeServer) dial(e Email) (Mailbox, error) {
 	f.dials.Add(1)
 	wake := make(chan struct{}, 1)
 	f.mu.Lock()
@@ -174,7 +174,7 @@ func testEmail(id string) Email {
 
 func newTestManager(t *testing.T, repo Repository, server *fakeServer, opts ...Option) *Manager {
 	t.Helper()
-	m, err := NewManager(context.Background(), repo, append([]Option{withDialer(server.dial)}, opts...)...)
+	m, err := NewManager(context.Background(), repo, append([]Option{WithDialer(server.dial)}, opts...)...)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}

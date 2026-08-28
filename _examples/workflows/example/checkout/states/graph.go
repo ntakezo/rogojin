@@ -9,6 +9,8 @@ func (c *Context) Graph() workflows.Graph {
 	return workflows.NewGraph(getHomepage, workflows.States{
 		getHomepage:    c.GetHomepage,
 		waitInQueue:    c.WaitInQueue,
+		login:          c.Login,
+		followLink:     c.FollowLink,
 		addToCart:      c.AddToCart,
 		submitCheckout: c.SubmitCheckout,
 	})

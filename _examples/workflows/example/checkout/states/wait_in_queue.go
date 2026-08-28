@@ -44,5 +44,5 @@ func (c *Context) WaitInQueue(ctx context.Context) (*workflows.State, error) {
 		}
 	}
 
-	return workflows.Next(addToCart), nil
+	return workflows.Next(login), nil
 }
