@@ -14,8 +14,8 @@
 //
 // Accounts are also where the email package's inboxes meet tasks: an
 // account or its group names a forwarding inbox, ForwardingEmail resolves
-// which one is in effect, and EmailDeleteGuard keeps a referenced email
-// from being deleted out from under a running task.
+// which one is in effect, and a manager built WithEmail keeps a referenced
+// email from being deleted out from under a running task.
 //
 // Fields are stored verbatim, in the clear: credentials are only as
 // protected as the Repository behind them. An implementation that encrypts
@@ -77,10 +77,46 @@ type Manager = leasing.Manager[Attrs]
 // A Lease is a live hold on one account. Release it exactly once when done.
 type Lease = leasing.Lease[Attrs]
 
+// An Option configures what NewManager wires up around the leasing core.
+type Option func(*config)
+
+type config struct {
+	email *email.Manager
+}
+
+// WithEmail hands the manager the email inventory its accounts forward to.
+// It closes the referential loop: the email manager learns to refuse
+// deleting an inbox while an account forwarding to it is held by a live
+// lease, and to report the tasks an idle durable lock would strand.
+func WithEmail(m *email.Manager) Option {
+	if m == nil {
+		panic("accounts: WithEmail requires a manager")
+	}
+	return func(c *config) { c.email = m }
+}
+
 // NewManager loads the groups and pool from the repository, persisting the
-// global group if absent.
-func NewManager(ctx context.Context, repo Repository) (*Manager, error) {
-	return leasing.NewManager(ctx, repo)
+// global group if absent. Given WithEmail, it also installs the account
+// side of the email delete policy — see WithEmail.
+func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {
+	var cfg config
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	m, err := leasing.NewManager(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.email != nil {
+		cfg.email.GuardDeletes(func(emailID string) (held, locked []string) {
+			if emailID == "" {
+				return nil, nil
+			}
+			ref := func(a Account, g Group) bool { return ForwardingEmail(a, g) == emailID }
+			return taskIDs(m.Held(ref)), taskIDs(m.Locked(ref))
+		})
+	}
+	return m, nil
 }
 
 // Bind decodes the consumer half of the account — Attrs.Fields — into F. An
@@ -106,22 +142,6 @@ func ForwardingEmail(a Account, g Group) string {
 		return a.Attrs.EmailID
 	}
 	return g.Refs[EmailRef]
-}
-
-// EmailDeleteGuard adapts the manager into the referential check
-// email.Manager.Delete consults: which tasks hold a live lease on — and
-// which merely durably lock — an account whose effective forwarding inbox
-// is the email in question. Wire it at construction:
-//
-//	email.NewManager(ctx, repo, email.WithDeleteGuard(accounts.EmailDeleteGuard(accountMgr)))
-func EmailDeleteGuard(m *Manager) email.DeleteGuard {
-	return func(emailID string) (held, locked []string) {
-		if emailID == "" {
-			return nil, nil
-		}
-		ref := func(a Account, g Group) bool { return ForwardingEmail(a, g) == emailID }
-		return taskIDs(m.Held(ref)), taskIDs(m.Locked(ref))
-	}
 }
 
 // taskIDs flattens assignments to their task ids, deduplicated in report

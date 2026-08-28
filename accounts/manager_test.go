@@ -3,9 +3,12 @@ package accounts
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/leasing"
 )
 
@@ -194,60 +197,87 @@ func TestForwardingEmailPrefersTheAccountOverItsGroup(t *testing.T) {
 	}
 }
 
-// TestEmailDeleteGuardSeesHeldAndLockedAccounts verifies the guard reports
-// exactly what email.Manager.Delete needs: tasks live-leasing a referencing
-// account under held, tasks merely durably locked under locked, resolved
-// through both attachment levels.
-func TestEmailDeleteGuardSeesHeldAndLockedAccounts(t *testing.T) {
-	repo := newFakeRepo()
+// memEmailRepo is a minimal in-memory email.Repository, enough to stand up
+// a real email manager for the WithEmail wiring test.
+type memEmailRepo struct {
+	mu   sync.Mutex
+	rows map[string]email.Email
+}
+
+func (r *memEmailRepo) List(ctx context.Context) ([]email.Email, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]email.Email, 0, len(r.rows))
+	for _, e := range r.rows {
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func (r *memEmailRepo) Save(ctx context.Context, e email.Email) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows[e.ID] = e
+	return nil
+}
+
+func (r *memEmailRepo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.rows, id)
+	return nil
+}
+
+// TestWithEmailProtectsReferencedInboxes verifies the wiring WithEmail
+// exists for: once the account manager holds the email manager, deleting an
+// inbox a live-leased account forwards to refuses and names the task, and
+// deleting one only idle durable locks point at reports those tasks as
+// stranded — resolved through both attachment levels.
+func TestWithEmailProtectsReferencedInboxes(t *testing.T) {
 	ctx := context.Background()
-	m, err := NewManager(ctx, repo)
+	emails, err := email.NewManager(ctx, &memEmailRepo{rows: map[string]email.Email{
+		"inbox-1": {ID: "inbox-1", Address: "fwd@example.com"},
+	}})
+	if err != nil {
+		t.Fatalf("email manager: %v", err)
+	}
+	defer emails.Close()
+
+	m, err := NewManager(ctx, newFakeRepo(), WithEmail(emails))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
 	if err := m.CreateGroup(ctx, Group{ID: "pool", Refs: map[string]string{EmailRef: "inbox-1"}}); err != nil {
 		t.Fatalf("create group: %v", err)
 	}
-	seed := []Account{
-		{ID: "a-own", Attrs: Attrs{EmailID: "inbox-1"}},
-		{ID: "a-inherit", GroupID: "pool"},
-		{ID: "a-other", Attrs: Attrs{EmailID: "inbox-2"}},
+	if err := m.Add(ctx, Account{ID: "a-own", Attrs: Attrs{EmailID: "inbox-1"}}); err != nil {
+		t.Fatalf("add a-own: %v", err)
 	}
-	for _, a := range seed {
-		if err := m.Add(ctx, a); err != nil {
-			t.Fatalf("add %s: %v", a.ID, err)
-		}
+	if err := m.Add(ctx, Account{ID: "a-inherit", GroupID: "pool"}); err != nil {
+		t.Fatalf("add a-inherit: %v", err)
 	}
-	guard := EmailDeleteGuard(m)
 
 	live, err := m.Acquire(ctx, Assignment{TaskID: "t-live", ResourceID: "a-own"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
+	if _, err := emails.Delete(ctx, "inbox-1"); !errors.Is(err, email.ErrEmailInUse) || !strings.Contains(err.Error(), "t-live") {
+		t.Fatalf("delete err = %v, want ErrEmailInUse naming t-live", err)
+	}
+
+	// The group-level attachment guards too: t-idle keeps only its durable
+	// lock, so the delete goes through and reports whom it stranded.
 	idle, err := m.Lock(ctx, Assignment{TaskID: "t-idle", GroupID: "pool"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	idle.Release(true) // the lock stays; only the lease ends
-	other, err := m.Acquire(ctx, Assignment{TaskID: "t-other", ResourceID: "a-other"})
-	if err != nil {
-		t.Fatalf("acquire other: %v", err)
-	}
-	defer other.Release(true)
-
-	held, locked := guard("inbox-1")
-	if len(held) != 1 || held[0] != "t-live" {
-		t.Fatalf("held = %v, want only t-live", held)
-	}
-	if len(locked) != 1 || locked[0] != "t-idle" {
-		t.Fatalf("locked = %v, want only t-idle", locked)
-	}
-
+	idle.Release(true)
 	live.Release(true)
-	if held, _ := guard("inbox-1"); len(held) != 0 {
-		t.Fatalf("held after release = %v, want none", held)
+	stranded, err := emails.Delete(ctx, "inbox-1")
+	if err != nil {
+		t.Fatalf("delete with only idle locks: %v", err)
 	}
-	if held, locked := guard(""); held != nil || locked != nil {
-		t.Fatalf("guard of empty id = %v/%v, want nothing", held, locked)
+	if len(stranded) != 1 || stranded[0] != "t-idle" {
+		t.Fatalf("stranded = %v, want the idle-locked t-idle", stranded)
 	}
 }
