@@ -357,9 +357,9 @@ subscription.
   at-least-once across restarts. Subscribers that care must deduplicate by
   `MessageID`.
 - **Reconnect.** On any connection error: exponential backoff (1s doubling
-  to 2m, ±jitter), re-dial, resume from the persisted cursor. Errors are
-  reported through `WithListenerErrorHandler`; the loop never gives up while
-  subscribers remain.
+  to 2m, reset after 30s of healthy service), re-dial, resume from the
+  persisted cursor. Errors are reported through `WithListenerErrorHandler`;
+  the loop never gives up while subscribers remain.
 - **Teardown.** The last `Close` covering an inbox logs out and removes the
   listener from the registry. `Close` removes the subscription from the
   fan-out set under the manager lock before closing its channel, so a
@@ -493,8 +493,9 @@ unexported seam so the loop is testable without a server:
 // mailbox is what the listener loop needs from an IMAP session; the real
 // implementation wraps go-imap, tests substitute a scripted fake.
 type mailbox interface {
-	Select(ctx context.Context) (uidValidity uint32, err error)
+	Select(ctx context.Context) (uidValidity, lastUID uint32, err error)
 	FetchSince(ctx context.Context, uid uint32) ([]Message, error)
+	FetchSinceDate(ctx context.Context, since time.Time) ([]Message, error) // backfill
 	Idle(ctx context.Context) error // returns when new mail may exist
 	Close() error
 }
