@@ -47,16 +47,11 @@ func main() {
 	// An in-memory proxy pool to get started. Seed it with real proxies, or
 	// swap in proxysqlite for a durable pool.
 	proxyRepo := newMemProxyRepo(
-		proxies.Proxy{ID: "proxy-1", URL: "http://127.0.0.1:8080"},
+		proxies.Proxy{ID: "proxy-1", Attrs: proxies.Attrs{URL: "http://127.0.0.1:8080"}},
 	)
 {{- end}}
 
-	// The task service answers "is this proxy in use?", so the guard that keeps
-	// a live proxy or group from being deleted reads svc at call time. It
-	// carries the resource kind, so a second kind added later gets its own.
-	var svc tasks.Service
-	manager, err := proxies.NewManager(ctx, proxyRepo, nil,
-		proxies.WithUsagePolicy(tasks.NewGuard(&svc, "proxy")))
+	manager, err := proxies.NewManager(ctx, proxyRepo)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -79,8 +74,8 @@ func main() {
 	// deleting a task frees its lock, and repointing one drops the lock its new
 	// placement no longer fits. Nothing else ever clears them. Add a second kind
 	// the same way.
-	svc = tasks.NewService({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
-		tasks.WithResource("proxy", manager.Unlock, proxies.StaleLockReleaser(manager)))
+	svc := tasks.NewService({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
+		tasks.WithResource("proxy", manager))
 
 	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New(manager)); err != nil {
 		log.Fatal(err)

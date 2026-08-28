@@ -32,8 +32,8 @@ func TestSaveListRoundTrip(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	locked := proxies.Proxy{ID: "p1", URL: "http://u:p@h1:80", OwnerID: "t1", Successes: 3, Failures: 2}
-	free := proxies.Proxy{ID: "p2", URL: "http://h2:80"}
+	locked := proxies.Proxy{ID: "p1", Attrs: proxies.Attrs{URL: "http://u:p@h1:80"}, OwnerID: "t1", Successes: 3, Failures: 2}
+	free := proxies.Proxy{ID: "p2", Attrs: proxies.Attrs{URL: "http://h2:80"}}
 	if err := repo.Save(ctx, locked); err != nil {
 		t.Fatalf("save locked: %v", err)
 	}
@@ -66,10 +66,10 @@ func TestSaveUpserts(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", URL: "http://h:80"}); err != nil {
+	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", Attrs: proxies.Attrs{URL: "http://h:80"}}); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
-	updated := proxies.Proxy{ID: "p1", URL: "http://h:80", OwnerID: "t1", Successes: 5, Failures: 1}
+	updated := proxies.Proxy{ID: "p1", Attrs: proxies.Attrs{URL: "http://h:80"}, OwnerID: "t1", Successes: 5, Failures: 1}
 	if err := repo.Save(ctx, updated); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
@@ -207,20 +207,20 @@ func TestCreatedAtSurvivesUpserts(t *testing.T) {
 	if err := repo.SaveGroup(ctx, proxies.Group{ID: "g", CreatedAt: created, UpdatedAt: created}); err != nil {
 		t.Fatalf("first SaveGroup: %v", err)
 	}
-	if err := repo.SaveGroup(ctx, proxies.Group{ID: "g", MaxHolders: 3, CreatedAt: later, UpdatedAt: later}); err != nil {
+	if err := repo.SaveGroup(ctx, proxies.Group{ID: "g", Strategy: proxies.StrategyBayesian, CreatedAt: later, UpdatedAt: later}); err != nil {
 		t.Fatalf("second SaveGroup: %v", err)
 	}
 	groups, _ := repo.ListGroups(ctx)
 	if !groups[0].CreatedAt.Equal(created) {
 		t.Fatalf("group CreatedAt = %v, want the original %v", groups[0].CreatedAt, created)
 	}
-	if groups[0].MaxHolders != 3 {
-		t.Fatalf("group MaxHolders = %d, want the updated 3", groups[0].MaxHolders)
+	if groups[0].Strategy != proxies.StrategyBayesian {
+		t.Fatalf("group Strategy = %q, want the updated bayesian", groups[0].Strategy)
 	}
 }
 
-// TestGroupCRUD verifies a proxy group round-trips with its strategy and
-// holder policy, lists in id order, and deletes cleanly.
+// TestGroupCRUD verifies a proxy group round-trips with its strategy, lists in
+// id order, and deletes cleanly.
 func TestGroupCRUD(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
@@ -230,11 +230,11 @@ func TestGroupCRUD(t *testing.T) {
 	}
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	g := proxies.Group{ID: "residential", Strategy: proxies.StrategyBayesian, MaxHolders: 3, CreatedAt: now, UpdatedAt: now}
+	g := proxies.Group{ID: "residential", Strategy: proxies.StrategyBayesian, CreatedAt: now, UpdatedAt: now}
 	if err := repo.SaveGroup(ctx, g); err != nil {
 		t.Fatalf("SaveGroup: %v", err)
 	}
-	if err := repo.SaveGroup(ctx, proxies.Group{ID: "datacenter", MaxHolders: proxies.UnlimitedHolders}); err != nil {
+	if err := repo.SaveGroup(ctx, proxies.Group{ID: "datacenter"}); err != nil {
 		t.Fatalf("SaveGroup datacenter: %v", err)
 	}
 
@@ -245,11 +245,11 @@ func TestGroupCRUD(t *testing.T) {
 	if listed[0].ID != "datacenter" || listed[1].ID != "residential" {
 		t.Fatalf("groups not in id order: %+v", listed)
 	}
-	if listed[0].MaxHolders != proxies.UnlimitedHolders {
-		t.Fatalf("datacenter MaxHolders = %d, want %d", listed[0].MaxHolders, proxies.UnlimitedHolders)
+	if listed[0].Strategy != "" {
+		t.Fatalf("datacenter Strategy = %q, want the empty default", listed[0].Strategy)
 	}
-	if got := listed[1]; got.Strategy != proxies.StrategyBayesian || got.MaxHolders != 3 || !got.CreatedAt.Equal(now) {
-		t.Fatalf("residential = %+v, want bayesian/3/%v", got, now)
+	if got := listed[1]; got.Strategy != proxies.StrategyBayesian || !got.CreatedAt.Equal(now) {
+		t.Fatalf("residential = %+v, want bayesian/%v", got, now)
 	}
 
 	if err := repo.DeleteGroup(ctx, "residential"); err != nil {
@@ -304,7 +304,7 @@ func TestLegacyProxiesLandInGlobalGroup(t *testing.T) {
 	if got.GroupID != proxies.GlobalGroup {
 		t.Fatalf("GroupID = %q, want %q", got.GroupID, proxies.GlobalGroup)
 	}
-	if got.OwnerID != "t1" || got.Successes != 7 || got.Failures != 3 || got.URL != "http://h:80" {
+	if got.OwnerID != "t1" || got.Successes != 7 || got.Failures != 3 || got.Attrs.URL != "http://h:80" {
 		t.Fatalf("legacy row not preserved: %+v", got)
 	}
 	if got.MaxHolders != 0 {
@@ -323,7 +323,7 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSQLite: %v", err)
 	}
-	saved := proxies.Proxy{ID: "p1", URL: "http://h:80", OwnerID: "t1", Successes: 7, Failures: 3}
+	saved := proxies.Proxy{ID: "p1", Attrs: proxies.Attrs{URL: "http://h:80"}, OwnerID: "t1", Successes: 7, Failures: 3}
 	if err := repo.Save(ctx, saved); err != nil {
 		t.Fatalf("save: %v", err)
 	}

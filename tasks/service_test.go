@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ntakezo/rogojin/comms"
+	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/workflows"
 )
 
@@ -219,18 +220,6 @@ func (m *memStore) DeleteGroup(ctx context.Context, id string) error {
 	defer m.mu.Unlock()
 	delete(m.groups, id)
 	return nil
-}
-
-func (m *memStore) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]Record, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]Record, 0)
-	for _, rec := range m.records {
-		if pin := rec.Assignments[kind].ResourceID; pin != nil && *pin == resourceID {
-			out = append(out, rec)
-		}
-	}
-	return out, nil
 }
 
 func (m *memStore) TasksInGroup(ctx context.Context, groupID string) ([]string, error) {
@@ -535,27 +524,63 @@ func TestRecoveredTaskResolvesInheritedResourceGroups(t *testing.T) {
 	}
 }
 
-// releaseSpy records the tasks it was asked to release and can be made to fail.
-type releaseSpy struct {
-	mu       sync.Mutex
-	released []string
-	err      error
+// fakeManager implements ResourceManager, recording every unlock and
+// stale-lock release it is asked for and optionally failing them. It stands in
+// for a leasing manager, whose real implementations these calls come off
+// structurally.
+type fakeManager struct {
+	mu        sync.Mutex
+	unlocked  []string
+	stales    []leasing.Assignment
+	unlockErr error
+	staleErr  error
+	// onUnlock, when set, runs inside Unlock so a test can interpose on the
+	// release moment of a deletion or a cascade.
+	onUnlock func(taskID string)
 }
 
-func (r *releaseSpy) release(ctx context.Context, taskID string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.err != nil {
-		return r.err
+func (f *fakeManager) Unlock(ctx context.Context, taskID string) error {
+	f.mu.Lock()
+	hook := f.onUnlock
+	f.mu.Unlock()
+	if hook != nil {
+		hook(taskID)
 	}
-	r.released = append(r.released, taskID)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.unlockErr != nil {
+		return f.unlockErr
+	}
+	f.unlocked = append(f.unlocked, taskID)
 	return nil
 }
 
-func (r *releaseSpy) calls() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]string(nil), r.released...)
+func (f *fakeManager) ReleaseStaleLock(ctx context.Context, a leasing.Assignment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.staleErr != nil {
+		return f.staleErr
+	}
+	f.stales = append(f.stales, a)
+	return nil
+}
+
+func (f *fakeManager) unlocks() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.unlocked...)
+}
+
+func (f *fakeManager) staleCalls() []leasing.Assignment {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]leasing.Assignment(nil), f.stales...)
+}
+
+func (f *fakeManager) setUnlockErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unlockErr = err
 }
 
 // TestDeleteTaskReleasesResources verifies deleting a task releases its
@@ -563,8 +588,8 @@ func (r *releaseSpy) calls() []string {
 // so a delete that skipped this would strand a resource bound to a task that no
 // longer exists — unleasable forever.
 func TestDeleteTaskReleasesResources(t *testing.T) {
-	spy := &releaseSpy{}
-	svc, store, wf := newDepsService(t, WithTaskReleaser(spy.release))
+	manager := &fakeManager{}
+	svc, store, wf := newDepsService(t, WithResource(proxyKind, manager))
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)
@@ -575,8 +600,8 @@ func TestDeleteTaskReleasesResources(t *testing.T) {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 
-	if got := spy.calls(); len(got) != 1 || got[0] != task.ID() {
-		t.Fatalf("released %v, want [%s]", got, task.ID())
+	if got := manager.unlocks(); len(got) != 1 || got[0] != task.ID() {
+		t.Fatalf("unlocked %v, want [%s]", got, task.ID())
 	}
 	if _, err := store.RecoverTask(ctx, task.ID()); err == nil {
 		t.Fatal("record survived delete")
@@ -587,8 +612,8 @@ func TestDeleteTaskReleasesResources(t *testing.T) {
 // deletion, keeping the record so the caller can retry. Dropping the task
 // anyway would lose the only handle on the resource still held.
 func TestDeleteTaskAbortsOnReleaseFailure(t *testing.T) {
-	spy := &releaseSpy{err: errors.New("proxy store down")}
-	svc, store, wf := newDepsService(t, WithTaskReleaser(spy.release))
+	manager := &fakeManager{unlockErr: errors.New("proxy store down")}
+	svc, store, wf := newDepsService(t, WithResource(proxyKind, manager))
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)
@@ -603,9 +628,7 @@ func TestDeleteTaskAbortsOnReleaseFailure(t *testing.T) {
 	}
 	if !svc.IsRunning(task.ID()) {
 		// still registered: a second attempt must be possible.
-		spy.mu.Lock()
-		spy.err = nil
-		spy.mu.Unlock()
+		manager.setUnlockErr(nil)
 		if err := svc.DeleteTask(ctx, task.ID()); err != nil {
 			t.Fatalf("retry DeleteTask: %v", err)
 		}
@@ -615,8 +638,8 @@ func TestDeleteTaskAbortsOnReleaseFailure(t *testing.T) {
 // TestDeleteGroupCascades verifies deleting a task group deletes its member
 // tasks — releasing each one's resources — and leaves other groups alone.
 func TestDeleteGroupCascades(t *testing.T) {
-	spy := &releaseSpy{}
-	svc, store, wf := newDepsService(t, WithTaskReleaser(spy.release))
+	manager := &fakeManager{}
+	svc, store, wf := newDepsService(t, WithResource(proxyKind, manager))
 	ctx := context.Background()
 
 	for _, id := range []string{"ga", "gb"} {
@@ -640,8 +663,8 @@ func TestDeleteGroupCascades(t *testing.T) {
 	if _, err := store.RecoverTask(ctx, b1.ID()); err != nil {
 		t.Fatalf("cascade leaked into gb: %v", err)
 	}
-	if got := spy.calls(); len(got) != 2 {
-		t.Fatalf("released %v, want both members", got)
+	if got := manager.unlocks(); len(got) != 2 {
+		t.Fatalf("unlocked %v, want both members", got)
 	}
 	if _, found, _ := store.GetGroup(ctx, "ga"); found {
 		t.Fatal("group record survived delete")
@@ -663,7 +686,8 @@ func TestDeleteGroupSealsMembersAgainstMidSweepStart(t *testing.T) {
 	var first, second Task
 	var once sync.Once
 	var startErr error
-	release := func(ctx context.Context, id string) error {
+	manager := &fakeManager{}
+	manager.onUnlock = func(id string) {
 		once.Do(func() {
 			// Race the sweep: start the member that is not being released now.
 			other := first
@@ -681,10 +705,9 @@ func TestDeleteGroupSealsMembersAgainstMidSweepStart(t *testing.T) {
 				startErr = errors.New("Start neither ran nor refused")
 			}
 		})
-		return nil
 	}
 
-	svc := NewService(store, comms.NewBus(), WithTaskReleaser(release))
+	svc := NewService(store, comms.NewBus(), WithResource(proxyKind, manager))
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
 	}
@@ -721,15 +744,15 @@ func TestDeleteGroupReleaseFailureLeavesGroupWhole(t *testing.T) {
 	wf := &depsWorkflow{}
 
 	var calls int
-	release := func(ctx context.Context, id string) error {
+	manager := &fakeManager{}
+	manager.onUnlock = func(id string) {
 		calls++
 		if calls == 2 {
-			return errors.New("proxy store down")
+			manager.setUnlockErr(errors.New("proxy store down"))
 		}
-		return nil
 	}
 
-	svc := NewService(store, comms.NewBus(), WithTaskReleaser(release))
+	svc := NewService(store, comms.NewBus(), WithResource(proxyKind, manager))
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
 	}
@@ -893,59 +916,6 @@ func (i *blockingInstance) Graph() workflows.Graph {
 	})
 }
 
-// TestRunningTasksReportsOnlyLiveLeases verifies the guard a leasing manager
-// consults sees exactly the tasks that would be harmed by deleting a pool:
-// running ones leasing from that group, of that kind. Created-but-unstarted and
-// finished tasks hold nothing; other groups, and other kinds, are none of its
-// business.
-func TestRunningTasksReportsOnlyLiveLeases(t *testing.T) {
-	store := newMemStore()
-	svc := NewService(store, comms.NewBus())
-	blocking := newBlockingWorkflow()
-	quick := &depsWorkflow{}
-	if err := svc.RegisterWorkflow(blocking.ID(), blocking); err != nil {
-		t.Fatalf("RegisterWorkflow blocking: %v", err)
-	}
-	if err := svc.RegisterWorkflow(quick.ID(), quick); err != nil {
-		t.Fatalf("RegisterWorkflow quick: %v", err)
-	}
-	ctx := context.Background()
-
-	live, _ := svc.CreateTask(ctx, blocking.ID(), nil, WithResourceGroup(proxyKind, "residential"))
-	idle, _ := svc.CreateTask(ctx, quick.ID(), nil, WithResourceGroup(proxyKind, "residential"))
-	other, _ := svc.CreateTask(ctx, blocking.ID(), nil, WithResourceGroup(proxyKind, "datacenter"))
-	unplaced, _ := svc.CreateTask(ctx, quick.ID(), nil)
-
-	go live.Start(ctx)
-	<-blocking.entered
-
-	running, err := svc.RunningTasks(ctx, proxyKind, "residential")
-	if err != nil {
-		t.Fatalf("RunningTasks: %v", err)
-	}
-	if len(running) != 1 || running[0] != live.ID() {
-		t.Fatalf("running = %v, want only the started %s, not the unstarted %s", running, live.ID(), idle.ID())
-	}
-	if got, _ := svc.RunningTasks(ctx, proxyKind, "datacenter"); len(got) != 0 {
-		t.Fatalf("datacenter running = %v, want none: %s never started", got, other.ID())
-	}
-	if got, _ := svc.RunningTasks(ctx, proxyKind, ""); len(got) != 0 {
-		t.Fatalf("unplaced running = %v, want none: %s leases nothing", got, unplaced.ID())
-	}
-	// The live task leases residential proxies. An account manager deleting its
-	// own residential group must not be told this run would be harmed.
-	if got, _ := svc.RunningTasks(ctx, accountKind, "residential"); len(got) != 0 {
-		t.Fatalf("residential accounts running = %v, want none: the name belongs to proxies", got)
-	}
-
-	// A finished task releases its hold, so the group frees up.
-	close(blocking.release)
-	waitUntil(t, func() bool { return !svc.IsRunning(live.ID()) })
-	if got, _ := svc.RunningTasks(ctx, proxyKind, "residential"); len(got) != 0 {
-		t.Fatalf("running after completion = %v, want none", got)
-	}
-}
-
 // waitUntil polls cond until it holds or the test times out.
 func waitUntil(t *testing.T, cond func() bool) {
 	t.Helper()
@@ -957,40 +927,6 @@ func waitUntil(t *testing.T, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("condition not met within timeout")
-}
-
-// TestRunningTasksTracksWiredGroupNotRecord verifies the guard reads the group
-// a task is actually leasing from, not the one its record now names. A group
-// reassigned mid-run must not make a live task look idle — the old pool is
-// still in its hands.
-func TestRunningTasksTracksWiredGroupNotRecord(t *testing.T) {
-	store := newMemStore()
-	svc := NewService(store, comms.NewBus())
-	wf := newBlockingWorkflow()
-	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
-		t.Fatalf("RegisterWorkflow: %v", err)
-	}
-	ctx := context.Background()
-
-	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{proxyKind: "residential"}}); err != nil {
-		t.Fatalf("CreateGroup: %v", err)
-	}
-	task, _ := svc.CreateTask(ctx, wf.ID(), nil, InGroup("checkout"))
-	go task.Start(ctx)
-	<-wf.entered
-	defer close(wf.release)
-
-	// Reassign the task group mid-run: the live task still holds residential.
-	if err := store.SaveGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{proxyKind: "datacenter"}}); err != nil {
-		t.Fatalf("SaveGroup: %v", err)
-	}
-	running, _ := svc.RunningTasks(ctx, proxyKind, "residential")
-	if len(running) != 1 || running[0] != task.ID() {
-		t.Fatalf("residential running = %v, want [%s]", running, task.ID())
-	}
-	if got, _ := svc.RunningTasks(ctx, proxyKind, "datacenter"); len(got) != 0 {
-		t.Fatalf("datacenter running = %v, want none: nothing leases it yet", got)
-	}
 }
 
 // TestGroupCreationRefusals verifies the global group cannot be re-created or
@@ -1025,12 +961,10 @@ func TestGroupCreationRefusals(t *testing.T) {
 	}
 }
 
-// TestUsageGuardReadsSuspendedAsIdle verifies the guard a leasing manager
-// consults treats a suspended task as idle, both group-wide and per task. That
-// is the escape hatch a refused deletion points at: a parked task holds
-// no request in flight, so its pool can be edited without stranding one. The
-// task is still live — IsRunning keeps saying so — it is simply not advancing.
-func TestUsageGuardReadsSuspendedAsIdle(t *testing.T) {
+// TestIsRunningReadsSuspendedAsLive verifies a suspended task still counts as
+// running for the service: it is parked, not finished, and a deletion must
+// still refuse it.
+func TestIsRunningReadsSuspendedAsLive(t *testing.T) {
 	store := newMemStore()
 	svc := NewService(store, comms.NewBus())
 	var log []workflows.State
@@ -1040,19 +974,12 @@ func TestUsageGuardReadsSuspendedAsIdle(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(proxyKind, "residential"))
+	task, err := svc.CreateTask(ctx, wf.ID(), nil)
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
 	go task.Start(ctx)
 	<-wf.entered
-
-	if got, _ := svc.RunningTasks(ctx, proxyKind, "residential"); len(got) != 1 || got[0] != task.ID() {
-		t.Fatalf("running = %v, want [%s]", got, task.ID())
-	}
-	if live, _ := svc.TaskIsRunning(ctx, task.ID()); !live {
-		t.Fatal("TaskIsRunning = false for a task mid-state")
-	}
 
 	// Suspend parks the task at the next state boundary.
 	if err := task.Suspend(); err != nil {
@@ -1061,38 +988,17 @@ func TestUsageGuardReadsSuspendedAsIdle(t *testing.T) {
 	close(wf.release)
 	waitUntil(t, func() bool { return task.Status() == workflows.StatusSuspended })
 
-	if got, _ := svc.RunningTasks(ctx, proxyKind, "residential"); len(got) != 0 {
-		t.Fatalf("running while suspended = %v, want none: the pool is free to edit", got)
-	}
-	if live, _ := svc.TaskIsRunning(ctx, task.ID()); live {
-		t.Fatal("TaskIsRunning = true while suspended")
-	}
 	if !svc.IsRunning(task.ID()) {
 		t.Fatal("IsRunning = false while suspended: parked is not finished")
 	}
+	if err := svc.DeleteTask(ctx, task.ID()); err == nil {
+		t.Fatal("expected a suspended task to refuse deletion")
+	}
 
-	// Resuming puts it back in the guard's sight until it finishes.
 	if err := task.Resume(); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	waitUntil(t, func() bool { return !svc.IsRunning(task.ID()) })
-	if got, _ := svc.RunningTasks(ctx, proxyKind, "residential"); len(got) != 0 {
-		t.Fatalf("running after completion = %v, want none", got)
-	}
-}
-
-// TestTaskIsRunningUnknownTask verifies an id this service never created — or
-// has already deleted — reads as idle, so a resource left locked to a task that
-// no longer exists here does not block its own deletion forever.
-func TestTaskIsRunningUnknownTask(t *testing.T) {
-	svc := NewService(newMemStore(), comms.NewBus())
-	live, err := svc.TaskIsRunning(context.Background(), "never-created")
-	if err != nil {
-		t.Fatalf("TaskIsRunning: %v", err)
-	}
-	if live {
-		t.Fatal("TaskIsRunning = true for an unknown task")
-	}
 }
 
 // TestPinIsDurablePlacementThroughRecovery verifies a pin is durable placement,
@@ -1172,36 +1078,16 @@ func TestWithoutClearsThePin(t *testing.T) {
 	assertPlacement(t, task, accountKind, "shoppers", "buyer-1")
 }
 
-// reassignSpy records what the reassigner was told, one entry per call.
-type reassignSpy struct {
-	calls []reassignCall
-	err   error
-}
-
-type reassignCall struct {
-	taskID, kind, groupID, resourceID string
-}
-
-// forKind returns the stale-lock release to register under kind, tagging each
-// call with it so a test can tell which kind's manager was asked.
-func (r *reassignSpy) forKind(kind string) StaleLockFunc {
-	return func(ctx context.Context, taskID, groupID, resourceID string) error {
-		r.calls = append(r.calls, reassignCall{taskID, kind, groupID, resourceID})
-		return r.err
-	}
-}
-
 // TestAssignResourceRepointsAndReleasesStaleLock verifies assignment is the
 // deliberate act that outranks a durable lock: it writes the new placement and
-// hands the releaser the placement as resolved — under the kind it applies to,
-// so each manager can tell whether the call is its own — and the lock the task
-// no longer fits is dropped by the reassignment rather than by a lease.
+// hands the kind's manager the placement as resolved, so the lock the task no
+// longer fits is dropped by the reassignment rather than by a lease.
 func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 	store := newMemStore()
-	spy := &reassignSpy{}
+	proxyMgr, accountMgr := &fakeManager{}, &fakeManager{}
 	svc := NewService(store, comms.NewBus(),
-		WithResource(proxyKind, nil, spy.forKind(proxyKind)),
-		WithResource(accountKind, nil, spy.forKind(accountKind)))
+		WithResource(proxyKind, proxyMgr),
+		WithResource(accountKind, accountMgr))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1225,9 +1111,12 @@ func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 	if resourceID := record.Assignments[proxyKind].ResourceID; resourceID == nil || *resourceID != "p7" {
 		t.Fatalf("record pin = %v, want p7", resourceID)
 	}
-	want := reassignCall{task.ID(), proxyKind, "datacenter", "p7"}
-	if len(spy.calls) != 1 || spy.calls[0] != want {
-		t.Fatalf("releaser told %v, want [%v]", spy.calls, want)
+	want := leasing.Assignment{TaskID: task.ID(), GroupID: "datacenter", ResourceID: "p7"}
+	if got := proxyMgr.staleCalls(); len(got) != 1 || got[0] != want {
+		t.Fatalf("proxy manager told %v, want [%v]", got, want)
+	}
+	if got := accountMgr.staleCalls(); len(got) != 0 {
+		t.Fatalf("account manager told %v, want nothing: the move was proxies'", got)
 	}
 
 	// The live handle keeps the placement it was wired with; the move lands on
@@ -1248,10 +1137,10 @@ func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 // back on the same account it was halfway through a checkout as.
 func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 	store := newMemStore()
-	spy := &reassignSpy{}
+	proxyMgr, accountMgr := &fakeManager{}, &fakeManager{}
 	svc := NewService(store, comms.NewBus(),
-		WithResource(proxyKind, nil, spy.forKind(proxyKind)),
-		WithResource(accountKind, nil, spy.forKind(accountKind)))
+		WithResource(proxyKind, proxyMgr),
+		WithResource(accountKind, accountMgr))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1281,22 +1170,23 @@ func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 	assertPlacement(t, recovered, accountKind, "shoppers", "buyer-1")
 
 	// Only the proxy manager is asked to drop a lock; the account lock stands.
-	want := reassignCall{task.ID(), proxyKind, "datacenter", ""}
-	if len(spy.calls) != 1 || spy.calls[0] != want {
-		t.Fatalf("releaser told %v, want [%v]", spy.calls, want)
+	want := leasing.Assignment{TaskID: task.ID(), GroupID: "datacenter"}
+	if got := proxyMgr.staleCalls(); len(got) != 1 || got[0] != want {
+		t.Fatalf("proxy manager told %v, want [%v]", got, want)
+	}
+	if got := accountMgr.staleCalls(); len(got) != 0 {
+		t.Fatalf("account manager told %v, want nothing", got)
 	}
 }
 
-// TestAssignResourceInheritsGroupForTheReleaser verifies the releaser is told
+// TestAssignResourceInheritsGroupForTheReleaser verifies the manager is told
 // the placement the task will actually lease from, not the nil that was stored:
 // a cleared assignment inherits the task group's, and a lock is stale or not
 // against that resolved group.
 func TestAssignResourceInheritsGroupForTheReleaser(t *testing.T) {
 	store := newMemStore()
-	spy := &reassignSpy{}
-	svc := NewService(store, comms.NewBus(),
-		WithResource(proxyKind, nil, spy.forKind(proxyKind)),
-		WithResource(accountKind, nil, spy.forKind(accountKind)))
+	proxyMgr := &fakeManager{}
+	svc := NewService(store, comms.NewBus(), WithResource(proxyKind, proxyMgr))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1315,125 +1205,19 @@ func TestAssignResourceInheritsGroupForTheReleaser(t *testing.T) {
 	if err := svc.AssignResource(ctx, task.ID(), proxyKind, Assignment{}); err != nil {
 		t.Fatalf("AssignResource: %v", err)
 	}
-	if len(spy.calls) != 1 || spy.calls[0].groupID != "residential" {
-		t.Fatalf("releaser told %v, want the inherited residential", spy.calls)
+	if got := proxyMgr.staleCalls(); len(got) != 1 || got[0].GroupID != "residential" {
+		t.Fatalf("manager told %v, want the inherited residential", got)
 	}
-}
-
-// pinnedTo builds a record pinned to resourceID for the kind, the shape a
-// stored placement takes when a task names one resource and inherits its group.
-func pinnedTo(kind, resourceID string) map[string]Assignment {
-	return map[string]Assignment{kind: {ResourceID: &resourceID}}
-}
-
-// TestPinnedTasksCountsOnlyWhatCanStillRun verifies the warning a deletion
-// carries names exactly the tasks it would strand. A task that finished, and
-// one that ran without ever checkpointing, can never run again — warning about
-// them is noise, not caution. A task pinned under another kind is not the
-// deleter's business at all.
-func TestPinnedTasksCountsOnlyWhatCanStillRun(t *testing.T) {
-	store := newMemStore()
-	svc := NewService(store, comms.NewBus())
-	ctx := context.Background()
-
-	failed := string(workflows.StatusFailed)
-	for _, rec := range []Record{
-		{ID: "resumable", WorkflowID: "wf", Status: failed, State: "s2", Assignments: pinnedTo(proxyKind, "p1")},
-		{ID: "suspended", WorkflowID: "wf", Status: string(workflows.StatusSuspended), State: "s1", Assignments: pinnedTo(proxyKind, "p1")},
-		{ID: "finished", WorkflowID: "wf", Status: string(workflows.StatusDone), State: "s3", Assignments: pinnedTo(proxyKind, "p1")},
-		{ID: "killed", WorkflowID: "wf", Status: string(workflows.StatusKilled), State: "s1", Assignments: pinnedTo(proxyKind, "p1")},
-		{ID: "no-checkpoint", WorkflowID: "wf", Status: string(workflows.StatusNotStarted), Assignments: pinnedTo(proxyKind, "p1")},
-		{ID: "elsewhere", WorkflowID: "wf", Status: failed, State: "s1", Assignments: pinnedTo(proxyKind, "p2")},
-		{ID: "other-kind", WorkflowID: "wf", Status: failed, State: "s1", Assignments: pinnedTo(accountKind, "p1")},
-		{ID: "unpinned", WorkflowID: "wf", Status: failed, State: "s1"},
-	} {
-		if err := store.CreateTask(ctx, rec); err != nil {
-			t.Fatalf("CreateTask %s: %v", rec.ID, err)
-		}
-	}
-
-	got, err := svc.PinnedTasks(ctx, proxyKind, "p1")
-	if err != nil {
-		t.Fatalf("PinnedTasks: %v", err)
-	}
-	want := []string{"resumable", "suspended"}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("PinnedTasks = %v, want %v", got, want)
-	}
-
-	// The account "p1" is a different resource that happens to share a name.
-	if got, _ := svc.PinnedTasks(ctx, accountKind, "p1"); len(got) != 1 || got[0] != "other-kind" {
-		t.Fatalf("account PinnedTasks = %v, want [other-kind]", got)
-	}
-
-	if got, _ := svc.PinnedTasks(ctx, proxyKind, ""); len(got) != 0 {
-		t.Fatalf("PinnedTasks(\"\") = %v, want none: an unpinned task pins nothing", got)
-	}
-}
-
-// TestPinnedTasksSeesUnstartedLiveTasks verifies a task created here and never
-// started still counts. It has no checkpoint, so the store alone would call it
-// unresumable — but it is sitting in the registry able to start, and deleting
-// the resource it pins would break its very first lease.
-func TestPinnedTasksSeesUnstartedLiveTasks(t *testing.T) {
-	store := newMemStore()
-	svc := NewService(store, comms.NewBus())
-	wf := &depsWorkflow{}
-	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
-		t.Fatalf("RegisterWorkflow: %v", err)
-	}
-	ctx := context.Background()
-
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(proxyKind, "residential"), WithPin(proxyKind, "p1"))
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
-
-	got, err := svc.PinnedTasks(ctx, proxyKind, "p1")
-	if err != nil {
-		t.Fatalf("PinnedTasks: %v", err)
-	}
-	if len(got) != 1 || got[0] != task.ID() {
-		t.Fatalf("PinnedTasks = %v, want [%s]", got, task.ID())
-	}
-}
-
-// unlockSpy records which kinds were asked to unlock a task, in order, and can
-// be made to fail for one of them.
-type unlockSpy struct {
-	mu      sync.Mutex
-	kinds   []string
-	failFor string
-}
-
-func (u *unlockSpy) forKind(kind string) ReleaseFunc {
-	return func(ctx context.Context, taskID string) error {
-		u.mu.Lock()
-		defer u.mu.Unlock()
-		u.kinds = append(u.kinds, kind)
-		if kind == u.failFor {
-			return errors.New("store down")
-		}
-		return nil
-	}
-}
-
-func (u *unlockSpy) asked() []string {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return append([]string(nil), u.kinds...)
 }
 
 // TestDeleteUnlocksEveryRegisteredKind verifies a deletion frees every kind's
 // durable lock, not just the first. A lock nothing releases is unleasable
 // forever, so a task holding a proxy and an account must give back both.
 func TestDeleteUnlocksEveryRegisteredKind(t *testing.T) {
-	unlocks := &unlockSpy{}
-	general := &releaseSpy{}
+	proxyMgr, accountMgr := &fakeManager{}, &fakeManager{}
 	svc, _, wf := newDepsService(t,
-		WithTaskReleaser(general.release),
-		WithResource(proxyKind, unlocks.forKind(proxyKind), nil),
-		WithResource(accountKind, unlocks.forKind(accountKind), nil))
+		WithResource(proxyKind, proxyMgr),
+		WithResource(accountKind, accountMgr))
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)
@@ -1444,13 +1228,10 @@ func TestDeleteUnlocksEveryRegisteredKind(t *testing.T) {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 
-	if got := unlocks.asked(); len(got) != 2 || got[0] != proxyKind || got[1] != accountKind {
-		t.Fatalf("unlocked %v, want both kinds in registration order", got)
-	}
-	// The general releaser is for whatever no resource kind describes, so it
-	// runs alongside them rather than instead of them.
-	if len(general.calls()) != 1 {
-		t.Fatalf("general releaser ran %d times, want 1", len(general.calls()))
+	for kind, mgr := range map[string]*fakeManager{proxyKind: proxyMgr, accountKind: accountMgr} {
+		if got := mgr.unlocks(); len(got) != 1 || got[0] != task.ID() {
+			t.Fatalf("%s unlocked %v, want [%s]", kind, got, task.ID())
+		}
 	}
 }
 
@@ -1459,10 +1240,11 @@ func TestDeleteUnlocksEveryRegisteredKind(t *testing.T) {
 // the error names the kind that failed, and the deletion still aborts — a task
 // whose locks are only partly freed must not lose the record that says so.
 func TestReleaseAttemptsEveryKindDespiteAFailure(t *testing.T) {
-	unlocks := &unlockSpy{failFor: proxyKind}
+	proxyMgr := &fakeManager{unlockErr: errors.New("store down")}
+	accountMgr := &fakeManager{}
 	svc, store, wf := newDepsService(t,
-		WithResource(proxyKind, unlocks.forKind(proxyKind), nil),
-		WithResource(accountKind, unlocks.forKind(accountKind), nil))
+		WithResource(proxyKind, proxyMgr),
+		WithResource(accountKind, accountMgr))
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)
@@ -1476,8 +1258,8 @@ func TestReleaseAttemptsEveryKindDespiteAFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), proxyKind) {
 		t.Fatalf("error = %v, want the failing kind named", err)
 	}
-	if got := unlocks.asked(); len(got) != 2 {
-		t.Fatalf("unlocked %v, want both attempted despite the failure", got)
+	if got := accountMgr.unlocks(); len(got) != 1 {
+		t.Fatalf("account unlocked %v, want attempted despite the proxy failure", got)
 	}
 	if _, err := store.RecoverTask(ctx, task.ID()); err != nil {
 		t.Fatalf("record gone after an aborted deletion: %v", err)
@@ -1494,8 +1276,19 @@ func TestRegisteringAKindTwicePanics(t *testing.T) {
 		}
 	}()
 	NewService(newMemStore(), comms.NewBus(),
-		WithResource(proxyKind, nil, nil),
-		WithResource(proxyKind, nil, nil))
+		WithResource(proxyKind, &fakeManager{}),
+		WithResource(proxyKind, &fakeManager{}))
+}
+
+// TestRegisteringANilManagerPanics verifies wiring a kind with nothing behind
+// it fails loud at construction: a nil manager could never free a lock.
+func TestRegisteringANilManagerPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("no panic: a nil manager can never unlock anything")
+		}
+	}()
+	NewService(newMemStore(), comms.NewBus(), WithResource(proxyKind, nil))
 }
 
 // TestAssignResourceWithoutARegisteredKind verifies placement still lands for a
@@ -1519,26 +1312,3 @@ func TestAssignResourceWithoutARegisteredKind(t *testing.T) {
 	}
 }
 
-// TestPinnedTasksWithoutRepository verifies in-memory operation still answers
-// from the registry, so a consumer running without durability is not told a
-// deletion is free when it is not.
-func TestPinnedTasksWithoutRepository(t *testing.T) {
-	svc := NewService(nil, comms.NewBus())
-	wf := &depsWorkflow{}
-	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
-		t.Fatalf("RegisterWorkflow: %v", err)
-	}
-	ctx := context.Background()
-
-	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(proxyKind, "residential"), WithPin(proxyKind, "p1"))
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
-	got, err := svc.PinnedTasks(ctx, proxyKind, "p1")
-	if err != nil {
-		t.Fatalf("PinnedTasks: %v", err)
-	}
-	if len(got) != 1 || got[0] != task.ID() {
-		t.Fatalf("PinnedTasks = %v, want [%s]", got, task.ID())
-	}
-}

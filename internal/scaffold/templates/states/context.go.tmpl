@@ -71,9 +71,9 @@ func NewContext(input Input, deps workflows.Deps{{if .Proxy}}, manager *proxies.
 			// this program calls its proxy manager. The whole placement travels
 			// together: group, or pin within it.
 			assignment: proxies.Assignment{
-				TaskID:  deps.TaskID,
-				GroupID: deps.Assignments["proxy"].GroupID,
-				ProxyID: deps.Assignments["proxy"].ResourceID,
+				TaskID:     deps.TaskID,
+				GroupID:    deps.Assignments["proxy"].GroupID,
+				ResourceID: deps.Assignments["proxy"].ResourceID,
 			},
 {{- end}}
 			bus: deps.Bus,
@@ -104,7 +104,7 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		// task naked instead.
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}
-	proxyURL, err := url.Parse(lease.Proxy().URL)
+	proxyURL, err := url.Parse(lease.Resource().Attrs.URL)
 	if err != nil {
 		lease.Release(false)
 		return nil, fmt.Errorf("parse proxy url: %w", err)

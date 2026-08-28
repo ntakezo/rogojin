@@ -103,7 +103,7 @@ func (s *SQLite) List(ctx context.Context) ([]proxies.Proxy, error) {
 	for rows.Next() {
 		var p proxies.Proxy
 		var created, updated string
-		if err := rows.Scan(&p.ID, &p.URL, &p.GroupID, &p.OwnerID, &p.MaxHolders, &p.Successes, &p.Failures, &created, &updated); err != nil {
+		if err := rows.Scan(&p.ID, &p.Attrs.URL, &p.GroupID, &p.OwnerID, &p.MaxHolders, &p.Successes, &p.Failures, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list proxies: %w", err)
 		}
 		if p.CreatedAt, err = parseTime(created); err != nil {
@@ -131,7 +131,7 @@ func (s *SQLite) Save(ctx context.Context, p proxies.Proxy) error {
 		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
 		 successes = excluded.successes, failures = excluded.failures,
 		 updated_at = excluded.updated_at`,
-		p.ID, p.URL, p.GroupID, p.OwnerID, p.MaxHolders, p.Successes, p.Failures,
+		p.ID, p.Attrs.URL, p.GroupID, p.OwnerID, p.MaxHolders, p.Successes, p.Failures,
 		formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save proxy %s: %w", p.ID, err)
@@ -148,10 +148,12 @@ func (s *SQLite) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListGroups returns every stored proxy group in stable id order.
+// ListGroups returns every stored proxy group in stable id order. The
+// max_holders column is legacy — holder policy lives on the proxy — and is
+// left unread.
 func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, strategy, max_holders, created_at, updated_at FROM proxy_groups ORDER BY id`)
+		`SELECT id, strategy, created_at, updated_at FROM proxy_groups ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list proxy groups: %w", err)
 	}
@@ -161,7 +163,7 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 	for rows.Next() {
 		var g proxies.Group
 		var created, updated string
-		if err := rows.Scan(&g.ID, &g.Strategy, &g.MaxHolders, &created, &updated); err != nil {
+		if err := rows.Scan(&g.ID, &g.Strategy, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list proxy groups: %w", err)
 		}
 		if g.CreatedAt, err = parseTime(created); err != nil {
@@ -183,11 +185,11 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 // gets to revise.
 func (s *SQLite) SaveGroup(ctx context.Context, g proxies.Group) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO proxy_groups (id, strategy, max_holders, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO proxy_groups (id, strategy, created_at, updated_at)
+		 VALUES (?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET strategy = excluded.strategy,
-		 max_holders = excluded.max_holders, updated_at = excluded.updated_at`,
-		g.ID, g.Strategy, g.MaxHolders, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
+		 updated_at = excluded.updated_at`,
+		g.ID, g.Strategy, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save proxy group %s: %w", g.ID, err)
 	}

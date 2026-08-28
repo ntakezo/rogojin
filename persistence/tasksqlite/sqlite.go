@@ -323,34 +323,6 @@ func (s *SQLite) TasksInGroup(ctx context.Context, groupID string) ([]string, er
 	return ids, nil
 }
 
-// TasksPinnedTo returns every task record pinned to resourceID for the kind. It
-// reads whole records because the caller decides which of them could still run,
-// a rule this store does not own.
-//
-// The NULLIF is load-bearing: json_extract rejects the empty string as
-// malformed, and a task placed nowhere stores the column default.
-func (s *SQLite) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]tasks.Record, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
-		 FROM tasks
-		 WHERE json_extract(NULLIF(assignments, ''), '$.' || ? || '.resourceId') = ?
-		 ORDER BY id`, kind, resourceID)
-	if err != nil {
-		return nil, fmt.Errorf("list tasks pinned to %s %s: %w", kind, resourceID, err)
-	}
-	defer rows.Close()
-
-	records := make([]tasks.Record, 0)
-	for rows.Next() {
-		record, err := scanRecord(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list tasks pinned to %s %s: %w", kind, resourceID, err)
-		}
-		records = append(records, record)
-	}
-	return records, rows.Err()
-}
-
 // scanner is the read surface shared by sql.Row and sql.Rows.
 type scanner interface {
 	Scan(dest ...any) error

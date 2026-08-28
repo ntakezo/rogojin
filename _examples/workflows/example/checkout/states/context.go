@@ -80,15 +80,15 @@ func NewContext(input StaticContext, deps workflows.Deps, manager *proxies.Manag
 			// together: the group to rotate within, or the one member pinned
 			// inside it. No branching here.
 			assignment: proxies.Assignment{
-				TaskID:  deps.TaskID,
-				GroupID: deps.Assignments[ProxyKind].GroupID,
-				ProxyID: deps.Assignments[ProxyKind].ResourceID,
+				TaskID:     deps.TaskID,
+				GroupID:    deps.Assignments[ProxyKind].GroupID,
+				ResourceID: deps.Assignments[ProxyKind].ResourceID,
 			},
 			accounts: accountManager,
 			account: accounts.Assignment{
-				TaskID:    deps.TaskID,
-				GroupID:   deps.Assignments[AccountKind].GroupID,
-				AccountID: deps.Assignments[AccountKind].ResourceID,
+				TaskID:     deps.TaskID,
+				GroupID:    deps.Assignments[AccountKind].GroupID,
+				ResourceID: deps.Assignments[AccountKind].ResourceID,
 			},
 			bus: deps.Bus,
 		},
@@ -109,9 +109,9 @@ func (c *Context) profile(ctx context.Context) (Profile, error) {
 			return Profile{}, fmt.Errorf("lock account: %w", err)
 		}
 		c.running.accountLease = lease
-		fmt.Printf("  task %s locked account %s\n", c.running.account.TaskID, lease.Account().ID)
+		fmt.Printf("  task %s locked account %s\n", c.running.account.TaskID, lease.Resource().ID)
 	}
-	return accounts.Bind[Profile](c.running.accountLease.Account())
+	return accounts.Bind[Profile](c.running.accountLease.Resource())
 }
 
 // client leases a proxy and builds the client on first use, so a recovered
@@ -128,12 +128,12 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}
-	client, err := common.NewClient(lease.Proxy().URL)
+	client, err := common.NewClient(lease.Resource().Attrs.URL)
 	if err != nil {
 		lease.Release(false)
 		return nil, err
 	}
-	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.assignment.TaskID, lease.Proxy().ID, lease.Proxy().URL)
+	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.assignment.TaskID, lease.Resource().ID, lease.Resource().Attrs.URL)
 
 	c.running.lease = lease
 	c.running.client = client

@@ -79,6 +79,10 @@ var migrations = []sqlitemigrate.Migration{
 			updated_at  TEXT NOT NULL DEFAULT ''
 		)`,
 	},
+	{
+		Name: "add strategy column to card_groups",
+		SQL:  `ALTER TABLE card_groups ADD COLUMN strategy TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 // Close closes the underlying database.
@@ -104,7 +108,7 @@ func (s *SQLite) List(ctx context.Context) ([]cards.Card, error) {
 		if err := rows.Scan(&c.ID, &c.GroupID, &c.OwnerID, &c.MaxHolders, &c.Successes, &c.Failures, &fields, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list cards: %w", err)
 		}
-		c.Fields = parseFields(fields)
+		c.Attrs = parseFields(fields)
 		if c.CreatedAt, err = parseTime(created); err != nil {
 			return nil, fmt.Errorf("list cards: %w", err)
 		}
@@ -123,7 +127,7 @@ func (s *SQLite) List(ctx context.Context) ([]cards.Card, error) {
 // stats, and updated_at. created_at is written on insert and never overwritten,
 // so a lock or a stat update cannot revise it.
 func (s *SQLite) Save(ctx context.Context, c cards.Card) error {
-	fields, err := formatFields(c.Fields)
+	fields, err := formatFields(c.Attrs)
 	if err != nil {
 		return fmt.Errorf("save card %s: %w", c.ID, err)
 	}
@@ -151,10 +155,12 @@ func (s *SQLite) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListGroups returns every stored card group in stable id order.
+// ListGroups returns every stored card group in stable id order. The
+// max_holders column is legacy — holder policy lives on the card — and is
+// left unread.
 func (s *SQLite) ListGroups(ctx context.Context) ([]cards.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, max_holders, created_at, updated_at FROM card_groups ORDER BY id`)
+		`SELECT id, strategy, created_at, updated_at FROM card_groups ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list card groups: %w", err)
 	}
@@ -164,7 +170,7 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]cards.Group, error) {
 	for rows.Next() {
 		var g cards.Group
 		var created, updated string
-		if err := rows.Scan(&g.ID, &g.MaxHolders, &created, &updated); err != nil {
+		if err := rows.Scan(&g.ID, &g.Strategy, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list card groups: %w", err)
 		}
 		if g.CreatedAt, err = parseTime(created); err != nil {
@@ -186,11 +192,11 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]cards.Group, error) {
 // to revise.
 func (s *SQLite) SaveGroup(ctx context.Context, g cards.Group) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO card_groups (id, max_holders, created_at, updated_at)
+		`INSERT INTO card_groups (id, strategy, created_at, updated_at)
 		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET max_holders = excluded.max_holders,
+		 ON CONFLICT(id) DO UPDATE SET strategy = excluded.strategy,
 		 updated_at = excluded.updated_at`,
-		g.ID, g.MaxHolders, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
+		g.ID, g.Strategy, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save card group %s: %w", g.ID, err)
 	}
