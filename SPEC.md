@@ -1,42 +1,56 @@
 # email — spec
 
-A new top-level package that gives tasks the ability to listen to a consumer's
-email inbox over IMAP and post-process incoming mail. Two vendors are
-supported: Gmail and Outlook.
+A new top-level package that gives tasks the ability to listen to a
+consumer's email inbox over IMAP and post-process incoming mail. Two vendors
+are supported: Gmail and Outlook.
 
-`email` is a resource package with a twist. Like `cards` and `proxies`, it has
-a persistence layer holding many instances, groups, and participation in task
-placement (`Deps.Assignments["email"]`). Unlike them, **there is no leasing**:
-listening to an inbox is not exclusive, so there is nothing to acquire, lock,
-or rotate. One IMAP listener exists per inbox, established lazily when the
-first task asks for it, and every listening task receives every matching
-message — delivery is fan-out, never first-taker-wins.
+`email` is deliberately not a leasing resource. Listening to an inbox is not
+exclusive, so there is nothing to acquire, lock, rotate, or score — and there
+are no email groups either: an email is one flat row in an inventory. One
+IMAP listener exists per inbox, established lazily when the first task asks
+for it, and every listening task receives every matching message — delivery
+is fan-out, never first-taker-wins.
+
+An email reaches a task through its **account**, not through task placement.
+An account, or an account group, is attached to an email at creation time —
+the account carries the foreign key. Formally this is a **forwarding
+inbox**: one inbox commonly receives mail for many personas (a catch-all, a
+plus-addressed pool, a group-wide shared box). The attached email's address
+may happen to equal the address inside the account's own payload; that
+coincidence is not modeled.
+
+The workflow decides everything downstream: which sender to listen for, and
+how to parse whatever arrives — if it listens at all.
 
 ## Vocabulary
 
-- **Email** — the stored resource: an address plus the vendor and credentials
-  needed to reach its inbox. What users add, group, and link accounts to.
+- **Email** — one stored row: an address, plus *optionally* the vendor and
+  credentials needed to open its inbox. An address-only email is usable as
+  data (form fill, registration); only an email with inbox credentials can
+  be listened to.
+- **Forwarding inbox** — the role an email plays when attached to an account
+  or account group: the place that account's mail actually lands.
 - **Message** — one piece of mail that arrived in an inbox.
 - **Listener** — the single IMAP connection + IDLE loop serving one inbox.
-- **Subscription** — one task's live feed of messages from one or more
-  inboxes, optionally filtered by sender.
+- **Subscription** — one task's live feed from one inbox, optionally
+  filtered by sender.
 
 ## Package layout
 
 ```
 email/
-  email.go      Email, Group, Message, Assignment, Repository, errors
-  manager.go    Manager: inventory, links, subscriptions, fan-out
+  email.go      Email, Inbox, Message, Repository, RefKey, errors
+  manager.go    Manager: inventory, subscriptions, fan-out
   listener.go   per-inbox IMAP loop: dial, select, backfill, IDLE, reconnect
   vendors.go    Vendor table: endpoints and auth mechanisms for gmail/outlook
 persistence/
   emailsqlite/  SQLite adapter for email.Repository (store name "email")
 ```
 
-`email` does not import `leasing`, `tasks`, or `workflows`. Like the other
-resource packages it is imported *by* the consumer's workflow code and by its
-own persistence adapter. It does import the IMAP client library directly —
-the IMAP engine is the package's reason to exist, not an adapter concern.
+`email` does not import `leasing`, `tasks`, or `workflows`. It is imported
+by the consumer's workflow code and by its own persistence adapter. It
+imports the IMAP client library directly — the IMAP engine is the package's
+reason to exist, not an adapter concern.
 
 Proposed dependencies (new to go.mod):
 
@@ -47,20 +61,25 @@ Proposed dependencies (new to go.mod):
 ## Core types
 
 ```go
-// Email is one inbox a consumer has stored: an address, the vendor that
-// hosts it, and the credentials needed to open an IMAP session against it.
-// LastUID and UIDValidity are the listener's durable cursor; consumers
-// never set them.
+// Email is one row of the email inventory: an address, and optionally the
+// inbox behind it. Inbox is nil for an address-only email, which can be
+// read but not listened to.
 type Email struct {
-	ID          string    `json:"id"`
-	GroupID     string    `json:"groupId"`
-	Address     string    `json:"address"`
-	Vendor      Vendor    `json:"vendor"`
-	Auth        Auth      `json:"auth"`
-	LastUID     uint32    `json:"lastUID"`
-	UIDValidity uint32    `json:"uidValidity"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	ID        string    `json:"id"`
+	Address   string    `json:"address"`
+	Inbox     *Inbox    `json:"inbox,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// Inbox is the listenable half of an email: where it lives and how to get
+// in. LastUID and UIDValidity are the listener's durable cursor; consumers
+// never set them.
+type Inbox struct {
+	Vendor      Vendor `json:"vendor"`
+	Auth        Auth   `json:"auth"`
+	LastUID     uint32 `json:"lastUID"`
+	UIDValidity uint32 `json:"uidValidity"`
 }
 
 type Vendor string
@@ -84,14 +103,6 @@ type Auth struct {
 	TokenURL     string `json:"tokenURL,omitempty"` // defaults per vendor
 }
 
-type Group struct {
-	ID        string    `json:"id"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-}
-
-const GlobalGroup = "global"
-
 // Message is one piece of mail as delivered to subscribers. From is the
 // addr-spec of the first From header address, lowercased.
 type Message struct {
@@ -106,23 +117,71 @@ type Message struct {
 	HTML      string
 }
 
-// Link binds an account (a persona from the accounts package) to the email
-// whose inbox it uses. One account has at most one email; many accounts may
-// share one email.
-type Link struct {
-	AccountID string
-	EmailID   string
-	CreatedAt time.Time
+// RefKey is the leasing ref key under which an account or account group
+// names its forwarding inbox: Refs[email.RefKey] = emailID.
+const RefKey = "email"
+```
+
+Why a typed struct instead of `json.RawMessage`: the package itself must
+dial IMAP from these fields, so the schema is owned here, not by the
+consumer.
+
+## The attachment: refs on leasing resources
+
+The foreign key lives on the account, and accounts are pure type aliases of
+`leasing.Resource[json.RawMessage]` — so the carrying surface is added to
+`leasing`, kept exactly as ignorant as `Attrs` already is:
+
+```go
+// leasing.Resource[T] gains:
+	Refs map[string]string `json:"refs,omitempty"`
+
+// leasing.Group gains the same field.
+```
+
+**Refs are carried, never read.** Leasing persists and returns them and
+attaches no meaning — the same contract `Attrs` has. The key/value
+convention (`"email"` → email ID) belongs to the consumer and the `email`
+package. Cards and proxies inherit the field and simply leave it empty.
+This keeps the leasing boundary intact: no email concept enters the
+mechanism layer.
+
+Attachment happens at creation time through existing signatures — both
+already take the full struct:
+
+```go
+mgr.CreateGroup(ctx, accounts.Group{ID: "pool-a",
+	Refs: map[string]string{email.RefKey: "inbox-1"}})   // group-wide forwarding inbox
+
+mgr.Add(ctx, accounts.Account{ID: "acct-7", GroupID: "pool-a",
+	Refs: map[string]string{email.RefKey: "inbox-2"},    // per-account override
+	Attrs: payload})
+```
+
+Resolution is per-key, account wins, group falls back — the same shape task
+placement already uses for resource groups. To make the group side reachable
+from a running task, `leasing.Lease[T]` gains one read accessor:
+
+```go
+// Group returns the group of the leased resource as of acquisition.
+func (l *Lease[T]) Group() Group
+```
+
+so the workflow resolves with no new lookup surface on the manager:
+
+```go
+id := lease.Resource().Refs[email.RefKey]
+if id == "" {
+	id = lease.Group().Refs[email.RefKey]
 }
 ```
 
-Unlike `leasing.Resource[T]` there is no `OwnerID`, `MaxHolders`,
-`Successes`, or `Failures` — listening is non-exclusive and has no outcome
-to score.
-
-Why a typed `Attrs`-equivalent instead of `json.RawMessage`: the package
-itself must dial IMAP from these fields, so the schema is owned here, not by
-the consumer. Consumer-defined extras don't belong on the credential record.
+Ripple: `accountsqlite`, `cardsqlite`, and `proxysqlite` each gain an
+append-only migration adding a `refs TEXT NOT NULL DEFAULT ''` (JSON)
+column to both their resource and group tables, so refs survive a restart
+for every kind. Deleting an email does **not** scrub refs pointing at it;
+a dangling ref fails loud at `Listen` with `ErrEmailNotFound` (open
+question below).
 
 ## Repository port
 
@@ -131,21 +190,13 @@ type Repository interface {
 	List(ctx context.Context) ([]Email, error)
 	Save(ctx context.Context, e Email) error
 	Delete(ctx context.Context, id string) error
-
-	ListGroups(ctx context.Context) ([]Group, error)
-	SaveGroup(ctx context.Context, g Group) error
-	DeleteGroup(ctx context.Context, id string) error
-
-	ListLinks(ctx context.Context) ([]Link, error)
-	SaveLink(ctx context.Context, l Link) error
-	DeleteLink(ctx context.Context, accountID string) error
 }
 ```
 
 Same contract style as `leasing.Repository`: `List` in deterministic order,
 `Save` is an upsert that never rewrites `CreatedAt`, `Delete` is a no-op on
 absent rows. The listener persists its cursor by calling `Save` with updated
-`LastUID`/`UIDValidity`.
+`Inbox.LastUID`/`Inbox.UIDValidity`.
 
 ## Manager
 
@@ -156,49 +207,36 @@ type Option func(*Manager)
 func WithDropHandler(fn func(emailID, taskID string, dropped uint64)) Option
 func WithListenerErrorHandler(fn func(emailID string, err error)) Option
 
-// Inventory — mirrors the leasing manager's shape.
+// Inventory.
 func (m *Manager) Add(ctx context.Context, e Email) error
 func (m *Manager) Delete(ctx context.Context, id string) error
-func (m *Manager) CreateGroup(ctx context.Context, id string) error
-func (m *Manager) DeleteGroup(ctx context.Context, id string) error
-
-// Links.
-func (m *Manager) LinkAccount(ctx context.Context, accountID, emailID string) error
-func (m *Manager) UnlinkAccount(ctx context.Context, accountID string) error
-func (m *Manager) EmailForAccount(ctx context.Context, accountID string) (Email, error)
+func (m *Manager) Get(ctx context.Context, id string) (Email, error)
 
 // Listening.
-func (m *Manager) Listen(ctx context.Context, a Assignment, opts ...ListenOption) (Subscription, error)
+func (m *Manager) Listen(ctx context.Context, taskID, emailID string, opts ...ListenOption) (Subscription, error)
 
 // Close stops every listener and closes every subscription. For process
 // shutdown; not part of the task path.
 func (m *Manager) Close() error
 ```
 
-`NewManager` loads emails, groups, and links into memory (leasing-style:
-persist first, mutate memory second on every write). `Add` validates ID
-presence, vendor membership, auth shape for the vendor, and group existence;
-it defaults `GroupID` to `"global"`. `Delete` and `DeleteGroup` refuse with
-`ErrEmailInUse`/`ErrGroupInUse` while any subscription covers the target,
-reporting the listening task IDs in the error — same philosophy as leasing:
-report, don't act. `Delete` also removes links pointing at the deleted email.
+`NewManager` loads the inventory into memory (leasing-style: persist first,
+mutate memory second on every write). `Add` validates ID and address
+presence, and — when an inbox is present — vendor membership and auth shape
+for the vendor. `Get` exists because address-only use is real: a workflow
+filling a form needs the address of its forwarding inbox without listening.
+`Delete` refuses with `ErrEmailInUse` while any subscription covers the
+target, reporting the listening task IDs — report, don't act, as leasing
+does.
 
 ### Listen
 
 ```go
-// Assignment names who is listening and to what. EmailID selects one inbox;
-// when empty, GroupID selects every inbox in the group, present and future
-// membership evaluated at Listen time.
-type Assignment struct {
-	TaskID  string
-	GroupID string
-	EmailID string
-}
-
 type ListenOption func(*listenConfig)
 
 // FromSender restricts the subscription to messages whose From addr-spec
-// equals address, case-insensitively. Default: all mail.
+// equals address, case-insensitively. Default: all mail. The workflow, not
+// the framework, decides this — and owns all parsing of what arrives.
 func FromSender(address string) ListenOption
 
 // WithBackfill re-delivers messages already in the inbox with an IMAP date
@@ -215,9 +253,8 @@ type Subscription interface {
 }
 ```
 
-Resolution: `EmailID` set → that inbox (must exist, and belong to `GroupID`
-when both are set); otherwise `GroupID` → all inboxes currently in the group,
-one subscription spanning all of them. Empty group → `ErrNoEmails`.
+`Listen` fails fast: `ErrEmailNotFound` for an unknown ID (including a
+dangling ref), `ErrNoInbox` for an address-only email.
 
 ## Listener lifecycle
 
@@ -226,9 +263,9 @@ One listener per email ID, held in a manager registry
 subscription.
 
 - **Lazily established.** The first `Listen` covering an inbox dials it.
-  Subsequent subscriptions attach to the running listener. Dial happens
-  outside the manager lock; concurrent first-listens are coalesced so
-  exactly one connection results.
+  Subsequent subscriptions attach to the running listener — many tasks,
+  many accounts, one connection. Dial happens outside the manager lock;
+  concurrent first-listens are coalesced so exactly one connection results.
 - **Loop.** Dial vendor endpoint (TLS :993) → authenticate → SELECT INBOX →
   compare UIDVALIDITY (mismatch resets the cursor to the current last UID —
   history renumbered, don't replay the whole mailbox) → fetch UIDs >
@@ -251,8 +288,9 @@ subscription.
 ## Fan-out semantics
 
 Every message is offered to **every** subscription attached to its inbox
-whose sender filter matches — never only the first to receive it. What each
-task does with the message is its own business.
+whose sender filter matches — never only the first to receive it. A
+forwarding inbox shared by a whole account group means many tasks on one
+listener; each decides for itself what a message means.
 
 Delivery per subscriber is a non-blocking send into that subscriber's
 buffered channel; a full buffer drops the message for that subscriber only
@@ -269,23 +307,11 @@ The internal registry borrows its concurrency discipline instead.
 
 ## Task and workflow integration
 
-`email` participates in placement exactly like other kinds — the workflow
-declares a kind string and the consumer routes it at task creation:
-
-```go
-// states/context.go (consumer code)
-const EmailKind = "email"
-
-// main.go
-task, _ := svc.CreateTask(ctx, checkout.Name, input,
-	tasks.WithResourceGroup(states.EmailKind, email.GlobalGroup))
-```
-
-Because there is nothing to unlock and no stale locks to release, **no
-`tasks.WithResource` registration exists for email** — the manager does not
-implement `tasks.ResourceManager`, and doesn't need to. `Deps.Assignments`
-carries the placement; the workflow holds `*email.Manager` in its static
-context and subscribes lazily on first use, mirroring the lease idiom:
+Email takes no part in task placement. There is no `"email"` kind, no
+`WithResourceGroup`, no entry in `Deps.Assignments`, and no
+`tasks.WithResource` registration — nothing to unlock, no stale locks to
+release. The path to an inbox runs through the account the task already
+locks:
 
 ```go
 // inbox returns the running subscription, establishing it on first use so
@@ -294,15 +320,19 @@ func (c *Context) inbox(ctx context.Context) (email.Subscription, error) {
 	if c.running.inbox != nil {
 		return c.running.inbox, nil
 	}
-	a, ok := c.static.Deps.Assignments[EmailKind]
-	if !ok {
-		return nil, fmt.Errorf("task %s has no email group assigned", c.static.Deps.TaskID)
+	lease, err := c.account(ctx) // the existing durable account lock
+	if err != nil {
+		return nil, err
 	}
-	sub, err := c.static.Email.Listen(ctx, email.Assignment{
-		TaskID:  c.static.Deps.TaskID,
-		GroupID: a.GroupID,
-		EmailID: a.ResourceID,
-	}, email.FromSender("no-reply@store.example"),
+	id := lease.Resource().Refs[email.RefKey]
+	if id == "" {
+		id = lease.Group().Refs[email.RefKey]
+	}
+	if id == "" {
+		return nil, fmt.Errorf("account %s has no forwarding inbox attached", lease.Resource().ID)
+	}
+	sub, err := c.static.Email.Listen(ctx, c.static.Deps.TaskID, id,
+		email.FromSender("no-reply@store.example"), // the workflow's choice
 		email.WithBackfill(c.running.startedAt))
 	if err != nil {
 		return nil, err
@@ -312,64 +342,49 @@ func (c *Context) inbox(ctx context.Context) (email.Subscription, error) {
 }
 ```
 
-`Teardown` closes the subscription alongside the leases. The subscription is
-a side effect, not a durable fact — it is reconstructed on restore, never
-snapshotted, and `WithBackfill(startedAt)` (with `startedAt` a snapshotted
-field) is what makes resumption lossless.
-
-The account-linked path composes with the lock idiom: a task that locked an
-account resolves its inbox with `EmailForAccount(ctx, lease.Resource().ID)`
-and listens with `EmailID` pinned. Links are the first cross-resource edge in
-the codebase; they live in `email`'s store, keyed by account ID, because
-`accounts` payloads are opaque and must stay that way.
+The sender filter and the parsing of any message that arrives are entirely
+workflow-defined; a workflow that never calls `inbox` pays nothing. The
+subscription is a side effect, not a durable fact — closed in `Teardown`,
+reconstructed on restore, never snapshotted; `WithBackfill(startedAt)` (with
+`startedAt` a snapshotted field) is what makes resumption lossless.
 
 ## Persistence: `persistence/emailsqlite`
 
 Standard adapter shape: `NewSQLite(dsn)`, `SetMaxOpenConns(1)`,
 `sqlitemigrate.Run(db, "email", migrations)` (store name `"email"`, stable
-forever), RFC3339Nano UTC times, `List* ORDER BY` primary key, upserts that
-never overwrite `created_at`.
+forever), RFC3339Nano UTC times, `List ORDER BY id`, upserts that never
+overwrite `created_at`.
 
-Migration 1:
+Migration 1 — one table, no groups, no links:
 
 ```sql
 CREATE TABLE IF NOT EXISTS emails (
   id TEXT PRIMARY KEY,
-  group_id TEXT NOT NULL DEFAULT 'global',
   address TEXT NOT NULL DEFAULT '',
-  vendor TEXT NOT NULL DEFAULT '',
+  vendor TEXT NOT NULL DEFAULT '',         -- '' = address-only, no inbox
   auth TEXT NOT NULL DEFAULT '',           -- Auth as JSON
   last_uid INTEGER NOT NULL DEFAULT 0,
   uid_validity INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL DEFAULT ''
 );
-CREATE TABLE IF NOT EXISTS email_groups (
-  id TEXT PRIMARY KEY,
-  created_at TEXT NOT NULL DEFAULT '',
-  updated_at TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS email_links (
-  account_id TEXT PRIMARY KEY,
-  email_id TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT ''
-);
 ```
 
+An empty `vendor` marks an address-only email; the adapter maps it to
+`Inbox == nil`. The account-side `refs` columns land in `accountsqlite`
+(and siblings) as part of the leasing change, not here.
+
 Credentials are stored in plaintext, as proxy URLs and account payloads
-already are; encryption-at-rest is out of scope here (open question below).
+already are; encryption-at-rest is out of scope (open question below).
 
 ## Errors
 
 ```go
 var (
-	ErrEmailNotFound    = errors.New("email: email not found")
-	ErrGroupNotFound    = errors.New("email: group not found")
-	ErrNoEmails         = errors.New("email: no emails in group")
-	ErrEmailInUse       = errors.New("email: email has active listeners")
-	ErrGroupInUse       = errors.New("email: group has active listeners")
-	ErrAccountNotLinked = errors.New("email: account has no linked email")
-	ErrVendorUnknown    = errors.New("email: unknown vendor")
+	ErrEmailNotFound = errors.New("email: email not found")
+	ErrNoInbox       = errors.New("email: email has no inbox")
+	ErrEmailInUse    = errors.New("email: email has active listeners")
+	ErrVendorUnknown = errors.New("email: unknown vendor")
 )
 ```
 
@@ -407,30 +422,37 @@ Guarantee-shaped tests:
   closes, registry entry gone.
 - `TestCursorSurvivesRestart` — manager restart resumes from persisted
   `LastUID`; UIDVALIDITY change resets instead of replaying.
-- `TestGroupListenCoversEveryInboxInTheGroup`
-- `TestLinkedAccountResolvesItsInbox` / `TestUnlinkedAccountFailsLoud`
+- `TestAddressOnlyEmailRefusesToListen` — `ErrNoInbox`, but `Get` works.
 - `TestDeleteRefusesWhileTasksAreListening` — names the listening tasks.
 - `TestSlowSubscriberDropsWithoutStallingPeers`
-- `emailsqlite`: round-trip of Auth JSON, cursor upsert preserving
-  `created_at`, migration ledger under store `"email"` sharing a file with
-  other stores.
+- In `leasing`: `TestRefsTravelOpaquely` — refs on resources and groups
+  round-trip through the repository untouched and unread;
+  `TestLeaseExposesItsGroup`.
+- In the example workflow (or `accounts` docs test): account ref wins,
+  group ref falls back — the resolution idiom.
+- `emailsqlite`: round-trip of Auth JSON and nil-Inbox mapping, cursor
+  upsert preserving `created_at`, migration ledger under store `"email"`
+  sharing a file with other stores.
 
 CI additions: none beyond the new packages riding `go test -race ./...`.
 
 ## Out of scope / open questions
 
-1. **Credential encryption at rest** — plaintext today, consistent with the
+1. **Dangling refs** — deleting an email leaves account/group refs pointing
+   at it; `Listen` fails loud with `ErrEmailNotFound`. Scrubbing would put
+   email knowledge inside leasing or accounts; left to the operator for now.
+2. **Credential encryption at rest** — plaintext today, consistent with the
    other stores; revisit as its own effort across all stores.
-2. **OAuth token acquisition** — the package refreshes access tokens from a
+3. **OAuth token acquisition** — the package refreshes access tokens from a
    stored refresh token; the interactive consent flow that produces the
    refresh token is the consumer's problem (CLI helper is a possible
    follow-up).
-3. **Folders** — INBOX only for now; a `Folder` field on Assignment is a
-   compatible later addition.
-4. **Richer filters** — subject/regex filters are compatible additions to
+4. **Folders** — INBOX only for now; a folder option is a compatible later
+   addition.
+5. **Richer filters** — subject/regex filters are compatible additions to
    `ListenOption`; sender-only matches the stated requirement.
-5. **Scaffolder** — no `rogojin new` flag for email in this pass; templates
+6. **Scaffolder** — no `rogojin new` flag for email in this pass; templates
    are untouched.
-6. **Message persistence** — deliberately none. The IMAP server is the
+7. **Message persistence** — deliberately none. The IMAP server is the
    durable log; `WithBackfill` is the replay mechanism. Revisit only if a
    vendor's retention becomes a problem.
