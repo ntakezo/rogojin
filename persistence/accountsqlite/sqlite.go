@@ -78,6 +78,14 @@ var migrations = []sqlitemigrate.Migration{
 		Name: "add strategy column to account_groups",
 		SQL:  `ALTER TABLE account_groups ADD COLUMN strategy TEXT NOT NULL DEFAULT ''`,
 	},
+	{
+		Name: "add email_id column to accounts",
+		SQL:  `ALTER TABLE accounts ADD COLUMN email_id TEXT NOT NULL DEFAULT ''`,
+	},
+	{
+		Name: "add refs column to account_groups",
+		SQL:  `ALTER TABLE account_groups ADD COLUMN refs TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 // Close closes the underlying database.
@@ -89,7 +97,7 @@ func (s *SQLite) Close() error {
 // order is deterministic.
 func (s *SQLite) List(ctx context.Context) ([]accounts.Account, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, group_id, owner_id, max_holders, successes, failures, fields, created_at, updated_at
+		`SELECT id, group_id, owner_id, max_holders, successes, failures, email_id, fields, created_at, updated_at
 		 FROM accounts ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
@@ -100,10 +108,10 @@ func (s *SQLite) List(ctx context.Context) ([]accounts.Account, error) {
 	for rows.Next() {
 		var a accounts.Account
 		var fields, created, updated string
-		if err := rows.Scan(&a.ID, &a.GroupID, &a.OwnerID, &a.MaxHolders, &a.Successes, &a.Failures, &fields, &created, &updated); err != nil {
+		if err := rows.Scan(&a.ID, &a.GroupID, &a.OwnerID, &a.MaxHolders, &a.Successes, &a.Failures, &a.Attrs.EmailID, &fields, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list accounts: %w", err)
 		}
-		a.Attrs = parseFields(fields)
+		a.Attrs.Fields = parseFields(fields)
 		if a.CreatedAt, err = parseTime(created); err != nil {
 			return nil, fmt.Errorf("list accounts: %w", err)
 		}
@@ -118,23 +126,24 @@ func (s *SQLite) List(ctx context.Context) ([]accounts.Account, error) {
 	return listed, nil
 }
 
-// Save upserts the account's record: group, holder policy, lock owner, fields,
-// stats, and updated_at. created_at is written on insert and never overwritten,
-// so a lock or a stat update cannot revise it.
+// Save upserts the account's record: group, holder policy, lock owner, the
+// forwarding email, fields, stats, and updated_at. created_at is written on
+// insert and never overwritten, so a lock or a stat update cannot revise it.
 func (s *SQLite) Save(ctx context.Context, a accounts.Account) error {
-	fields, err := formatFields(a.Attrs)
+	fields, err := formatFields(a.Attrs.Fields)
 	if err != nil {
 		return fmt.Errorf("save account %s: %w", a.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO accounts (id, group_id, owner_id, max_holders, successes, failures, fields, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO accounts (id, group_id, owner_id, max_holders, successes, failures, email_id, fields, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET group_id = excluded.group_id,
 		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
 		 successes = excluded.successes, failures = excluded.failures,
-		 fields = excluded.fields, updated_at = excluded.updated_at`,
-		a.ID, a.GroupID, a.OwnerID, a.MaxHolders, a.Successes, a.Failures, fields,
-		formatTime(a.CreatedAt), formatTime(a.UpdatedAt))
+		 email_id = excluded.email_id, fields = excluded.fields,
+		 updated_at = excluded.updated_at`,
+		a.ID, a.GroupID, a.OwnerID, a.MaxHolders, a.Successes, a.Failures,
+		a.Attrs.EmailID, fields, formatTime(a.CreatedAt), formatTime(a.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save account %s: %w", a.ID, err)
 	}
@@ -155,7 +164,7 @@ func (s *SQLite) Delete(ctx context.Context, id string) error {
 // left unread.
 func (s *SQLite) ListGroups(ctx context.Context) ([]accounts.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, strategy, created_at, updated_at FROM account_groups ORDER BY id`)
+		`SELECT id, strategy, refs, created_at, updated_at FROM account_groups ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list account groups: %w", err)
 	}
@@ -164,9 +173,12 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]accounts.Group, error) {
 	listed := make([]accounts.Group, 0)
 	for rows.Next() {
 		var g accounts.Group
-		var created, updated string
-		if err := rows.Scan(&g.ID, &g.Strategy, &created, &updated); err != nil {
+		var refs, created, updated string
+		if err := rows.Scan(&g.ID, &g.Strategy, &refs, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list account groups: %w", err)
+		}
+		if g.Refs, err = parseRefs(refs); err != nil {
+			return nil, fmt.Errorf("list account groups: decode refs of %s: %w", g.ID, err)
 		}
 		if g.CreatedAt, err = parseTime(created); err != nil {
 			return nil, fmt.Errorf("list account groups: %w", err)
@@ -186,12 +198,16 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]accounts.Group, error) {
 // never overwritten: when a group was created is not something a later save
 // gets to revise.
 func (s *SQLite) SaveGroup(ctx context.Context, g accounts.Group) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO account_groups (id, strategy, created_at, updated_at)
-		 VALUES (?, ?, ?, ?)
+	refs, err := formatRefs(g.Refs)
+	if err != nil {
+		return fmt.Errorf("save account group %s: %w", g.ID, err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO account_groups (id, strategy, refs, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET strategy = excluded.strategy,
-		 updated_at = excluded.updated_at`,
-		g.ID, g.Strategy, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
+		 refs = excluded.refs, updated_at = excluded.updated_at`,
+		g.ID, g.Strategy, refs, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save account group %s: %w", g.ID, err)
 	}
@@ -228,6 +244,31 @@ func parseFields(fields string) json.RawMessage {
 		return nil
 	}
 	return json.RawMessage(fields)
+}
+
+// formatRefs stores a group's refs as JSON text; no refs store as "" so
+// pre-refs rows keep round-tripping.
+func formatRefs(refs map[string]string) (string, error) {
+	if len(refs) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(refs)
+	if err != nil {
+		return "", fmt.Errorf("encode refs: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// parseRefs is the inverse of formatRefs.
+func parseRefs(refs string) (map[string]string, error) {
+	if refs == "" {
+		return nil, nil
+	}
+	decoded := make(map[string]string)
+	if err := json.Unmarshal([]byte(refs), &decoded); err != nil {
+		return nil, err
+	}
+	return decoded, nil
 }
 
 // formatTime stores timestamps as RFC3339Nano UTC text; the zero time stores

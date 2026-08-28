@@ -1311,4 +1311,3 @@ func TestAssignResourceWithoutARegisteredKind(t *testing.T) {
 		t.Fatalf("stored group = %v, want residential", stored)
 	}
 }
-

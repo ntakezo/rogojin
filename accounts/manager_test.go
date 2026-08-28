@@ -95,7 +95,7 @@ type profile struct {
 // into the workflow's own shape at the point of use.
 func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	raw := json.RawMessage(`{"email":"a@b.c","password":"hunter2"}`)
-	repo := newFakeRepo(Account{ID: "a1", Attrs: raw})
+	repo := newFakeRepo(Account{ID: "a1", Attrs: Attrs{Fields: raw}})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)
@@ -116,8 +116,8 @@ func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	if err := lease.Release(true); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	if string(repo.records["a1"].Attrs) != string(raw) {
-		t.Fatalf("persisted fields = %s, want untouched", repo.records["a1"].Attrs)
+	if string(repo.records["a1"].Attrs.Fields) != string(raw) {
+		t.Fatalf("persisted fields = %s, want untouched", repo.records["a1"].Attrs.Fields)
 	}
 }
 
@@ -133,7 +133,7 @@ func TestBindToleratesAccountsWithoutFields(t *testing.T) {
 		t.Fatalf("bound = %+v, want the zero profile", got)
 	}
 
-	if _, err := Bind[profile](Account{ID: "a9", Attrs: json.RawMessage(`{"email":`)}); err == nil {
+	if _, err := Bind[profile](Account{ID: "a9", Attrs: Attrs{Fields: json.RawMessage(`{"email":`)}}); err == nil {
 		t.Fatal("expected an error for malformed fields")
 	}
 }
@@ -173,4 +173,81 @@ func TestManagerSatisfiesTasksContract(t *testing.T) {
 		Unlock(ctx context.Context, taskID string) error
 		ReleaseStaleLock(ctx context.Context, a leasing.Assignment) error
 	} = m
+}
+
+// TestForwardingEmailPrefersTheAccountOverItsGroup verifies the resolution
+// order the forwarding-inbox edge lives by: the account's own EmailID wins,
+// the group's ref is the fallback, and neither means no inbox at all.
+func TestForwardingEmailPrefersTheAccountOverItsGroup(t *testing.T) {
+	group := Group{ID: "pool", Refs: map[string]string{EmailRef: "inbox-group"}}
+
+	pinned := Account{ID: "a1", Attrs: Attrs{EmailID: "inbox-own"}}
+	if got := ForwardingEmail(pinned, group); got != "inbox-own" {
+		t.Fatalf("resolved %q, want the account's own inbox-own", got)
+	}
+	inheriting := Account{ID: "a2"}
+	if got := ForwardingEmail(inheriting, group); got != "inbox-group" {
+		t.Fatalf("resolved %q, want the group's inbox-group", got)
+	}
+	if got := ForwardingEmail(inheriting, Group{ID: "bare"}); got != "" {
+		t.Fatalf("resolved %q, want empty when nothing is attached", got)
+	}
+}
+
+// TestEmailDeleteGuardSeesHeldAndLockedAccounts verifies the guard reports
+// exactly what email.Manager.Delete needs: tasks live-leasing a referencing
+// account under held, tasks merely durably locked under locked, resolved
+// through both attachment levels.
+func TestEmailDeleteGuardSeesHeldAndLockedAccounts(t *testing.T) {
+	repo := newFakeRepo()
+	ctx := context.Background()
+	m, err := NewManager(ctx, repo)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.CreateGroup(ctx, Group{ID: "pool", Refs: map[string]string{EmailRef: "inbox-1"}}); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	seed := []Account{
+		{ID: "a-own", Attrs: Attrs{EmailID: "inbox-1"}},
+		{ID: "a-inherit", GroupID: "pool"},
+		{ID: "a-other", Attrs: Attrs{EmailID: "inbox-2"}},
+	}
+	for _, a := range seed {
+		if err := m.Add(ctx, a); err != nil {
+			t.Fatalf("add %s: %v", a.ID, err)
+		}
+	}
+	guard := EmailDeleteGuard(m)
+
+	live, err := m.Acquire(ctx, Assignment{TaskID: "t-live", ResourceID: "a-own"})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	idle, err := m.Lock(ctx, Assignment{TaskID: "t-idle", GroupID: "pool"})
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	idle.Release(true) // the lock stays; only the lease ends
+	other, err := m.Acquire(ctx, Assignment{TaskID: "t-other", ResourceID: "a-other"})
+	if err != nil {
+		t.Fatalf("acquire other: %v", err)
+	}
+	defer other.Release(true)
+
+	held, locked := guard("inbox-1")
+	if len(held) != 1 || held[0] != "t-live" {
+		t.Fatalf("held = %v, want only t-live", held)
+	}
+	if len(locked) != 1 || locked[0] != "t-idle" {
+		t.Fatalf("locked = %v, want only t-idle", locked)
+	}
+
+	live.Release(true)
+	if held, _ := guard("inbox-1"); len(held) != 0 {
+		t.Fatalf("held after release = %v, want none", held)
+	}
+	if held, locked := guard(""); held != nil || locked != nil {
+		t.Fatalf("guard of empty id = %v/%v, want nothing", held, locked)
+	}
 }
