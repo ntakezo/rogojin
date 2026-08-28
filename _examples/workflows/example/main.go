@@ -33,35 +33,32 @@ func main() {
 	forward := newForwardProxy()
 	defer forward.Close()
 
-	// The manager is built first but the task service answers "is this in use?",
-	// so the guard reads svc at call time. It carries the kind, which is all
-	// that separates one manager's guard from another's.
-	var svc tasks.Service
-	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{ID: "local-1", URL: forward.URL}), nil,
-		proxies.WithUsagePolicy(tasks.NewGuard(&svc, states.ProxyKind)))
+	// Each manager stands alone: it guards its own pool from the leases and
+	// locks it owns and asks nothing of the task service.
+	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{ID: "local-1", GroupID: proxies.GlobalGroup, Attrs: proxies.Attrs{URL: forward.URL}}))
 	if err != nil {
 		log.Fatalf("proxy manager: %v", err)
 	}
 
-	// Accounts are the same machinery minus the rotation knob, guarded the same
-	// way against the same service — only the kind differs, so the account group
-	// named "global" is never confused with the proxy group of the same name.
+	// Accounts are the same machinery minus the rotation knob. The account
+	// group named "global" is never confused with the proxy group of the same
+	// name: a kind resolves only against its own manager.
 	accountManager, err := accounts.NewManager(ctx, newMemAccountRepo(accounts.Account{
 		ID:      "buyer-1",
 		GroupID: accounts.GlobalGroup,
-		Fields:  profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
-	}), nil, accounts.WithUsagePolicy(tasks.NewGuard(&svc, states.AccountKind)))
+		Attrs:   profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
+	}))
 	if err != nil {
 		log.Fatalf("account manager: %v", err)
 	}
 
-	// Both kinds of lock outlive the process, so each manager registers under its
-	// kind: deleting a task unlocks both, while repointing one drops only the
-	// lock that moved — a task sent to other proxies must keep the account it is
-	// halfway through a checkout as.
-	svc = tasks.NewService(newMemRepo(), comms.NewBus(),
-		tasks.WithResource(states.ProxyKind, manager.Unlock, proxies.StaleLockReleaser(manager)),
-		tasks.WithResource(states.AccountKind, accountManager.Unlock, accounts.StaleLockReleaser(accountManager)))
+	// Both kinds of lock outlive the process, so each manager registers under
+	// its kind: deleting a task unlocks both, while repointing one drops only
+	// the lock that moved — a task sent to other proxies must keep the account
+	// it is halfway through a checkout as.
+	svc := tasks.NewService(newMemRepo(), comms.NewBus(),
+		tasks.WithResource(states.ProxyKind, manager),
+		tasks.WithResource(states.AccountKind, accountManager))
 	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager, accountManager)); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}

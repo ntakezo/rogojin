@@ -74,6 +74,10 @@ var migrations = []sqlitemigrate.Migration{
 			updated_at  TEXT NOT NULL DEFAULT ''
 		)`,
 	},
+	{
+		Name: "add strategy column to account_groups",
+		SQL:  `ALTER TABLE account_groups ADD COLUMN strategy TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 // Close closes the underlying database.
@@ -99,7 +103,7 @@ func (s *SQLite) List(ctx context.Context) ([]accounts.Account, error) {
 		if err := rows.Scan(&a.ID, &a.GroupID, &a.OwnerID, &a.MaxHolders, &a.Successes, &a.Failures, &fields, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list accounts: %w", err)
 		}
-		a.Fields = parseFields(fields)
+		a.Attrs = parseFields(fields)
 		if a.CreatedAt, err = parseTime(created); err != nil {
 			return nil, fmt.Errorf("list accounts: %w", err)
 		}
@@ -118,7 +122,7 @@ func (s *SQLite) List(ctx context.Context) ([]accounts.Account, error) {
 // stats, and updated_at. created_at is written on insert and never overwritten,
 // so a lock or a stat update cannot revise it.
 func (s *SQLite) Save(ctx context.Context, a accounts.Account) error {
-	fields, err := formatFields(a.Fields)
+	fields, err := formatFields(a.Attrs)
 	if err != nil {
 		return fmt.Errorf("save account %s: %w", a.ID, err)
 	}
@@ -146,10 +150,12 @@ func (s *SQLite) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListGroups returns every stored account group in stable id order.
+// ListGroups returns every stored account group in stable id order. The
+// max_holders column is legacy — holder policy lives on the account — and is
+// left unread.
 func (s *SQLite) ListGroups(ctx context.Context) ([]accounts.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, max_holders, created_at, updated_at FROM account_groups ORDER BY id`)
+		`SELECT id, strategy, created_at, updated_at FROM account_groups ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list account groups: %w", err)
 	}
@@ -159,7 +165,7 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]accounts.Group, error) {
 	for rows.Next() {
 		var g accounts.Group
 		var created, updated string
-		if err := rows.Scan(&g.ID, &g.MaxHolders, &created, &updated); err != nil {
+		if err := rows.Scan(&g.ID, &g.Strategy, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list account groups: %w", err)
 		}
 		if g.CreatedAt, err = parseTime(created); err != nil {
@@ -181,11 +187,11 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]accounts.Group, error) {
 // gets to revise.
 func (s *SQLite) SaveGroup(ctx context.Context, g accounts.Group) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO account_groups (id, max_holders, created_at, updated_at)
+		`INSERT INTO account_groups (id, strategy, created_at, updated_at)
 		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET max_holders = excluded.max_holders,
+		 ON CONFLICT(id) DO UPDATE SET strategy = excluded.strategy,
 		 updated_at = excluded.updated_at`,
-		g.ID, g.MaxHolders, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
+		g.ID, g.Strategy, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save account group %s: %w", g.ID, err)
 	}

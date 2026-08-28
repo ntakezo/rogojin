@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
 	"github.com/ntakezo/rogojin/comms"
+	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/workflows"
 )
 
@@ -59,10 +59,6 @@ type Repository interface {
 	DeleteGroup(ctx context.Context, id string) error
 	// TasksInGroup returns the ids of every task in the group.
 	TasksInGroup(ctx context.Context, groupID string) ([]string, error)
-	// TasksPinnedTo returns every task record pinned to resourceID for the
-	// kind. Whole records, not ids: which of them could still run is a rule
-	// this store does not own.
-	TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]Record, error)
 }
 
 // A Service registers workflows and creates, recovers, groups, and deletes
@@ -102,22 +98,6 @@ type Service interface {
 	// IsRunning reports whether a known task is started and not yet terminal.
 	// A suspended task counts: it is parked, not finished.
 	IsRunning(id string) bool
-	// RunningTasks returns the ids of every task actively running against the
-	// kind's groupID. With TaskIsRunning it satisfies the usage guard a leasing
-	// manager consults before deleting a resource or a group, so a pool is
-	// never torn out from under a run. Each manager asks about its own kind, so
-	// a proxy group and an account group may share a name without colliding.
-	RunningTasks(ctx context.Context, kind, groupID string) ([]string, error)
-	// TaskIsRunning reports whether the named task is actively running. It
-	// answers the half of the usage guard that asks about one task rather than
-	// a whole group, for a resource some task holds a durable lock on. The
-	// question is kind-agnostic: a task runs, or it does not.
-	TaskIsRunning(ctx context.Context, taskID string) (bool, error)
-	// PinnedTasks returns the ids of every task pinned to the kind's resourceID
-	// that could still run, running or not. It is the half of the usage guard a
-	// leasing manager cannot answer for itself: a durable lock lives on the
-	// resource, but a pin lives here.
-	PinnedTasks(ctx context.Context, kind, resourceID string) ([]string, error)
 }
 
 type service struct {
@@ -128,8 +108,6 @@ type service struct {
 	repository Repository
 
 	bus comms.Bus
-
-	release ReleaseFunc
 
 	resources []resource
 
@@ -249,98 +227,6 @@ func (s *service) IsRunning(id string) bool {
 
 	t, ok := s.taskRegistry[id]
 	return ok && t.IsRunning()
-}
-
-// RunningTasks reports which tasks are actively running against the kind's
-// groupID, reading the group each was actually wired to rather than what its
-// record now says: a task started before a reassignment is still running
-// against the old pool. A suspended task is excluded — it is parked between
-// states with no request in flight, which is what makes suspending a task the
-// way to free its resources for deletion. It answers from this service's
-// registry, so in a multi-process deployment it sees only this process's runs.
-// It never errors; the signature matches the port it satisfies.
-func (s *service) RunningTasks(ctx context.Context, kind, groupID string) ([]string, error) {
-	s.taskRegistryMu.RLock()
-	defer s.taskRegistryMu.RUnlock()
-
-	ids := make([]string, 0)
-	for id, t := range s.taskRegistry {
-		if wired, _ := t.Assignment(kind); isActive(t) && wired == groupID {
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	return ids, nil
-}
-
-// TaskIsRunning reports whether the task is actively running, on the same
-// suspended-is-not-running reading as RunningTasks. An unknown task — never
-// created here, or already deleted — is not running.
-func (s *service) TaskIsRunning(ctx context.Context, taskID string) (bool, error) {
-	s.taskRegistryMu.RLock()
-	defer s.taskRegistryMu.RUnlock()
-
-	t, known := s.taskRegistry[taskID]
-	return known && isActive(t), nil
-}
-
-// isActive reports whether the task is advancing right now, as opposed to
-// merely started: a suspended task has stopped at a state boundary.
-func isActive(t *task) bool {
-	return t.Status() == workflows.StatusRunning
-}
-
-// PinnedTasks reports which tasks pinned to the kind's resourceID could still
-// run, so a deletion can be weighed before it happens rather than discovered at
-// the task's next lease. A task counts when it is resumable from a durable
-// checkpoint, or is live in this process's registry and not yet terminal.
-//
-// Tasks that finished, and tasks that ran without durability and so kept no
-// checkpoint to resume from, are left out: nothing can make them run again, and
-// warning about them is noise.
-func (s *service) PinnedTasks(ctx context.Context, kind, resourceID string) ([]string, error) {
-	if resourceID == "" {
-		return nil, nil
-	}
-
-	// The registry lock is dropped before the store is read: a repository call
-	// under it would block every other task operation for the length of a query.
-	s.taskRegistryMu.RLock()
-	counted := make(map[string]bool)
-	for id, t := range s.taskRegistry {
-		if _, pin := t.Assignment(kind); pin == resourceID && !t.Status().Terminal() {
-			counted[id] = true
-		}
-	}
-	s.taskRegistryMu.RUnlock()
-
-	ids := make([]string, 0, len(counted))
-	for id := range counted {
-		ids = append(ids, id)
-	}
-
-	if s.repository != nil {
-		records, err := s.repository.TasksPinnedTo(ctx, kind, resourceID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list tasks pinned to %s %s: %w", kind, resourceID, err)
-		}
-		for _, record := range records {
-			if counted[record.ID] || !resumable(record) {
-				continue
-			}
-			ids = append(ids, record.ID)
-		}
-	}
-	sort.Strings(ids)
-	return ids, nil
-}
-
-// resumable reports whether a stored task could still be started. Durability
-// begins at the first checkpoint, so a record that never checkpointed has
-// nothing to resume from; a terminal one has nothing left to do.
-func resumable(record Record) bool {
-	status := workflows.Status(record.Status)
-	return status != workflows.StatusNotStarted && !status.Terminal()
 }
 
 func (s *service) RecoverTask(ctx context.Context, id string) (Task, error) {
@@ -499,15 +385,15 @@ func (s *service) AssignResource(ctx context.Context, id string, kind string, as
 	if err := s.repository.SaveAssignment(ctx, id, kind, assignment); err != nil {
 		return fmt.Errorf("failed to assign %s placement of task %s: %w", kind, id, err)
 	}
-	stale := s.staleLockReleaser(kind)
-	if stale == nil {
+	manager := s.managerFor(kind)
+	if manager == nil {
 		return nil
 	}
 
-	// The releaser is told the placement as resolved, not as stored: a nil group
+	// The manager is told the placement as resolved, not as stored: a nil group
 	// inherits the task group's, which is what the task will actually lease from.
 	resolved := resolve(assignment, group, kind)
-	if err := stale(ctx, id, resolved.GroupID, resolved.ResourceID); err != nil {
+	if err := manager.ReleaseStaleLock(ctx, leasing.Assignment{TaskID: id, GroupID: resolved.GroupID, ResourceID: resolved.ResourceID}); err != nil {
 		return fmt.Errorf("failed to release the stale %s lock of task %s: %w", kind, id, err)
 	}
 	return nil
@@ -542,22 +428,14 @@ func (s *service) deleteTaskLocked(ctx context.Context, id string) error {
 	return s.repository.DeleteTask(ctx, id)
 }
 
-// releaseTask frees everything bound to the task: the general releaser, then
-// every registered kind's unlock. All of them run even when one fails — a lock
-// left held is unleasable forever, so one broken store must not strand the
-// locks the other managers would have freed.
+// releaseTask frees every registered kind's durable lock on the task. All of
+// them run even when one fails — a lock left held is unleasable forever, so
+// one broken store must not strand the locks the other managers would have
+// freed.
 func (s *service) releaseTask(ctx context.Context, id string) error {
 	var errs []error
-	if s.release != nil {
-		if err := s.release(ctx, id); err != nil {
-			errs = append(errs, err)
-		}
-	}
 	for _, r := range s.resources {
-		if r.unlock == nil {
-			continue
-		}
-		if err := r.unlock(ctx, id); err != nil {
+		if err := r.manager.Unlock(ctx, id); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", r.kind, err))
 		}
 	}
@@ -567,12 +445,12 @@ func (s *service) releaseTask(ctx context.Context, id string) error {
 	return fmt.Errorf("failed to release resources of task %s: %w", id, errors.Join(errs...))
 }
 
-// staleLockReleaser returns the registered stale-lock release for the kind, or
-// nil when no manager of that kind is wired.
-func (s *service) staleLockReleaser(kind string) StaleLockFunc {
+// managerFor returns the registered manager for the kind, or nil when no
+// manager of that kind is wired.
+func (s *service) managerFor(kind string) ResourceManager {
 	for _, r := range s.resources {
 		if r.kind == kind {
-			return r.stale
+			return r.manager
 		}
 	}
 	return nil

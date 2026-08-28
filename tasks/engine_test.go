@@ -139,10 +139,6 @@ func (f *fakeStore) SaveAssignment(ctx context.Context, id string, kind string, 
 	return nil
 }
 
-func (f *fakeStore) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]Record, error) {
-	return nil, nil
-}
-
 func (f *fakeStore) RecoverTask(ctx context.Context, id string) (Record, error) {
 	return Record{}, nil
 }

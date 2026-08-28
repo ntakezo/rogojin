@@ -20,7 +20,7 @@ func TestAResourceKindNeedsNoConfiguration(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	m, err := NewManager(ctx, Config[payload]{Noun: "api key", Repository: repo})
+	m, err := NewManager(ctx, Repository[payload](repo))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestPayloadSurvivesALockAndARestart(t *testing.T) {
 	repo := newFakeRepo(res{ID: "k1", Attrs: want})
 	ctx := context.Background()
 
-	m, err := NewManager(ctx, Config[payload]{Noun: "api key", Repository: repo})
+	m, err := NewManager(ctx, Repository[payload](repo))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestPayloadSurvivesALockAndARestart(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 
-	restarted, err := NewManager(ctx, Config[payload]{Noun: "api key", Repository: repo})
+	restarted, err := NewManager(ctx, Repository[payload](repo))
 	if err != nil {
 		t.Fatalf("NewManager after restart: %v", err)
 	}
@@ -78,27 +78,37 @@ func TestPayloadSurvivesALockAndARestart(t *testing.T) {
 	}
 }
 
-// TestConfigIsValidatedNotRepaired verifies a misconfigured default strategy is
-// reported. Quietly substituting round robin would hand every group an
-// algorithm nobody asked for, and the mistake would only show as odd rotation.
-func TestConfigIsValidatedNotRepaired(t *testing.T) {
-	ctx := context.Background()
-	repo := newFakeRepo()
-
-	if _, err := NewManager(ctx, Config[payload]{Repository: repo, DefaultStrategy: "absent"}); err == nil {
-		t.Fatal("expected an unregistered default strategy to be refused")
-	}
-
-	strategies := map[string]StrategyFactory[payload]{
-		"mine": func() Selection[payload] { return firstSelection{} },
-	}
-	if _, err := NewManager(ctx, Config[payload]{Repository: repo, Strategies: strategies}); err == nil {
-		t.Fatal("expected configured strategies with no named default to be refused")
-	}
-	if _, err := NewManager(ctx, Config[payload]{Repository: repo, Strategies: strategies, DefaultStrategy: "mine"}); err != nil {
-		t.Fatalf("a named, registered default: %v", err)
-	}
-	if _, err := NewManager(ctx, Config[payload]{}); err == nil {
+// TestNewManagerRequiresARepository verifies the one hard requirement is
+// reported rather than deferred to a nil dereference mid-lease.
+func TestNewManagerRequiresARepository(t *testing.T) {
+	if _, err := NewManager[payload](context.Background(), nil); err == nil {
 		t.Fatal("expected a repository to be required")
+	}
+}
+
+// TestWithStrategyOverridesRoundRobin verifies a custom factory registered
+// under the round-robin name replaces the built-in, which is the documented way
+// to override the default.
+func TestWithStrategyOverridesRoundRobin(t *testing.T) {
+	repo := newFakeRepo(res{ID: "k1"}, res{ID: "k2"})
+	ctx := context.Background()
+
+	m, err := NewManager(ctx, Repository[payload](repo),
+		WithStrategy(StrategyRoundRobin, func() Selection[payload] { return firstSelection{} }))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	for i := range 2 {
+		lease, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		if lease.Resource().ID != "k1" {
+			t.Fatalf("acquire %d = %s, want k1 every time under the override", i, lease.Resource().ID)
+		}
+		if err := lease.Release(true); err != nil {
+			t.Fatalf("release %d: %v", i, err)
+		}
 	}
 }
