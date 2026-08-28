@@ -544,7 +544,8 @@ func TestDeleteRefusesWhileTasksAreListening(t *testing.T) {
 // TestDeleteRefusesWhileAReferencingAccountIsHeld verifies the guard side
 // of the delete policy — the same policy leasing institutes for resources
 // under running tasks: live leases block, idle durable locks report as
-// stranded rather than blocking.
+// stranded rather than blocking. The guard here is a fake; accounts covers
+// installing the real one through WithEmail.
 func TestDeleteRefusesWhileAReferencingAccountIsHeld(t *testing.T) {
 	server := newFakeServer()
 	held := []string{"t-running"}
@@ -554,7 +555,8 @@ func TestDeleteRefusesWhileAReferencingAccountIsHeld(t *testing.T) {
 		}
 		return held, []string{"t-suspended"}
 	}
-	m := newTestManager(t, newMemRepo(), server, WithDeleteGuard(guard))
+	m := newTestManager(t, newMemRepo(), server)
+	m.GuardDeletes(guard)
 	addEmail(t, m, testEmail("inbox-1"))
 
 	if _, err := m.Delete(context.Background(), "inbox-1"); !errors.Is(err, ErrEmailInUse) {

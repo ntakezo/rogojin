@@ -107,14 +107,6 @@ type Repository interface {
 	Delete(ctx context.Context, id string) error
 }
 
-// A DeleteGuard is the referential check Delete consults: given an email
-// ID, the task IDs of accounts held by a live lease (held) and of accounts
-// bound only by a durable lock (locked) whose effective forwarding inbox is
-// that email. This package carries the hook; accounts supplies the
-// canonical implementation. Without a guard, Delete checks only active
-// subscriptions.
-type DeleteGuard func(emailID string) (held, locked []string)
-
 // ErrEmailNotFound is returned when an operation names an email the manager
 // does not know — deleted while a referencing task was down, or never
 // added. A dangling account reference surfaces here, at Listen, rather than

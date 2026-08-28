@@ -166,9 +166,10 @@ const EmailRef = "email"
 // otherwise. Empty means no inbox is attached at either level.
 func ForwardingEmail(a Account, g Group) string
 
-// EmailDeleteGuard adapts this manager into the referential check
-// email.Manager.Delete consults; see the delete-guard section.
-func EmailDeleteGuard(m *Manager) email.DeleteGuard
+// WithEmail hands the manager the email inventory its accounts forward
+// to, installing the referential delete check into it; see the
+// delete-policy section.
+func WithEmail(m *email.Manager) Option
 ```
 
 Accounts stay pure aliases — no wrapper managers return. Cards keep raw
@@ -246,14 +247,12 @@ type Option func(*Manager)
 func WithDropHandler(fn func(emailID, taskID string, dropped uint64)) Option
 func WithListenerErrorHandler(fn func(emailID string, err error)) Option
 
-// DeleteGuard is the referential check Delete consults: given an email ID,
-// the task IDs of accounts held by a live lease (held) and of accounts
-// bound only by a durable lock (locked) whose effective forwarding inbox
-// is that email. email carries the hook; accounts supplies the canonical
-// implementation. Without a guard, Delete checks only active subscriptions.
-type DeleteGuard func(emailID string) (held, locked []string)
-
-func WithDeleteGuard(g DeleteGuard) Option
+// GuardDeletes installs the referential check Delete consults before
+// removing an email: which tasks hold a live lease on — and which merely
+// durably lock — an account forwarding to it. accounts.NewManager installs
+// this when handed the email manager; consumers never call it. Without a
+// guard, Delete checks only active subscriptions.
+func (m *Manager) GuardDeletes(guard func(emailID string) (held, locked []string))
 
 // Inventory.
 func (m *Manager) Add(ctx context.Context, e Email) error
@@ -289,26 +288,21 @@ tasks, applied to the account→email edge:
   but their task IDs come back as `stranded`, so the caller decides, just
   as leasing reports unbound task IDs rather than acting.
 
-`email` cannot see accounts (the import points the other way), so the check
-arrives as an injected `DeleteGuard` — and `accounts`, which owns the model
-and the resolution, exports its canonical construction:
+`email` cannot see accounts (the import points the other way), so the
+account manager is what closes the loop: it optionally takes the email
+manager at construction and installs the check itself through
+`email.Manager.GuardDeletes` — no guard type, no consumer-side wiring
+ceremony:
 
 ```go
-// accounts package (imports email)
-
-// EmailDeleteGuard returns the referential check email.Manager.Delete
-// consults: which tasks hold, or durably lock, an account whose effective
-// forwarding inbox is the email in question.
-func EmailDeleteGuard(m *Manager) email.DeleteGuard
+emailMgr, _ := email.NewManager(ctx, emailRepo)
+accountMgr, _ := accounts.NewManager(ctx, accountRepo, accounts.WithEmail(emailMgr))
 ```
 
-Consumer main wires the two managers together — the same composition point
-where `tasks.WithResource` lives:
-
-```go
-emailMgr, _ := email.NewManager(ctx, emailRepo,
-	email.WithDeleteGuard(accounts.EmailDeleteGuard(accountMgr)))
-```
+`accounts.WithEmail` is the whole composition surface; the closure it
+installs resolves `ForwardingEmail` over the manager's `Held`/`Locked`
+facts. An account manager built without it leaves email deletes guarded by
+subscriptions alone.
 
 ### Listen
 
@@ -518,8 +512,8 @@ Guarantee-shaped tests:
 - `TestAddressOnlyEmailRefusesToListen` — `ErrNoInbox`, but `Get` works.
 - `TestDeleteRefusesWhileAReferencingAccountIsHeld` — a guard reporting a
   live lease blocks and names the task; idle lock comes back as `stranded`
-  (fake guard in `email`; the real one is covered in `accounts` by
-  `TestEmailDeleteGuardSeesHeldAndLockedAccounts`).
+  (fake guard in `email`; the real wiring is covered in `accounts` by
+  `TestWithEmailProtectsReferencedInboxes`).
 - `TestDeleteRefusesWhileTasksAreListening` — names the listening tasks.
 - `TestSlowSubscriberDropsWithoutStallingPeers`
 - In `accounts`: `TestForwardingEmailPrefersTheAccountOverItsGroup`,
@@ -540,10 +534,10 @@ CI additions: none beyond the new packages riding `go test -race ./...`.
 2. `email` + `emailsqlite`: the package itself — no domain imports, so it
    lands standalone with a fake guard in tests.
 3. `accounts`: typed `Attrs`, `Bind` over `Attrs.Fields`, `EmailRef`,
-   `ForwardingEmail`, `EmailDeleteGuard`; `accountsqlite` migration and
+   `ForwardingEmail`, `WithEmail`; `accountsqlite` migration and
    port change; update the example workflow's `Bind` usage.
 4. `cardsqlite`/`proxysqlite`: group `refs` migrations.
-5. Wire the guard and the `inbox` idiom into `_examples`.
+5. Wire `WithEmail` and the `inbox` idiom into `_examples`.
 
 ## Out of scope / open questions
 

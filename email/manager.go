@@ -28,12 +28,6 @@ func WithListenerErrorHandler(fn func(emailID string, err error)) Option {
 	return func(m *Manager) { m.errHandler = fn }
 }
 
-// WithDeleteGuard installs the referential check Delete consults; see
-// DeleteGuard. accounts.EmailDeleteGuard is the canonical implementation.
-func WithDeleteGuard(g DeleteGuard) Option {
-	return func(m *Manager) { m.guard = g }
-}
-
 // withDialer substitutes the IMAP dialer, so tests can serve scripted
 // mailboxes without a server.
 func withDialer(d dialer) Option {
@@ -47,14 +41,25 @@ func withDialer(d dialer) Option {
 type Manager struct {
 	repo        Repository
 	dial        dialer
-	guard       DeleteGuard
 	dropHandler func(emailID, taskID string, dropped uint64)
 	errHandler  func(emailID string, err error)
 
 	mu        sync.Mutex
+	guard     func(emailID string) (held, locked []string)
 	inventory map[string]Email
 	listeners map[string]*listener
 	closed    bool
+}
+
+// GuardDeletes installs the referential check Delete consults before
+// removing an email: which tasks hold a live lease on — and which merely
+// durably lock — an account forwarding to it. accounts.NewManager installs
+// this when handed the email manager; consumers never call it. Without a
+// guard, Delete checks only active subscriptions.
+func (m *Manager) GuardDeletes(guard func(emailID string) (held, locked []string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.guard = guard
 }
 
 // NewManager loads the inventory from the repository. The inventory changes
