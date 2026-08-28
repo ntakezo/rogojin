@@ -6,6 +6,7 @@ package proxysqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -81,6 +82,10 @@ var migrations = []sqlitemigrate.Migration{
 			updated_at  TEXT NOT NULL DEFAULT ''
 		)`,
 	},
+	{
+		Name: "add refs column to proxy_groups",
+		SQL:  `ALTER TABLE proxy_groups ADD COLUMN refs TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 // Close closes the underlying database.
@@ -153,7 +158,7 @@ func (s *SQLite) Delete(ctx context.Context, id string) error {
 // left unread.
 func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, strategy, created_at, updated_at FROM proxy_groups ORDER BY id`)
+		`SELECT id, strategy, refs, created_at, updated_at FROM proxy_groups ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list proxy groups: %w", err)
 	}
@@ -162,9 +167,12 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 	listed := make([]proxies.Group, 0)
 	for rows.Next() {
 		var g proxies.Group
-		var created, updated string
-		if err := rows.Scan(&g.ID, &g.Strategy, &created, &updated); err != nil {
+		var refs, created, updated string
+		if err := rows.Scan(&g.ID, &g.Strategy, &refs, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list proxy groups: %w", err)
+		}
+		if g.Refs, err = parseRefs(refs); err != nil {
+			return nil, fmt.Errorf("list proxy groups: decode refs of %s: %w", g.ID, err)
 		}
 		if g.CreatedAt, err = parseTime(created); err != nil {
 			return nil, fmt.Errorf("list proxy groups: %w", err)
@@ -184,16 +192,45 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 // never overwritten: when a group was created is not something a later save
 // gets to revise.
 func (s *SQLite) SaveGroup(ctx context.Context, g proxies.Group) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO proxy_groups (id, strategy, created_at, updated_at)
-		 VALUES (?, ?, ?, ?)
+	refs, err := formatRefs(g.Refs)
+	if err != nil {
+		return fmt.Errorf("save proxy group %s: %w", g.ID, err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO proxy_groups (id, strategy, refs, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET strategy = excluded.strategy,
-		 updated_at = excluded.updated_at`,
-		g.ID, g.Strategy, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
+		 refs = excluded.refs, updated_at = excluded.updated_at`,
+		g.ID, g.Strategy, refs, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save proxy group %s: %w", g.ID, err)
 	}
 	return nil
+}
+
+// formatRefs stores a group's refs as JSON text; no refs store as "" so
+// pre-refs rows keep round-tripping.
+func formatRefs(refs map[string]string) (string, error) {
+	if len(refs) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(refs)
+	if err != nil {
+		return "", fmt.Errorf("encode refs: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// parseRefs is the inverse of formatRefs.
+func parseRefs(refs string) (map[string]string, error) {
+	if refs == "" {
+		return nil, nil
+	}
+	decoded := make(map[string]string)
+	if err := json.Unmarshal([]byte(refs), &decoded); err != nil {
+		return nil, err
+	}
+	return decoded, nil
 }
 
 // DeleteGroup removes the group's record; absent rows are a no-op. Member
