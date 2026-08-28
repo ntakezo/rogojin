@@ -481,21 +481,25 @@ referencing accounts. Wrapped errors follow house style:
 ## Testing
 
 White-box, same package, no assertion library. The IMAP boundary is an
-unexported seam so the loop is testable without a server:
+exported seam — consumers testing workflows need scripted inboxes as much
+as this package does, and the example serves its verification mail through
+one:
 
 ```go
-// mailbox is what the listener loop needs from an IMAP session; the real
-// implementation wraps go-imap, tests substitute a scripted fake.
-type mailbox interface {
+// Mailbox is one authenticated session against an inbox; the production
+// implementation wraps go-imap, tests and examples substitute fakes.
+type Mailbox interface {
 	Select(ctx context.Context) (uidValidity, lastUID uint32, err error)
 	FetchSince(ctx context.Context, uid uint32) ([]Message, error)
 	FetchSinceDate(ctx context.Context, since time.Time) ([]Message, error) // backfill
 	Idle(ctx context.Context) error // returns when new mail may exist
 	Close() error
 }
-```
 
-injected via an unexported `withDialer(func(Email) (mailbox, error))` option.
+type Dialer func(e Email) (Mailbox, error)
+
+func WithDialer(d Dialer) Option
+```
 
 Guarantee-shaped tests:
 

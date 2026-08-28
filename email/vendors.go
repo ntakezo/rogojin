@@ -67,7 +67,7 @@ func validateInbox(in Inbox) error {
 
 // dialIMAP opens and authenticates the vendor session for e; it is the
 // production dialer behind every listener and backfill.
-func dialIMAP(e Email) (mailbox, error) {
+func dialIMAP(e Email) (Mailbox, error) {
 	if e.Inbox == nil {
 		return nil, ErrNoInbox
 	}
