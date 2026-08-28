@@ -13,11 +13,11 @@ is fan-out, never first-taker-wins.
 
 An email reaches a task through its **account**, not through task placement.
 An account, or an account group, is attached to an email at creation time —
-the account carries the foreign key. Formally this is a **forwarding
-inbox**: one inbox commonly receives mail for many personas (a catch-all, a
-plus-addressed pool, a group-wide shared box). The attached email's address
-may happen to equal the address inside the account's own payload; that
-coincidence is not modeled.
+the account carries the foreign key, as a first-class typed field. Formally
+this is a **forwarding inbox**: one inbox commonly receives mail for many
+personas (a catch-all, a plus-addressed pool, a group-wide shared box). The
+attached email's address may happen to equal the address inside the
+account's own payload; that coincidence is not modeled.
 
 The workflow decides everything downstream: which sender to listen for, and
 how to parse whatever arrives — if it listens at all.
@@ -39,18 +39,18 @@ how to parse whatever arrives — if it listens at all.
 
 ```
 email/
-  email.go      Email, Inbox, Message, Repository, RefKey, errors
-  manager.go    Manager: inventory, subscriptions, fan-out
+  email.go      Email, Inbox, Message, Repository, errors
+  manager.go    Manager: inventory, subscriptions, fan-out, delete guard
   listener.go   per-inbox IMAP loop: dial, select, backfill, IDLE, reconnect
   vendors.go    Vendor table: endpoints and auth mechanisms for gmail/outlook
 persistence/
   emailsqlite/  SQLite adapter for email.Repository (store name "email")
 ```
 
-`email` does not import `leasing`, `tasks`, or `workflows`. It is imported
-by the consumer's workflow code and by its own persistence adapter. It
-imports the IMAP client library directly — the IMAP engine is the package's
-reason to exist, not an adapter concern.
+`email` does not import `leasing`, `tasks`, `accounts`, or `workflows`. It
+is imported by the consumer's workflow code and by its own persistence
+adapter. It imports the IMAP client library directly — the IMAP engine is
+the package's reason to exist, not an adapter concern.
 
 Proposed dependencies (new to go.mod):
 
@@ -116,72 +116,104 @@ type Message struct {
 	Text      string
 	HTML      string
 }
-
-// RefKey is the leasing ref key under which an account or account group
-// names its forwarding inbox: Refs[email.RefKey] = emailID.
-const RefKey = "email"
 ```
 
 Why a typed struct instead of `json.RawMessage`: the package itself must
 dial IMAP from these fields, so the schema is owned here, not by the
 consumer.
 
-## The attachment: refs on leasing resources
+## Consolidating the concrete account model
 
-The foreign key lives on the account, and accounts are pure type aliases of
-`leasing.Resource[json.RawMessage]` — so the carrying surface is added to
-`leasing`, kept exactly as ignorant as `Attrs` already is:
+The framework today guarantees fields at exactly one place per kind: the
+generic `leasing.Resource[T]` carries `ID`, `GroupID`, `OwnerID`,
+timestamps, and outcome counters; anything kind-specific lives in `Attrs T`.
+Proxies already use a typed `Attrs{URL}`; accounts and cards use raw JSON
+and therefore have **no concrete model** — nowhere to guarantee an
+account-specific field.
+
+The consolidation: **each kind's concrete model is its typed `Attrs`
+struct.** Accounts move from `json.RawMessage` to a typed payload that
+guarantees the forwarding email ID while keeping the consumer's payload
+opaque inside it:
 
 ```go
-// leasing.Resource[T] gains:
-	Refs map[string]string `json:"refs,omitempty"`
+// accounts package
 
-// leasing.Group gains the same field.
+// Attrs is the concrete account model: the fields the framework
+// guarantees on every account, wrapped around the consumer's own payload.
+type Attrs struct {
+	// EmailID names this account's forwarding inbox in the email
+	// inventory. Empty inherits the account group's, if any.
+	EmailID string `json:"emailID,omitempty"`
+	// Fields is the consumer's opaque payload, exactly as before.
+	Fields json.RawMessage `json:"fields,omitempty"`
+}
+
+type Account = leasing.Resource[Attrs]
+
+// Bind decodes the consumer half of the account — Attrs.Fields — into F.
+func Bind[F any](a Account) (F, error)
+
+// EmailRef is the group-ref key under which an account group names its
+// forwarding inbox: Group.Refs[EmailRef] = emailID.
+const EmailRef = "email"
+
+// ForwardingEmail resolves the effective forwarding inbox of an account in
+// its group: the account's own EmailID wherever set, the group's ref
+// otherwise. Empty means no inbox is attached at either level.
+func ForwardingEmail(a Account, g Group) string
 ```
 
-**Refs are carried, never read.** Leasing persists and returns them and
-attaches no meaning — the same contract `Attrs` has. The key/value
-convention (`"email"` → email ID) belongs to the consumer and the `email`
-package. Cards and proxies inherit the field and simply leave it empty.
-This keeps the leasing boundary intact: no email concept enters the
-mechanism layer.
+Accounts stay pure aliases — no wrapper managers return. Cards keep raw
+JSON until they earn a guaranteed field; the pattern is now established.
+
+### Group-level attachment: refs on leasing groups
+
+`leasing.Group` has no payload, so the group side needs minimal carriage:
+
+```go
+// leasing.Group gains:
+	Refs map[string]string `json:"refs,omitempty"`
+```
+
+**Refs are carried, never read** — the same contract `Attrs` has on
+resources. Leasing persists and returns them and attaches no meaning; the
+`accounts.EmailRef` convention belongs to accounts. Card and proxy groups
+inherit the field and leave it empty. No email concept enters the mechanism
+layer.
 
 Attachment happens at creation time through existing signatures — both
 already take the full struct:
 
 ```go
 mgr.CreateGroup(ctx, accounts.Group{ID: "pool-a",
-	Refs: map[string]string{email.RefKey: "inbox-1"}})   // group-wide forwarding inbox
+	Refs: map[string]string{accounts.EmailRef: "inbox-1"}}) // group-wide forwarding inbox
 
 mgr.Add(ctx, accounts.Account{ID: "acct-7", GroupID: "pool-a",
-	Refs: map[string]string{email.RefKey: "inbox-2"},    // per-account override
-	Attrs: payload})
+	Attrs: accounts.Attrs{EmailID: "inbox-2", Fields: payload}}) // per-account override
 ```
 
-Resolution is per-key, account wins, group falls back — the same shape task
-placement already uses for resource groups. To make the group side reachable
-from a running task, `leasing.Lease[T]` gains one read accessor:
+### New leasing read surface
+
+Resolution and the delete guard both need facts leasing already owns — who
+holds a live lease, who holds a durable lock — filtered by meaning leasing
+doesn't have. Three small read accessors, all generic, none aware of email:
 
 ```go
 // Group returns the group of the leased resource as of acquisition.
 func (l *Lease[T]) Group() Group
+
+// Held reports the assignment of every resource currently held by a live
+// lease (acquire or lock mode) whose resource and group satisfy pred.
+func (m *Manager[T]) Held(pred func(Resource[T], Group) bool) []Assignment
+
+// Locked reports the assignment of every durably locked resource (OwnerID
+// set), running or not, whose resource and group satisfy pred.
+func (m *Manager[T]) Locked(pred func(Resource[T], Group) bool) []Assignment
 ```
 
-so the workflow resolves with no new lookup surface on the manager:
-
-```go
-id := lease.Resource().Refs[email.RefKey]
-if id == "" {
-	id = lease.Group().Refs[email.RefKey]
-}
-```
-
-Ripple: `accountsqlite`, `cardsqlite`, and `proxysqlite` each gain an
-append-only migration adding a `refs TEXT NOT NULL DEFAULT ''` (JSON)
-column to both their resource and group tables, so refs survive a restart
-for every kind. Deleting an email does **not** scrub refs pointing at it;
-a dangling ref fails loud at `Listen` with `ErrEmailNotFound` (open
-question below).
+The caller supplies the predicate; leasing supplies the facts. This is the
+same inversion `tasks.ResourceManager` already uses, pointed the other way.
 
 ## Repository port
 
@@ -207,9 +239,16 @@ type Option func(*Manager)
 func WithDropHandler(fn func(emailID, taskID string, dropped uint64)) Option
 func WithListenerErrorHandler(fn func(emailID string, err error)) Option
 
+// WithDeleteGuard installs the referential check Delete consults: given an
+// email ID, report the task IDs of accounts held by a live lease (held)
+// and of accounts bound only by a durable lock (locked) whose effective
+// forwarding inbox is that email. Without a guard, Delete checks only
+// active subscriptions.
+func WithDeleteGuard(fn func(emailID string) (held, locked []string)) Option
+
 // Inventory.
 func (m *Manager) Add(ctx context.Context, e Email) error
-func (m *Manager) Delete(ctx context.Context, id string) error
+func (m *Manager) Delete(ctx context.Context, id string) (stranded []string, err error)
 func (m *Manager) Get(ctx context.Context, id string) (Email, error)
 
 // Listening.
@@ -225,9 +264,34 @@ mutate memory second on every write). `Add` validates ID and address
 presence, and — when an inbox is present — vendor membership and auth shape
 for the vendor. `Get` exists because address-only use is real: a workflow
 filling a form needs the address of its forwarding inbox without listening.
-`Delete` refuses with `ErrEmailInUse` while any subscription covers the
-target, reporting the listening task IDs — report, don't act, as leasing
-does.
+
+### Delete mirrors the leasing delete policy
+
+The same policy leasing institutes for deleting resources under running
+tasks, applied to the account→email edge:
+
+- **Refuse while actively used.** `Delete` returns `ErrEmailInUse`, naming
+  the task IDs, when any subscription covers the email **or** the guard
+  reports a live lease on a referencing account. An account leased or
+  locked to a running task cannot have its email deleted out from under it.
+- **Report what it strands.** Accounts bound only by an idle durable lock
+  (a suspended or failed task that will resume as that persona) don't block
+  the delete — leasing's own `Delete` unbinds rather than blocks there —
+  but their task IDs come back as `stranded`, so the caller decides, just
+  as leasing reports unbound task IDs rather than acting.
+
+The guard is wired in consumer main, the only place that holds both
+managers — the same composition point where `tasks.WithResource` lives:
+
+```go
+emailMgr, _ := email.NewManager(ctx, emailRepo,
+	email.WithDeleteGuard(func(id string) (held, locked []string) {
+		ref := func(a accounts.Account, g accounts.Group) bool {
+			return accounts.ForwardingEmail(a, g) == id
+		}
+		return taskIDs(accountMgr.Held(ref)), taskIDs(accountMgr.Locked(ref))
+	}))
+```
 
 ### Listen
 
@@ -254,7 +318,7 @@ type Subscription interface {
 ```
 
 `Listen` fails fast: `ErrEmailNotFound` for an unknown ID (including a
-dangling ref), `ErrNoInbox` for an address-only email.
+dangling reference), `ErrNoInbox` for an address-only email.
 
 ## Listener lifecycle
 
@@ -324,10 +388,7 @@ func (c *Context) inbox(ctx context.Context) (email.Subscription, error) {
 	if err != nil {
 		return nil, err
 	}
-	id := lease.Resource().Refs[email.RefKey]
-	if id == "" {
-		id = lease.Group().Refs[email.RefKey]
-	}
+	id := accounts.ForwardingEmail(lease.Resource(), lease.Group())
 	if id == "" {
 		return nil, fmt.Errorf("account %s has no forwarding inbox attached", lease.Resource().ID)
 	}
@@ -348,7 +409,9 @@ subscription is a side effect, not a durable fact — closed in `Teardown`,
 reconstructed on restore, never snapshotted; `WithBackfill(startedAt)` (with
 `startedAt` a snapshotted field) is what makes resumption lossless.
 
-## Persistence: `persistence/emailsqlite`
+## Persistence
+
+### `persistence/emailsqlite`
 
 Standard adapter shape: `NewSQLite(dsn)`, `SetMaxOpenConns(1)`,
 `sqlitemigrate.Run(db, "email", migrations)` (store name `"email"`, stable
@@ -371,11 +434,22 @@ CREATE TABLE IF NOT EXISTS emails (
 ```
 
 An empty `vendor` marks an address-only email; the adapter maps it to
-`Inbox == nil`. The account-side `refs` columns land in `accountsqlite`
-(and siblings) as part of the leasing change, not here.
+`Inbox == nil`. Credentials are stored in plaintext, as proxy URLs and
+account payloads already are; encryption-at-rest is out of scope (open
+question below).
 
-Credentials are stored in plaintext, as proxy URLs and account payloads
-already are; encryption-at-rest is out of scope (open question below).
+### Ripple in the existing adapters
+
+- `accountsqlite`: migration adds `email_id TEXT NOT NULL DEFAULT ''` to
+  `accounts` — a real queryable column, since it's a guaranteed field. The
+  existing `fields` column now holds `Attrs.Fields`; existing rows read
+  back unchanged (`email_id` defaults empty). The adapter's port becomes
+  `leasing.Repository[accounts.Attrs]`.
+- `accountsqlite`, `cardsqlite`, `proxysqlite`: migration adds
+  `refs TEXT NOT NULL DEFAULT ''` (JSON) to each group table, so
+  `Group.Refs` survive a restart for every kind.
+
+All append-only, per the migration ledger's rules.
 
 ## Errors
 
@@ -383,13 +457,14 @@ already are; encryption-at-rest is out of scope (open question below).
 var (
 	ErrEmailNotFound = errors.New("email: email not found")
 	ErrNoInbox       = errors.New("email: email has no inbox")
-	ErrEmailInUse    = errors.New("email: email has active listeners")
+	ErrEmailInUse    = errors.New("email: email in use by running tasks")
 	ErrVendorUnknown = errors.New("email: unknown vendor")
 )
 ```
 
 Each sentinel gets the leasing-style doc explaining why it fails rather than
-blocks. Wrapped errors follow house style:
+blocks. `ErrEmailInUse` covers both active subscriptions and guard-reported
+live leases. Wrapped errors follow house style:
 `fmt.Errorf("dial inbox %s: %w", id, err)`.
 
 ## Testing
@@ -423,24 +498,39 @@ Guarantee-shaped tests:
 - `TestCursorSurvivesRestart` — manager restart resumes from persisted
   `LastUID`; UIDVALIDITY change resets instead of replaying.
 - `TestAddressOnlyEmailRefusesToListen` — `ErrNoInbox`, but `Get` works.
+- `TestDeleteRefusesWhileAReferencingAccountIsHeld` — guard-reported live
+  lease blocks and names the task; idle lock comes back as `stranded`.
 - `TestDeleteRefusesWhileTasksAreListening` — names the listening tasks.
 - `TestSlowSubscriberDropsWithoutStallingPeers`
-- In `leasing`: `TestRefsTravelOpaquely` — refs on resources and groups
-  round-trip through the repository untouched and unread;
-  `TestLeaseExposesItsGroup`.
-- In the example workflow (or `accounts` docs test): account ref wins,
-  group ref falls back — the resolution idiom.
+- In `accounts`: `TestForwardingEmailPrefersTheAccountOverItsGroup`,
+  `TestFieldsTravelOpaquelyInsideAttrs` (Bind still decodes only the
+  consumer half).
+- In `leasing`: `TestGroupRefsTravelOpaquely`, `TestLeaseExposesItsGroup`,
+  `TestHeldAndLockedReportOnlyMatchingAssignments`.
 - `emailsqlite`: round-trip of Auth JSON and nil-Inbox mapping, cursor
   upsert preserving `created_at`, migration ledger under store `"email"`
   sharing a file with other stores.
 
 CI additions: none beyond the new packages riding `go test -race ./...`.
 
+## Implementation order
+
+1. `leasing`: `Group.Refs`, `Lease.Group()`, `Held`/`Locked` — generic,
+   email-free, tested where they live.
+2. `accounts`: typed `Attrs`, `Bind` over `Attrs.Fields`, `EmailRef`,
+   `ForwardingEmail`; `accountsqlite` migration and port change; update the
+   example workflow's `Bind` usage.
+3. `cardsqlite`/`proxysqlite`: group `refs` migrations.
+4. `email` + `emailsqlite`: the package itself.
+5. Wire the delete guard and the `inbox` idiom into `_examples`.
+
 ## Out of scope / open questions
 
-1. **Dangling refs** — deleting an email leaves account/group refs pointing
-   at it; `Listen` fails loud with `ErrEmailNotFound`. Scrubbing would put
-   email knowledge inside leasing or accounts; left to the operator for now.
+1. **Dangling references** — deleting an email that only idle-locked
+   accounts point at strands them by design (reported, not blocked), and
+   unheld accounts' references aren't scrubbed either way; `Listen` fails
+   loud with `ErrEmailNotFound` on resume. Scrubbing would put email
+   knowledge inside leasing or accounts.
 2. **Credential encryption at rest** — plaintext today, consistent with the
    other stores; revisit as its own effort across all stores.
 3. **OAuth token acquisition** — the package refreshes access tokens from a
@@ -456,3 +546,6 @@ CI additions: none beyond the new packages riding `go test -race ./...`.
 7. **Message persistence** — deliberately none. The IMAP server is the
    durable log; `WithBackfill` is the replay mechanism. Revisit only if a
    vendor's retention becomes a problem.
+8. **Cards' concrete model** — cards stay raw JSON until they earn a
+   guaranteed field; when they do, they follow the same typed-`Attrs`
+   consolidation.
