@@ -47,10 +47,13 @@ persistence/
   emailsqlite/  SQLite adapter for email.Repository (store name "email")
 ```
 
-`email` does not import `leasing`, `tasks`, `accounts`, or `workflows`. It
-is imported by the consumer's workflow code and by its own persistence
-adapter. It imports the IMAP client library directly — the IMAP engine is
-the package's reason to exist, not an adapter concern.
+`email` imports `accounts`: email serves no purpose outside of accounts —
+the account is the only path to an inbox — so the dependency is embraced
+rather than injected. The direction stays acyclic (`accounts` → `leasing`,
+`email` → `accounts`; `accounts` never imports `email`). `email` does not
+import `tasks` or `workflows`, and it imports the IMAP client library
+directly — the IMAP engine is the package's reason to exist, not an adapter
+concern.
 
 Proposed dependencies (new to go.mod):
 
@@ -233,18 +236,14 @@ absent rows. The listener persists its cursor by calling `Save` with updated
 ## Manager
 
 ```go
-func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error)
+// NewManager binds the email inventory to the accounts it serves; the
+// accounts manager is how Delete sees which running tasks would lose
+// their inbox.
+func NewManager(ctx context.Context, repo Repository, accountMgr *accounts.Manager, opts ...Option) (*Manager, error)
 
 type Option func(*Manager)
 func WithDropHandler(fn func(emailID, taskID string, dropped uint64)) Option
 func WithListenerErrorHandler(fn func(emailID string, err error)) Option
-
-// WithDeleteGuard installs the referential check Delete consults: given an
-// email ID, report the task IDs of accounts held by a live lease (held)
-// and of accounts bound only by a durable lock (locked) whose effective
-// forwarding inbox is that email. Without a guard, Delete checks only
-// active subscriptions.
-func WithDeleteGuard(fn func(emailID string) (held, locked []string)) Option
 
 // Inventory.
 func (m *Manager) Add(ctx context.Context, e Email) error
@@ -271,26 +270,23 @@ The same policy leasing institutes for deleting resources under running
 tasks, applied to the account→email edge:
 
 - **Refuse while actively used.** `Delete` returns `ErrEmailInUse`, naming
-  the task IDs, when any subscription covers the email **or** the guard
-  reports a live lease on a referencing account. An account leased or
-  locked to a running task cannot have its email deleted out from under it.
+  the task IDs, when any subscription covers the email **or** a referencing
+  account is held by a live lease. An account leased or locked to a running
+  task cannot have its email deleted out from under it.
 - **Report what it strands.** Accounts bound only by an idle durable lock
   (a suspended or failed task that will resume as that persona) don't block
   the delete — leasing's own `Delete` unbinds rather than blocks there —
   but their task IDs come back as `stranded`, so the caller decides, just
   as leasing reports unbound task IDs rather than acting.
 
-The guard is wired in consumer main, the only place that holds both
-managers — the same composition point where `tasks.WithResource` lives:
+The check is built in — no injection point. Because `email` imports
+`accounts`, `Delete` asks the accounts manager directly:
 
 ```go
-emailMgr, _ := email.NewManager(ctx, emailRepo,
-	email.WithDeleteGuard(func(id string) (held, locked []string) {
-		ref := func(a accounts.Account, g accounts.Group) bool {
-			return accounts.ForwardingEmail(a, g) == id
-		}
-		return taskIDs(accountMgr.Held(ref)), taskIDs(accountMgr.Locked(ref))
-	}))
+ref := func(a accounts.Account, g accounts.Group) bool {
+	return accounts.ForwardingEmail(a, g) == id
+}
+held, locked := m.accounts.Held(ref), m.accounts.Locked(ref)
 ```
 
 ### Listen
@@ -463,8 +459,8 @@ var (
 ```
 
 Each sentinel gets the leasing-style doc explaining why it fails rather than
-blocks. `ErrEmailInUse` covers both active subscriptions and guard-reported
-live leases. Wrapped errors follow house style:
+blocks. `ErrEmailInUse` covers both active subscriptions and live leases on
+referencing accounts. Wrapped errors follow house style:
 `fmt.Errorf("dial inbox %s: %w", id, err)`.
 
 ## Testing
@@ -498,8 +494,9 @@ Guarantee-shaped tests:
 - `TestCursorSurvivesRestart` — manager restart resumes from persisted
   `LastUID`; UIDVALIDITY change resets instead of replaying.
 - `TestAddressOnlyEmailRefusesToListen` — `ErrNoInbox`, but `Get` works.
-- `TestDeleteRefusesWhileAReferencingAccountIsHeld` — guard-reported live
-  lease blocks and names the task; idle lock comes back as `stranded`.
+- `TestDeleteRefusesWhileAReferencingAccountIsHeld` — a live lease on a
+  referencing account blocks and names the task; idle lock comes back as
+  `stranded`.
 - `TestDeleteRefusesWhileTasksAreListening` — names the listening tasks.
 - `TestSlowSubscriberDropsWithoutStallingPeers`
 - In `accounts`: `TestForwardingEmailPrefersTheAccountOverItsGroup`,
@@ -521,8 +518,9 @@ CI additions: none beyond the new packages riding `go test -race ./...`.
    `ForwardingEmail`; `accountsqlite` migration and port change; update the
    example workflow's `Bind` usage.
 3. `cardsqlite`/`proxysqlite`: group `refs` migrations.
-4. `email` + `emailsqlite`: the package itself.
-5. Wire the delete guard and the `inbox` idiom into `_examples`.
+4. `email` + `emailsqlite`: the package itself, constructed over the
+   accounts manager.
+5. Wire the `inbox` idiom into `_examples`.
 
 ## Out of scope / open questions
 
