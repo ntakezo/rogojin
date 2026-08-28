@@ -20,6 +20,7 @@ import (
 	"github.com/ntakezo/rogojin/_examples/workflows/example/checkout/states"
 	"github.com/ntakezo/rogojin/accounts"
 	"github.com/ntakezo/rogojin/comms"
+	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/proxies"
 	"github.com/ntakezo/rogojin/tasks"
 )
@@ -42,15 +43,36 @@ func main() {
 
 	// Accounts are the same machinery minus the rotation knob. The account
 	// group named "global" is never confused with the proxy group of the same
-	// name: a kind resolves only against its own manager.
+	// name: a kind resolves only against its own manager. EmailID is the
+	// account's guaranteed field — its forwarding inbox — while the profile
+	// stays the workflow's opaque payload.
 	accountManager, err := accounts.NewManager(ctx, newMemAccountRepo(accounts.Account{
 		ID:      "buyer-1",
 		GroupID: accounts.GlobalGroup,
-		Attrs:   profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
+		Attrs: accounts.Attrs{
+			EmailID: "inbox-1",
+			Fields:  profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
+		},
 	}))
 	if err != nil {
 		log.Fatalf("account manager: %v", err)
 	}
+
+	// Email is not a leased resource — no groups, no rotation, no locks. The
+	// inventory holds the forwarding inboxes accounts point at; a workflow
+	// reaches its inbox through its locked account (ForwardingEmail, then
+	// Listen with a sender filter and a backfill window). The guard closes
+	// the loop the other way: an inbox referenced by a held or locked
+	// account refuses deletion, exactly like a leased resource would.
+	emailManager, err := email.NewManager(ctx, newMemEmailRepo(email.Email{
+		ID:      "inbox-1",
+		Address: "orders@example.com",
+		Inbox:   &email.Inbox{Vendor: email.Gmail, Auth: email.Auth{Kind: email.AuthPassword, Password: "app-password"}},
+	}), email.WithDeleteGuard(accounts.EmailDeleteGuard(accountManager)))
+	if err != nil {
+		log.Fatalf("email manager: %v", err)
+	}
+	defer emailManager.Close()
 
 	// Both kinds of lock outlive the process, so each manager registers under
 	// its kind: deleting a task unlocks both, while repointing one drops only
@@ -82,6 +104,65 @@ func main() {
 		log.Fatalf("start task: %v", err)
 	}
 	fmt.Printf("task %s finished with status %q, output %s\n", task.ID(), task.Status(), output)
+
+	// The account's durable lock survived the run, so its forwarding inbox
+	// refuses to vanish silently: the delete goes through — nothing holds a
+	// live lease anymore — but reports whom it stranded, leasing-style.
+	inbox, err := emailManager.Get(ctx, "inbox-1")
+	if err != nil {
+		log.Fatalf("get inbox: %v", err)
+	}
+	stranded, err := emailManager.Delete(ctx, "inbox-1")
+	if err != nil {
+		log.Fatalf("delete inbox: %v", err)
+	}
+	fmt.Printf("deleted forwarding inbox %s (%s), stranding %v\n", inbox.ID, inbox.Address, stranded)
+}
+
+// memEmailRepo is a minimal in-memory email.Repository; the manager owns all
+// listener state, so this only stores the inventory and its cursors.
+type memEmailRepo struct {
+	mu      sync.Mutex
+	records map[string]email.Email
+	order   []string
+}
+
+func newMemEmailRepo(seed ...email.Email) *memEmailRepo {
+	r := &memEmailRepo{records: make(map[string]email.Email)}
+	for _, e := range seed {
+		r.records[e.ID] = e
+		r.order = append(r.order, e.ID)
+	}
+	return r
+}
+
+func (r *memEmailRepo) List(ctx context.Context) ([]email.Email, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]email.Email, 0, len(r.order))
+	for _, id := range r.order {
+		if e, ok := r.records[id]; ok {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (r *memEmailRepo) Save(ctx context.Context, e email.Email) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.records[e.ID]; !ok {
+		r.order = append(r.order, e.ID)
+	}
+	r.records[e.ID] = e
+	return nil
+}
+
+func (r *memEmailRepo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.records, id)
+	return nil
 }
 
 // newForwardProxy serves a minimal HTTP forward proxy so the workflow's traffic
