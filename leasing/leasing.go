@@ -57,11 +57,15 @@ type Resource[T any] struct {
 // A Group is a durable named subset of the pool that leases rotate within.
 // Strategy names the selection algorithm its members rotate through
 // (StrategyRoundRobin when empty); each group runs its own strategy instance.
+// Refs are opaque references to things outside this package, keyed by a
+// consumer-chosen name — like Attrs on a resource, they are carried and
+// persisted but never read here.
 type Group struct {
-	ID        string    `json:"id"`
-	Strategy  string    `json:"strategy"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID        string            `json:"id"`
+	Strategy  string            `json:"strategy"`
+	Refs      map[string]string `json:"refs,omitempty"`
+	CreatedAt time.Time         `json:"createdAt"`
+	UpdatedAt time.Time         `json:"updatedAt"`
 }
 
 // Repository is the persistence port: a dumb durable store of resources and

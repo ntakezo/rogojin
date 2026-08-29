@@ -3,9 +3,12 @@ package accounts
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/leasing"
 )
 
@@ -95,7 +98,7 @@ type profile struct {
 // into the workflow's own shape at the point of use.
 func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	raw := json.RawMessage(`{"email":"a@b.c","password":"hunter2"}`)
-	repo := newFakeRepo(Account{ID: "a1", Attrs: raw})
+	repo := newFakeRepo(Account{ID: "a1", Attrs: Attrs{Fields: raw}})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)
@@ -116,8 +119,8 @@ func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	if err := lease.Release(true); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	if string(repo.records["a1"].Attrs) != string(raw) {
-		t.Fatalf("persisted fields = %s, want untouched", repo.records["a1"].Attrs)
+	if string(repo.records["a1"].Attrs.Fields) != string(raw) {
+		t.Fatalf("persisted fields = %s, want untouched", repo.records["a1"].Attrs.Fields)
 	}
 }
 
@@ -133,7 +136,7 @@ func TestBindToleratesAccountsWithoutFields(t *testing.T) {
 		t.Fatalf("bound = %+v, want the zero profile", got)
 	}
 
-	if _, err := Bind[profile](Account{ID: "a9", Attrs: json.RawMessage(`{"email":`)}); err == nil {
+	if _, err := Bind[profile](Account{ID: "a9", Attrs: Attrs{Fields: json.RawMessage(`{"email":`)}}); err == nil {
 		t.Fatal("expected an error for malformed fields")
 	}
 }
@@ -173,4 +176,108 @@ func TestManagerSatisfiesTasksContract(t *testing.T) {
 		Unlock(ctx context.Context, taskID string) error
 		ReleaseStaleLock(ctx context.Context, a leasing.Assignment) error
 	} = m
+}
+
+// TestForwardingEmailPrefersTheAccountOverItsGroup verifies the resolution
+// order the forwarding-inbox edge lives by: the account's own EmailID wins,
+// the group's ref is the fallback, and neither means no inbox at all.
+func TestForwardingEmailPrefersTheAccountOverItsGroup(t *testing.T) {
+	group := Group{ID: "pool", Refs: map[string]string{EmailRef: "inbox-group"}}
+
+	pinned := Account{ID: "a1", Attrs: Attrs{EmailID: "inbox-own"}}
+	if got := ForwardingEmail(pinned, group); got != "inbox-own" {
+		t.Fatalf("resolved %q, want the account's own inbox-own", got)
+	}
+	inheriting := Account{ID: "a2"}
+	if got := ForwardingEmail(inheriting, group); got != "inbox-group" {
+		t.Fatalf("resolved %q, want the group's inbox-group", got)
+	}
+	if got := ForwardingEmail(inheriting, Group{ID: "bare"}); got != "" {
+		t.Fatalf("resolved %q, want empty when nothing is attached", got)
+	}
+}
+
+// memEmailRepo is a minimal in-memory email.Repository, enough to stand up
+// a real email manager for the WithEmail wiring test.
+type memEmailRepo struct {
+	mu   sync.Mutex
+	rows map[string]email.Email
+}
+
+func (r *memEmailRepo) List(ctx context.Context) ([]email.Email, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]email.Email, 0, len(r.rows))
+	for _, e := range r.rows {
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func (r *memEmailRepo) Save(ctx context.Context, e email.Email) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows[e.ID] = e
+	return nil
+}
+
+func (r *memEmailRepo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.rows, id)
+	return nil
+}
+
+// TestWithEmailProtectsReferencedInboxes verifies the wiring WithEmail
+// exists for: once the account manager holds the email manager, deleting an
+// inbox a live-leased account forwards to refuses and names the task, and
+// deleting one only idle durable locks point at reports those tasks as
+// stranded — resolved through both attachment levels.
+func TestWithEmailProtectsReferencedInboxes(t *testing.T) {
+	ctx := context.Background()
+	emails, err := email.NewManager(ctx, &memEmailRepo{rows: map[string]email.Email{
+		"inbox-1": {ID: "inbox-1", Address: "fwd@example.com"},
+	}})
+	if err != nil {
+		t.Fatalf("email manager: %v", err)
+	}
+	defer emails.Close()
+
+	m, err := NewManager(ctx, newFakeRepo(), WithEmail(emails))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.CreateGroup(ctx, Group{ID: "pool", Refs: map[string]string{EmailRef: "inbox-1"}}); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := m.Add(ctx, Account{ID: "a-own", Attrs: Attrs{EmailID: "inbox-1"}}); err != nil {
+		t.Fatalf("add a-own: %v", err)
+	}
+	if err := m.Add(ctx, Account{ID: "a-inherit", GroupID: "pool"}); err != nil {
+		t.Fatalf("add a-inherit: %v", err)
+	}
+
+	live, err := m.Acquire(ctx, Assignment{TaskID: "t-live", ResourceID: "a-own"})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, err := emails.Delete(ctx, "inbox-1"); !errors.Is(err, email.ErrEmailInUse) || !strings.Contains(err.Error(), "t-live") {
+		t.Fatalf("delete err = %v, want ErrEmailInUse naming t-live", err)
+	}
+
+	// The group-level attachment guards too: t-idle keeps only its durable
+	// lock, so the delete goes through and reports whom it stranded.
+	idle, err := m.Lock(ctx, Assignment{TaskID: "t-idle", GroupID: "pool"})
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	idle.Release(true)
+	live.Release(true)
+	stranded, err := emails.Delete(ctx, "inbox-1")
+	if err != nil {
+		t.Fatalf("delete with only idle locks: %v", err)
+	}
+	if len(stranded) != 1 || stranded[0] != "t-idle" {
+		t.Fatalf("stranded = %v, want the idle-locked t-idle", stranded)
+	}
 }

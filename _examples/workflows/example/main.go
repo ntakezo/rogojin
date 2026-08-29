@@ -15,11 +15,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"time"
 
 	example_checkout "github.com/ntakezo/rogojin/_examples/workflows/example/checkout"
 	"github.com/ntakezo/rogojin/_examples/workflows/example/checkout/states"
 	"github.com/ntakezo/rogojin/accounts"
 	"github.com/ntakezo/rogojin/comms"
+	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/proxies"
 	"github.com/ntakezo/rogojin/tasks"
 )
@@ -27,7 +29,12 @@ import (
 func main() {
 	ctx := context.Background()
 
-	site := newSite()
+	// The mail server stands in for the vendor: the site's login handler
+	// "sends" the verification mail by delivering into it, and the email
+	// manager's listeners dial it instead of imap.gmail.com.
+	mailServer := newMemMailServer()
+
+	site := newSite(mailServer.deliver)
 	defer site.Close()
 
 	forward := newForwardProxy()
@@ -40,14 +47,34 @@ func main() {
 		log.Fatalf("proxy manager: %v", err)
 	}
 
+	// Email is not a leased resource — no groups, no rotation, no locks. The
+	// inventory holds the forwarding inboxes accounts point at; a workflow
+	// reaches its inbox through its locked account (ForwardingEmail, then
+	// Listen with a sender filter and a backfill window).
+	emailManager, err := email.NewManager(ctx, newMemEmailRepo(email.Email{
+		ID:      "inbox-1",
+		Address: "orders@example.com",
+		Inbox:   &email.Inbox{Vendor: email.Gmail, Auth: email.Auth{Kind: email.AuthPassword, Password: "app-password"}},
+	}), email.WithDialer(mailServer.dial))
+	if err != nil {
+		log.Fatalf("email manager: %v", err)
+	}
+	defer emailManager.Close()
+
 	// Accounts are the same machinery minus the rotation knob. The account
 	// group named "global" is never confused with the proxy group of the same
-	// name: a kind resolves only against its own manager.
+	// name: a kind resolves only against its own manager. EmailID is the
+	// account's guaranteed field — its forwarding inbox — and WithEmail
+	// closes the referential loop: an inbox a held or locked account forwards
+	// to refuses deletion, exactly like a leased resource would.
 	accountManager, err := accounts.NewManager(ctx, newMemAccountRepo(accounts.Account{
 		ID:      "buyer-1",
 		GroupID: accounts.GlobalGroup,
-		Attrs:   profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
-	}))
+		Attrs: accounts.Attrs{
+			EmailID: "inbox-1",
+			Fields:  profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
+		},
+	}), accounts.WithEmail(emailManager))
 	if err != nil {
 		log.Fatalf("account manager: %v", err)
 	}
@@ -59,7 +86,7 @@ func main() {
 	svc := tasks.NewService(newMemRepo(), comms.NewBus(),
 		tasks.WithResource(states.ProxyKind, manager),
 		tasks.WithResource(states.AccountKind, accountManager))
-	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager, accountManager)); err != nil {
+	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager, accountManager, emailManager)); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}
 
@@ -84,6 +111,52 @@ func main() {
 	fmt.Printf("task %s finished with status %q, output %s\n", task.ID(), task.Status(), output)
 }
 
+// memEmailRepo is a minimal in-memory email.Repository; the manager owns all
+// listener state, so this only stores the inventory and its cursors.
+type memEmailRepo struct {
+	mu      sync.Mutex
+	records map[string]email.Email
+	order   []string
+}
+
+func newMemEmailRepo(seed ...email.Email) *memEmailRepo {
+	r := &memEmailRepo{records: make(map[string]email.Email)}
+	for _, e := range seed {
+		r.records[e.ID] = e
+		r.order = append(r.order, e.ID)
+	}
+	return r
+}
+
+func (r *memEmailRepo) List(ctx context.Context) ([]email.Email, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]email.Email, 0, len(r.order))
+	for _, id := range r.order {
+		if e, ok := r.records[id]; ok {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (r *memEmailRepo) Save(ctx context.Context, e email.Email) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.records[e.ID]; !ok {
+		r.order = append(r.order, e.ID)
+	}
+	r.records[e.ID] = e
+	return nil
+}
+
+func (r *memEmailRepo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.records, id)
+	return nil
+}
+
 // newForwardProxy serves a minimal HTTP forward proxy so the workflow's traffic
 // demonstrably routes through the leased proxy.
 func newForwardProxy() *httptest.Server {
@@ -106,11 +179,25 @@ func newForwardProxy() *httptest.Server {
 	}))
 }
 
-// newSite serves the canned product, cart, and checkout responses the workflow drives against.
-func newSite() *httptest.Server {
+// newSite serves the canned product, login, cart, and checkout responses the
+// workflow drives against. The login handler answers by mail: it delivers
+// the verification message — link and all — into the forwarding inbox.
+func newSite(deliver func(email.Message)) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/product", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"variantID": "variant-M", "csrfToken": "csrf-abc"})
+	})
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		deliver(email.Message{
+			From:    states.VerificationSender,
+			Subject: "confirm your sign-in",
+			Text:    "Follow http://" + r.Host + "/follow?token=tok-123 to finish signing in.",
+			Date:    time.Now(),
+		})
+		json.NewEncoder(w).Encode(map[string]string{"status": "mail-sent"})
+	})
+	mux.HandleFunc("/follow", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "verified"})
 	})
 	mux.HandleFunc("/cart", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"cartID": "cart-123"})
@@ -119,6 +206,97 @@ func newSite() *httptest.Server {
 		json.NewEncoder(w).Encode(map[string]string{"orderID": "order-999", "status": "confirmed"})
 	})
 	return httptest.NewServer(mux)
+}
+
+// memMailServer stands in for the vendor's IMAP host: it holds the inbox's
+// mail and serves email.Mailbox sessions to the manager's listeners and
+// backfills, waking idlers as mail lands.
+type memMailServer struct {
+	mu      sync.Mutex
+	nextUID uint32
+	msgs    []email.Message
+	wakes   map[chan struct{}]struct{}
+}
+
+func newMemMailServer() *memMailServer {
+	return &memMailServer{nextUID: 1, wakes: make(map[chan struct{}]struct{})}
+}
+
+// deliver lands one message on the server and wakes every idling session.
+func (s *memMailServer) deliver(msg email.Message) {
+	s.mu.Lock()
+	msg.UID = s.nextUID
+	s.nextUID++
+	if msg.Date.IsZero() {
+		msg.Date = time.Now()
+	}
+	s.msgs = append(s.msgs, msg)
+	for wake := range s.wakes {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *memMailServer) dial(e email.Email) (email.Mailbox, error) {
+	wake := make(chan struct{}, 1)
+	s.mu.Lock()
+	s.wakes[wake] = struct{}{}
+	s.mu.Unlock()
+	return &mailSession{server: s, wake: wake}, nil
+}
+
+type mailSession struct {
+	server *memMailServer
+	wake   chan struct{}
+}
+
+func (m *mailSession) Select(ctx context.Context) (uint32, uint32, error) {
+	m.server.mu.Lock()
+	defer m.server.mu.Unlock()
+	return 1, m.server.nextUID - 1, nil
+}
+
+func (m *mailSession) FetchSince(ctx context.Context, uid uint32) ([]email.Message, error) {
+	m.server.mu.Lock()
+	defer m.server.mu.Unlock()
+	out := make([]email.Message, 0)
+	for _, msg := range m.server.msgs {
+		if msg.UID > uid {
+			out = append(out, msg)
+		}
+	}
+	return out, nil
+}
+
+func (m *mailSession) FetchSinceDate(ctx context.Context, since time.Time) ([]email.Message, error) {
+	m.server.mu.Lock()
+	defer m.server.mu.Unlock()
+	out := make([]email.Message, 0)
+	for _, msg := range m.server.msgs {
+		if !msg.Date.Before(since) {
+			out = append(out, msg)
+		}
+	}
+	return out, nil
+}
+
+func (m *mailSession) Idle(ctx context.Context) error {
+	select {
+	case <-m.wake:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *mailSession) Close() error {
+	m.server.mu.Lock()
+	delete(m.server.wakes, m.wake)
+	m.server.mu.Unlock()
+	return nil
 }
 
 // memProxyRepo is a minimal in-memory proxies.Repository seeded with a fixed

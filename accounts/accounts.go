@@ -1,8 +1,9 @@
-// Package accounts allocates site accounts to tasks. It is the leasing package
-// specialized to one resource kind: the payload is the account's fields —
-// email, password, names, whatever the target site asks for — travelling as
-// opaque JSON, so a new workflow needs no schema change; Bind decodes them
-// into a struct at the point of use.
+// Package accounts allocates site accounts to tasks. It is the leasing
+// package specialized to one resource kind, and it owns the concrete
+// account model: Attrs carries the fields the framework guarantees on every
+// account — today the forwarding email — wrapped around the consumer's own
+// payload, which travels as opaque JSON so a new workflow needs no schema
+// change; Bind decodes it into a struct at the point of use.
 //
 // The types here are aliases, not wrappers: an Account is a leasing.Resource,
 // the Manager is a leasing.Manager, and every behavior — groups, holder caps,
@@ -11,11 +12,16 @@
 // specific site, so which one a task gets matters far less than that no two
 // tasks get the same one at once, and round robin is exactly that.
 //
-// Fields are stored verbatim, in the clear: credentials are only as protected
-// as the Repository behind them. An implementation that encrypts Attrs on the
-// way down and decrypts it on the way up is transparent to everything above.
-// Treat a leased account's Attrs as read-only — the pool shares the backing
-// bytes.
+// Accounts are also where the email package's inboxes meet tasks: an
+// account or its group names a forwarding inbox, ForwardingEmail resolves
+// which one is in effect, and a manager built WithEmail keeps a referenced
+// email from being deleted out from under a running task.
+//
+// Fields are stored verbatim, in the clear: credentials are only as
+// protected as the Repository behind them. An implementation that encrypts
+// on the way down and decrypts on the way up is transparent to everything
+// above. Treat a leased account's Attrs as read-only — the pool shares the
+// backing bytes.
 package accounts
 
 import (
@@ -23,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/leasing"
 )
 
@@ -35,43 +42,119 @@ const GlobalGroup = leasing.GlobalGroup
 // throughput win.
 const UnlimitedHolders = leasing.UnlimitedHolders
 
-// An Account is the durable record of one account on a target site; its
-// workflow-defined fields live in Attrs as JSON this package never reads.
-type Account = leasing.Resource[json.RawMessage]
+// EmailRef is the group-ref key under which an account group names its
+// forwarding inbox: Group.Refs[EmailRef] = the email's ID. The account-level
+// counterpart is the typed Attrs.EmailID.
+const EmailRef = "email"
+
+// Attrs is the concrete account model: the fields the framework guarantees
+// on every account, wrapped around the consumer's own payload.
+type Attrs struct {
+	// EmailID names this account's forwarding inbox in the email
+	// inventory. Empty inherits the account group's, if any.
+	EmailID string `json:"emailID,omitempty"`
+	// Fields is the consumer's opaque payload; this package never reads it.
+	Fields json.RawMessage `json:"fields,omitempty"`
+}
+
+// An Account is the durable record of one account on a target site.
+type Account = leasing.Resource[Attrs]
 
 // A Group is a durable named subset of the accounts — usually one target site.
 type Group = leasing.Group
 
 // Repository is the persistence port: a dumb durable store of accounts and
 // their groups, and the only place credentials can be protected.
-type Repository = leasing.Repository[json.RawMessage]
+type Repository = leasing.Repository[Attrs]
 
 // An Assignment is the placement a task leases under; the pin names an
 // account, and pinning is the common case here — "this task is this persona".
 type Assignment = leasing.Assignment
 
 // A Manager allocates accounts to tasks. See leasing.Manager.
-type Manager = leasing.Manager[json.RawMessage]
+type Manager = leasing.Manager[Attrs]
 
 // A Lease is a live hold on one account. Release it exactly once when done.
-type Lease = leasing.Lease[json.RawMessage]
+type Lease = leasing.Lease[Attrs]
 
-// NewManager loads the groups and pool from the repository, persisting the
-// global group if absent.
-func NewManager(ctx context.Context, repo Repository) (*Manager, error) {
-	return leasing.NewManager(ctx, repo)
+// An Option configures what NewManager wires up around the leasing core.
+type Option func(*config)
+
+type config struct {
+	email *email.Manager
 }
 
-// Bind decodes an account's workflow-defined fields into F. An account with no
-// fields yields the zero F rather than an error, so a workflow that needs none
-// can ignore them entirely.
+// WithEmail hands the manager the email inventory its accounts forward to.
+// It closes the referential loop: the email manager learns to refuse
+// deleting an inbox while an account forwarding to it is held by a live
+// lease, and to report the tasks an idle durable lock would strand.
+func WithEmail(m *email.Manager) Option {
+	if m == nil {
+		panic("accounts: WithEmail requires a manager")
+	}
+	return func(c *config) { c.email = m }
+}
+
+// NewManager loads the groups and pool from the repository, persisting the
+// global group if absent. Given WithEmail, it also installs the account
+// side of the email delete policy — see WithEmail.
+func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {
+	var cfg config
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	m, err := leasing.NewManager(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.email != nil {
+		cfg.email.GuardDeletes(func(emailID string) (held, locked []string) {
+			if emailID == "" {
+				return nil, nil
+			}
+			ref := func(a Account, g Group) bool { return ForwardingEmail(a, g) == emailID }
+			return taskIDs(m.Held(ref)), taskIDs(m.Locked(ref))
+		})
+	}
+	return m, nil
+}
+
+// Bind decodes the consumer half of the account — Attrs.Fields — into F. An
+// account with no fields yields the zero F rather than an error, so a
+// workflow that needs none can ignore them entirely.
 func Bind[F any](a Account) (F, error) {
 	var fields F
-	if len(a.Attrs) == 0 {
+	if len(a.Attrs.Fields) == 0 {
 		return fields, nil
 	}
-	if err := json.Unmarshal(a.Attrs, &fields); err != nil {
+	if err := json.Unmarshal(a.Attrs.Fields, &fields); err != nil {
 		return fields, fmt.Errorf("decode fields of account %s: %w", a.ID, err)
 	}
 	return fields, nil
+}
+
+// ForwardingEmail resolves the effective forwarding inbox of an account in
+// its group: the account's own EmailID wherever set, the group's EmailRef
+// otherwise. Empty means no inbox is attached at either level — the same
+// own-then-group shape task placement resolves by.
+func ForwardingEmail(a Account, g Group) string {
+	if a.Attrs.EmailID != "" {
+		return a.Attrs.EmailID
+	}
+	return g.Refs[EmailRef]
+}
+
+// taskIDs flattens assignments to their task ids, deduplicated in report
+// order.
+func taskIDs(assignments []leasing.Assignment) []string {
+	seen := make(map[string]struct{}, len(assignments))
+	ids := make([]string, 0, len(assignments))
+	for _, a := range assignments {
+		if _, dup := seen[a.TaskID]; dup {
+			continue
+		}
+		seen[a.TaskID] = struct{}{}
+		ids = append(ids, a.TaskID)
+	}
+	return ids
 }

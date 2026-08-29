@@ -46,10 +46,13 @@ func TestSaveListRoundTrip(t *testing.T) {
 		ID:      "a1",
 		GroupID: "site",
 		OwnerID: "t1",
-		Attrs: mustJSON(t, map[string]string{
-			"email":    "buyer@example.com",
-			"password": "hunter2",
-		}),
+		Attrs: accounts.Attrs{
+			EmailID: "inbox-1",
+			Fields: mustJSON(t, map[string]string{
+				"email":    "buyer@example.com",
+				"password": "hunter2",
+			}),
+		},
 		Successes: 3,
 		Failures:  2,
 	}
@@ -74,14 +77,17 @@ func TestSaveListRoundTrip(t *testing.T) {
 	if got := listed[0]; got.OwnerID != "t1" || got.Successes != 3 || got.Failures != 2 || got.GroupID != "site" {
 		t.Fatalf("a1 round-trip: got %+v", got)
 	}
-	if string(listed[0].Attrs) != string(locked.Attrs) {
-		t.Fatalf("fields = %s, want %s", listed[0].Attrs, locked.Attrs)
+	if string(listed[0].Attrs.Fields) != string(locked.Attrs.Fields) {
+		t.Fatalf("fields = %s, want %s", listed[0].Attrs.Fields, locked.Attrs.Fields)
+	}
+	if listed[0].Attrs.EmailID != "inbox-1" {
+		t.Fatalf("email_id = %q, want the forwarding inbox inbox-1", listed[0].Attrs.EmailID)
 	}
 	if listed[1].MaxHolders != 2 {
 		t.Fatalf("a2 max holders = %d, want 2", listed[1].MaxHolders)
 	}
-	if listed[1].Attrs != nil {
-		t.Fatalf("a2 fields = %s, want none", listed[1].Attrs)
+	if listed[1].Attrs.Fields != nil || listed[1].Attrs.EmailID != "" {
+		t.Fatalf("a2 attrs = %+v, want none", listed[1].Attrs)
 	}
 }
 
@@ -104,10 +110,10 @@ func TestFieldsAreOpaqueToTheSchema(t *testing.T) {
 	wantCheckout := checkout{Email: "buyer@example.com", Card: "4111"}
 	wantForum := forum{Handle: "ada", Token: "t0k", Boards: []string{"a", "b"}}
 
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", Attrs: mustJSON(t, wantCheckout)}); err != nil {
+	if err := repo.Save(ctx, accounts.Account{ID: "a1", Attrs: accounts.Attrs{Fields: mustJSON(t, wantCheckout)}}); err != nil {
 		t.Fatalf("save checkout account: %v", err)
 	}
-	if err := repo.Save(ctx, accounts.Account{ID: "a2", Attrs: mustJSON(t, wantForum)}); err != nil {
+	if err := repo.Save(ctx, accounts.Account{ID: "a2", Attrs: accounts.Attrs{Fields: mustJSON(t, wantForum)}}); err != nil {
 		t.Fatalf("save forum account: %v", err)
 	}
 
@@ -137,7 +143,7 @@ func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", Attrs: json.RawMessage("not json")}); err == nil {
+	if err := repo.Save(ctx, accounts.Account{ID: "a1", Attrs: accounts.Attrs{Fields: json.RawMessage("not json")}}); err == nil {
 		t.Fatal("expected invalid JSON fields to be refused")
 	}
 	listed, err := repo.List(ctx)
@@ -208,7 +214,7 @@ func TestGroupRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	created := time.Now().UTC().Truncate(time.Millisecond)
-	want := accounts.Group{ID: "site", CreatedAt: created, UpdatedAt: created}
+	want := accounts.Group{ID: "site", Refs: map[string]string{accounts.EmailRef: "inbox-1"}, CreatedAt: created, UpdatedAt: created}
 	if err := repo.SaveGroup(ctx, want); err != nil {
 		t.Fatalf("save group: %v", err)
 	}
@@ -222,6 +228,9 @@ func TestGroupRoundTrip(t *testing.T) {
 	}
 	if listed[0].ID != want.ID || listed[0].Strategy != "" || !listed[0].CreatedAt.Equal(created) {
 		t.Fatalf("group round-trip: got %+v, want %+v", listed[0], want)
+	}
+	if listed[0].Refs[accounts.EmailRef] != "inbox-1" {
+		t.Fatalf("group refs = %v, want the forwarding inbox carried opaquely", listed[0].Refs)
 	}
 
 	if err := repo.DeleteGroup(ctx, "site"); err != nil {
@@ -289,7 +298,7 @@ func TestSchemaReopensCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := first.Save(ctx, accounts.Account{ID: "a1", Attrs: mustJSON(t, map[string]string{"email": "a@b.c"})}); err != nil {
+	if err := first.Save(ctx, accounts.Account{ID: "a1", Attrs: accounts.Attrs{Fields: mustJSON(t, map[string]string{"email": "a@b.c"})}}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := first.Close(); err != nil {

@@ -340,7 +340,8 @@ func (m *Manager[T]) acquire(ctx context.Context, a Assignment, lock bool) (*Lea
 			// a locked resource is exclusive to its owner: one lease at a time.
 			if m.heldCount(id) == 0 {
 				m.hold(id, a.TaskID)
-				return &Lease[T]{manager: m, resource: m.pool[id], taskID: a.TaskID}, nil
+				p := m.pool[id]
+				return &Lease[T]{manager: m, resource: p, group: m.groups[p.GroupID], taskID: a.TaskID}, nil
 			}
 		} else {
 			g, ok := m.groups[a.GroupID]
@@ -367,7 +368,7 @@ func (m *Manager[T]) acquire(ctx context.Context, a Assignment, lock bool) (*Lea
 					m.bindings[a.TaskID] = p.ID
 				}
 				m.hold(p.ID, a.TaskID)
-				return &Lease[T]{manager: m, resource: p, taskID: a.TaskID}, nil
+				return &Lease[T]{manager: m, resource: p, group: m.groups[p.GroupID], taskID: a.TaskID}, nil
 			}
 		}
 
@@ -417,6 +418,59 @@ func (m *Manager[T]) CheckAssignment(a Assignment) error {
 		return fmt.Errorf("group %s: %w", a.GroupID, ErrGroupNotFound)
 	}
 	return m.checkPin(a)
+}
+
+// Held reports the assignment of every live lease — in acquire or lock mode —
+// whose resource and group satisfy pred. It is one of the two facts this
+// package owns, offered raw: the predicate brings the meaning (which payload
+// field, which ref), the manager brings who holds what. Results are sorted by
+// task then resource so refusals built on them read stably.
+func (m *Manager[T]) Held(pred func(Resource[T], Group) bool) []Assignment {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	matched := make([]Assignment, 0)
+	for resourceID, holders := range m.holders {
+		p, ok := m.pool[resourceID]
+		if !ok || !pred(p, m.groups[p.GroupID]) {
+			continue
+		}
+		for taskID := range holders {
+			matched = append(matched, Assignment{TaskID: taskID, GroupID: p.GroupID, ResourceID: p.ID})
+		}
+	}
+	sortAssignments(matched)
+	return matched
+}
+
+// Locked reports the assignment of every durable lock — running or not — whose
+// resource and group satisfy pred. See Held; a task both locked and leasing
+// appears in both reports.
+func (m *Manager[T]) Locked(pred func(Resource[T], Group) bool) []Assignment {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	matched := make([]Assignment, 0)
+	for taskID, resourceID := range m.bindings {
+		p, ok := m.pool[resourceID]
+		if !ok || !pred(p, m.groups[p.GroupID]) {
+			continue
+		}
+		matched = append(matched, Assignment{TaskID: taskID, GroupID: p.GroupID, ResourceID: p.ID})
+	}
+	sortAssignments(matched)
+	return matched
+}
+
+// sortAssignments orders by task then resource, the stable order Held and
+// Locked report in.
+func sortAssignments(a []Assignment) {
+	sort.Slice(a, func(i, j int) bool {
+		if a[i].TaskID != a[j].TaskID {
+			return a[i].TaskID < a[j].TaskID
+		}
+		return a[i].ResourceID < a[j].ResourceID
+	})
 }
 
 // groupHasResources reports whether any resource belongs to the group, leased
@@ -679,6 +733,7 @@ func (m *Manager[T]) remove(ctx context.Context, p Resource[T]) error {
 type Lease[T any] struct {
 	manager  *Manager[T]
 	resource Resource[T]
+	group    Group
 	taskID   string
 	once     sync.Once
 }
@@ -686,6 +741,12 @@ type Lease[T any] struct {
 // Resource returns the leased resource as of acquisition.
 func (l *Lease[T]) Resource() Resource[T] {
 	return l.resource
+}
+
+// Group returns the group of the leased resource as of acquisition, so
+// holders can read group-level Refs without another lookup surface.
+func (l *Lease[T]) Group() Group {
+	return l.group
 }
 
 // Release frees the resource, records the outcome selection strategies learn
