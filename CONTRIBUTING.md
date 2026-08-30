@@ -50,7 +50,7 @@ Small, focused PRs are reviewed quickly. If your change grew beyond one concern,
 
 ## Changing the scaffolder
 
-The `rogojin new` CLI (`cmd/rogojin`) renders a runnable workflow from the templates in `internal/scaffold/templates`. Those templates **reproduce framework surface** — the `workflows.Workflow` and `Instance` interfaces, the opt-in capabilities (`Snapshotter`, `Outputter`, `Teardowner`), and the wiring in `main` (`tasks.NewService`, `proxies.NewManager`, the SQLite constructors). This makes the scaffolder a maintenance surface that many feature changes touch indirectly:
+The `rogojin new` CLI (`cmd/rogojin`) renders a runnable workflow from the templates in `internal/scaffold/templates`. Those templates **reproduce framework surface** — the `workflows.Workflow` and `Instance` interfaces, the opt-in capabilities (`Snapshotter`, `Outputter`, `Teardowner`), and the wiring in `main` (`tasks.NewManager`, `proxies.NewManager`, the SQLite constructors). This makes the scaffolder a maintenance surface that many feature changes touch indirectly:
 
 - **If your changes affect the templates, update the templates in the same PR.** Renaming a type, adding an interface method, or changing a constructor signature will leave the generated code stale. `TestGeneratedCodeCompiles` renders every flag combination and runs `go vet` against the real packages, so a change that breaks the templates fails CI — but it only catches *compile* breakage. Conceptual drift (the example adopts a better pattern the templates don't) is not caught; keep the templates and `_examples` in step.
 

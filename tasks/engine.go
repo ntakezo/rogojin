@@ -212,7 +212,7 @@ func (e *engine) Output() []byte {
 
 // seal latches the engine closed so a later Start refuses, reporting false —
 // and sealing nothing — if the engine is live. Deletion seals every task it is
-// about to remove, because Start never goes through the service and could
+// about to remove, because Start never goes through the manager and could
 // otherwise begin a run mid-sweep.
 func (e *engine) seal() bool {
 	e.mu.Lock()

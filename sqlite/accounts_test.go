@@ -1,0 +1,308 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"github.com/ntakezo/rogojin/leasing"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/ntakezo/rogojin/accounts"
+)
+
+// satisfiesRepositoryPort fails to compile if Accounts drifts from the persistence port it exists to implement.
+var _ accounts.Repository = (*Accounts)(nil)
+
+// newTestAccounts opens the accounts store on a fresh temp-file database.
+func newTestAccounts(t *testing.T) accounts.Repository {
+	t.Helper()
+	repo, err := NewAccounts(openTestDB(t))
+	if err != nil {
+		t.Fatalf("NewAccounts: %v", err)
+	}
+	return repo
+}
+
+// TestAccountsSaveListRoundTrip verifies every field — the lock owner and
+// the workflow's own JSON — survives storage, because lock reclamation and
+// login both read them back verbatim.
+func TestAccountsSaveListRoundTrip(t *testing.T) {
+	repo := newTestAccounts(t)
+	ctx := context.Background()
+
+	locked := accounts.Account{
+		Resource: leasing.Resource{ID: "a1", GroupID: "site", OwnerID: "t1"},
+		EmailID:  "inbox-1",
+		Fields: mustJSON(t, map[string]string{
+			"email":    "buyer@example.com",
+			"password": "hunter2",
+		}),
+	}
+	free := accounts.Account{Resource: leasing.Resource{ID: "a2", GroupID: "site", MaxHolders: 2}}
+	if err := repo.Save(ctx, locked); err != nil {
+		t.Fatalf("save locked: %v", err)
+	}
+	if err := repo.Save(ctx, free); err != nil {
+		t.Fatalf("save free: %v", err)
+	}
+
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("got %d accounts, want 2", len(listed))
+	}
+	if listed[0].ID != "a1" || listed[1].ID != "a2" {
+		t.Fatalf("order = %s, %s; want a1, a2", listed[0].ID, listed[1].ID)
+	}
+	if got := listed[0]; got.OwnerID != "t1" || got.GroupID != "site" {
+		t.Fatalf("a1 round-trip: got %+v", got)
+	}
+	if string(listed[0].Fields) != string(locked.Fields) {
+		t.Fatalf("fields = %s, want %s", listed[0].Fields, locked.Fields)
+	}
+	if listed[0].EmailID != "inbox-1" {
+		t.Fatalf("email_id = %q, want the forwarding inbox inbox-1", listed[0].EmailID)
+	}
+	if listed[1].MaxHolders != 2 {
+		t.Fatalf("a2 max holders = %d, want 2", listed[1].MaxHolders)
+	}
+	if listed[1].Fields != nil || listed[1].EmailID != "" {
+		t.Fatalf("a2 = %+v, want no email and no fields", listed[1])
+	}
+}
+
+// TestAccountsFieldsAreOpaqueToTheSchema verifies the point of the JSON column: two
+// workflows with unrelated account shapes share one table and one migration
+// history.
+func TestAccountsFieldsAreOpaqueToTheSchema(t *testing.T) {
+	repo := newTestAccounts(t)
+	ctx := context.Background()
+
+	type checkout struct {
+		Email string `json:"email"`
+		Card  string `json:"card"`
+	}
+	type forum struct {
+		Handle string   `json:"handle"`
+		Token  string   `json:"token"`
+		Boards []string `json:"boards"`
+	}
+	wantCheckout := checkout{Email: "buyer@example.com", Card: "4111"}
+	wantForum := forum{Handle: "ada", Token: "t0k", Boards: []string{"a", "b"}}
+
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: mustJSON(t, wantCheckout)}); err != nil {
+		t.Fatalf("save checkout account: %v", err)
+	}
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a2"}, Fields: mustJSON(t, wantForum)}); err != nil {
+		t.Fatalf("save forum account: %v", err)
+	}
+
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	gotCheckout, err := accounts.Bind[checkout](listed[0])
+	if err != nil {
+		t.Fatalf("bind checkout: %v", err)
+	}
+	if gotCheckout != wantCheckout {
+		t.Fatalf("checkout = %+v, want %+v", gotCheckout, wantCheckout)
+	}
+	gotForum, err := accounts.Bind[forum](listed[1])
+	if err != nil {
+		t.Fatalf("bind forum: %v", err)
+	}
+	if gotForum.Handle != wantForum.Handle || gotForum.Token != wantForum.Token || len(gotForum.Boards) != 2 {
+		t.Fatalf("forum = %+v, want %+v", gotForum, wantForum)
+	}
+}
+
+// TestAccountsSaveRejectsFieldsThatAreNotJSON verifies a bad payload is refused at the
+// write, not discovered as a decode failure inside a later run.
+func TestAccountsSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
+	repo := newTestAccounts(t)
+	ctx := context.Background()
+
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: json.RawMessage("not json")}); err == nil {
+		t.Fatal("expected invalid JSON fields to be refused")
+	}
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("refused save still stored %d accounts", len(listed))
+	}
+}
+
+// TestAccountsSavePreservesCreatedAt verifies a lock, an unlock, or a stat update does
+// not get to revise when the account was added.
+func TestAccountsSavePreservesCreatedAt(t *testing.T) {
+	repo := newTestAccounts(t)
+	ctx := context.Background()
+
+	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", CreatedAt: created, UpdatedAt: created}}); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	updated := time.Now().UTC().Truncate(time.Millisecond)
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}}); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !listed[0].CreatedAt.Equal(created) {
+		t.Fatalf("created_at = %s, want the original %s", listed[0].CreatedAt, created)
+	}
+	if !listed[0].UpdatedAt.Equal(updated) {
+		t.Fatalf("updated_at = %s, want the refreshed %s", listed[0].UpdatedAt, updated)
+	}
+}
+
+// TestAccountsDeleteIsIdempotent verifies deleting an absent row is not an error, so a
+// manager cleaning up after a partial failure can retry.
+func TestAccountsDeleteIsIdempotent(t *testing.T) {
+	repo := newTestAccounts(t)
+	ctx := context.Background()
+
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := repo.Delete(ctx, "a1"); err != nil {
+		t.Fatalf("first delete: %v", err)
+	}
+	if err := repo.Delete(ctx, "a1"); err != nil {
+		t.Fatalf("second delete: %v", err)
+	}
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("got %d accounts, want none", len(listed))
+	}
+}
+
+// TestAccountsGroupRoundTrip verifies groups persist with their strategy — normally
+// the empty string, resolving to round robin — and their timestamps.
+func TestAccountsGroupRoundTrip(t *testing.T) {
+	repo := newTestAccounts(t)
+	ctx := context.Background()
+
+	created := time.Now().UTC().Truncate(time.Millisecond)
+	want := accounts.Group{ID: "site", Refs: map[string]string{accounts.EmailRef: "inbox-1"}, CreatedAt: created, UpdatedAt: created}
+	if err := repo.SaveGroup(ctx, want); err != nil {
+		t.Fatalf("save group: %v", err)
+	}
+
+	listed, err := repo.ListGroups(ctx)
+	if err != nil {
+		t.Fatalf("list groups: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("got %d groups, want 1", len(listed))
+	}
+	if listed[0].ID != want.ID || listed[0].Strategy != "" || !listed[0].CreatedAt.Equal(created) {
+		t.Fatalf("group round-trip: got %+v, want %+v", listed[0], want)
+	}
+	if listed[0].Refs[accounts.EmailRef] != "inbox-1" {
+		t.Fatalf("group refs = %v, want the forwarding inbox carried opaquely", listed[0].Refs)
+	}
+
+	if err := repo.DeleteGroup(ctx, "site"); err != nil {
+		t.Fatalf("delete group: %v", err)
+	}
+	if listed, err = repo.ListGroups(ctx); err != nil || len(listed) != 0 {
+		t.Fatalf("after delete: %v, %v", listed, err)
+	}
+}
+
+// TestAccountsAdoptsAPreLedgerDatabase verifies the upgrade path for a database written
+// before migrations were recorded in a ledger, when progress lived in the
+// file-header counter. Its rows must survive and its schema must not be
+// re-migrated, since the store is opened by the same code on every start.
+func TestAccountsAdoptsAPreLedgerDatabase(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "accounts.db")
+	ctx := context.Background()
+
+	// Hand-build what the old code left behind: both tables as they stood at
+	// counter 2 — before the strategy column existed — and no ledger.
+	raw, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	for _, m := range accountMigrations[:2] {
+		if _, err := raw.Exec(m.SQL); err != nil {
+			t.Fatalf("seed %s: %v", m.Name, err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO accounts (id, group_id) VALUES ('a1', 'site')`); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	if _, err := raw.Exec(`PRAGMA user_version = 2`); err != nil {
+		t.Fatalf("seed counter: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	repoDB := openAt(t, dsn)
+	repo, err := NewAccounts(repoDB)
+	if err != nil {
+		t.Fatalf("open a pre-ledger database: %v", err)
+	}
+	defer repoDB.Close()
+
+	listed, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != "a1" {
+		t.Fatalf("got %+v, want the row the old database held", listed)
+	}
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a2"}}); err != nil {
+		t.Fatalf("save after adoption: %v", err)
+	}
+}
+
+// TestAccountsSchemaReopensCleanly verifies the migration counter holds: a second open
+// of the same file applies nothing and loses nothing.
+func TestAccountsSchemaReopensCleanly(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "accounts.db")
+	ctx := context.Background()
+
+	firstDB := openAt(t, dsn)
+	first, err := NewAccounts(firstDB)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if err := first.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: mustJSON(t, map[string]string{"email": "a@b.c"})}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := firstDB.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	secondDB := openAt(t, dsn)
+	second, err := NewAccounts(secondDB)
+	if err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+	defer secondDB.Close()
+
+	listed, err := second.List(ctx)
+	if err != nil {
+		t.Fatalf("list after reopen: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != "a1" {
+		t.Fatalf("got %+v, want the stored account", listed)
+	}
+}

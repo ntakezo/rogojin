@@ -1,0 +1,198 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/ntakezo/rogojin/payments"
+)
+
+// Payments is the payments.Repository: one row per payment, its checkout-defined
+// fields — number, expiry, CVV, billing address — in a JSON text column so
+// the schema knows nothing about what any workflow's payments contain.
+//
+// They are stored in the clear. This is the plain-file default, not a vault:
+// a database holding real payment data belongs behind a store that seals
+// payments.Payment.Fields on the way down and opens them on the way up, which the
+// Repository port is shaped to allow. Wrap this one, or write your own.
+type Payments struct {
+	db *sql.DB
+}
+
+// NewPayments builds the payments store on db, bringing its tables up to the
+// current schema.
+func NewPayments(db *DB) (payments.Repository, error) {
+	if err := migrate(db.db, "payments", paymentMigrations); err != nil {
+		return nil, err
+	}
+	return &Payments{db: db.db}, nil
+}
+
+// paymentMigrations is the ordered schema history of the payments store. Append new
+// steps to the end; never edit or reorder shipped ones: the ledger records
+// which of them have already run on existing databases by position.
+var paymentMigrations = []migration{
+	{
+		Name: "create payments table",
+		SQL: `CREATE TABLE IF NOT EXISTS payments (
+			id          TEXT PRIMARY KEY,
+			group_id    TEXT NOT NULL DEFAULT 'global',
+			owner_id    TEXT NOT NULL DEFAULT '',
+			max_holders INTEGER NOT NULL DEFAULT 0,
+			successes   INTEGER NOT NULL DEFAULT 0,
+			failures    INTEGER NOT NULL DEFAULT 0,
+			fields      TEXT NOT NULL DEFAULT '',
+			created_at  TEXT NOT NULL DEFAULT '',
+			updated_at  TEXT NOT NULL DEFAULT ''
+		)`,
+	},
+	{
+		Name: "create payment_groups table",
+		SQL: `CREATE TABLE IF NOT EXISTS payment_groups (
+			id          TEXT PRIMARY KEY,
+			max_holders INTEGER NOT NULL DEFAULT 0,
+			created_at  TEXT NOT NULL DEFAULT '',
+			updated_at  TEXT NOT NULL DEFAULT ''
+		)`,
+	},
+	{
+		Name: "add strategy column to payment_groups",
+		SQL:  `ALTER TABLE payment_groups ADD COLUMN strategy TEXT NOT NULL DEFAULT ''`,
+	},
+	{
+		Name: "add refs column to payment_groups",
+		SQL:  `ALTER TABLE payment_groups ADD COLUMN refs TEXT NOT NULL DEFAULT ''`,
+	},
+}
+
+// List returns every stored payment in stable id order, so the manager's pool
+// order is deterministic. The successes and failures columns are legacy —
+// payments keep no lease outcomes — and are left unread.
+func (s *Payments) List(ctx context.Context) ([]payments.Payment, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, group_id, owner_id, max_holders, fields, created_at, updated_at
+		 FROM payments ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list payments: %w", err)
+	}
+	defer rows.Close()
+
+	listed := make([]payments.Payment, 0)
+	for rows.Next() {
+		var c payments.Payment
+		var fields, created, updated string
+		if err := rows.Scan(&c.ID, &c.GroupID, &c.OwnerID, &c.MaxHolders, &fields, &created, &updated); err != nil {
+			return nil, fmt.Errorf("list payments: %w", err)
+		}
+		c.Fields = parseFields(fields)
+		if c.CreatedAt, err = parseTime(created); err != nil {
+			return nil, fmt.Errorf("list payments: %w", err)
+		}
+		if c.UpdatedAt, err = parseTime(updated); err != nil {
+			return nil, fmt.Errorf("list payments: %w", err)
+		}
+		listed = append(listed, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list payments: %w", err)
+	}
+	return listed, nil
+}
+
+// Save upserts the payment's record: group, holder policy, lock owner, fields, and
+// updated_at. created_at is written on insert and never overwritten, so a later
+// lock cannot revise it.
+func (s *Payments) Save(ctx context.Context, c payments.Payment) error {
+	fields, err := formatFields(c.Fields)
+	if err != nil {
+		return fmt.Errorf("save payment %s: %w", c.ID, err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO payments (id, group_id, owner_id, max_holders, fields, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET group_id = excluded.group_id,
+		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
+		 fields = excluded.fields,
+		 updated_at = excluded.updated_at`,
+		c.ID, c.GroupID, c.OwnerID, c.MaxHolders, fields,
+		formatTime(c.CreatedAt), formatTime(c.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("save payment %s: %w", c.ID, err)
+	}
+	return nil
+}
+
+// Delete removes the payment's record; absent rows are a no-op.
+func (s *Payments) Delete(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM payments WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete payment %s: %w", id, err)
+	}
+	return nil
+}
+
+// ListGroups returns every stored payment group in stable id order. The
+// max_holders column is legacy — holder policy lives on the payment — and is
+// left unread.
+func (s *Payments) ListGroups(ctx context.Context) ([]payments.Group, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, strategy, refs, created_at, updated_at FROM payment_groups ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list payment groups: %w", err)
+	}
+	defer rows.Close()
+
+	listed := make([]payments.Group, 0)
+	for rows.Next() {
+		var g payments.Group
+		var refs, created, updated string
+		if err := rows.Scan(&g.ID, &g.Strategy, &refs, &created, &updated); err != nil {
+			return nil, fmt.Errorf("list payment groups: %w", err)
+		}
+		if g.Refs, err = parseMap[string](refs); err != nil {
+			return nil, fmt.Errorf("list payment groups: decode refs of %s: %w", g.ID, err)
+		}
+		if g.CreatedAt, err = parseTime(created); err != nil {
+			return nil, fmt.Errorf("list payment groups: %w", err)
+		}
+		if g.UpdatedAt, err = parseTime(updated); err != nil {
+			return nil, fmt.Errorf("list payment groups: %w", err)
+		}
+		listed = append(listed, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list payment groups: %w", err)
+	}
+	return listed, nil
+}
+
+// SaveGroup upserts the group's record. created_at is written on insert and
+// never overwritten: when a group was created is not something a later save
+// gets to revise.
+func (s *Payments) SaveGroup(ctx context.Context, g payments.Group) error {
+	refs, err := formatMap(g.Refs)
+	if err != nil {
+		return fmt.Errorf("save payment group %s: encode refs: %w", g.ID, err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO payment_groups (id, strategy, refs, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET strategy = excluded.strategy,
+		 refs = excluded.refs, updated_at = excluded.updated_at`,
+		g.ID, g.Strategy, refs, formatTime(g.CreatedAt), formatTime(g.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("save payment group %s: %w", g.ID, err)
+	}
+	return nil
+}
+
+// DeleteGroup removes the group's record; absent rows are a no-op. Member
+// payments are the manager's to delete — the store cascades nothing.
+func (s *Payments) DeleteGroup(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM payment_groups WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete payment group %s: %w", id, err)
+	}
+	return nil
+}

@@ -8,6 +8,7 @@ import (
 
 	"{{.ModulePath}}/{{.Package}}/states"
 {{- if .Proxy}}
+	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/proxies"
 {{- end}}
 	"github.com/ntakezo/rogojin/workflows"
@@ -25,18 +26,27 @@ type workflow struct {
 }
 
 // New builds the workflow module.
-func New({{if .Proxy}}manager *proxies.Manager{{end}}) workflows.Workflow {
-	return workflow{
-{{- if .Proxy}}
-		proxies: manager,
-{{- end}}
-	}
+func New() workflows.Workflow {
+	return &workflow{}
 }
 
-func (w workflow) ID() string { return Name }
-
+func (w *workflow) ID() string { return Name }
+{{if .Proxy}}
+// UseResources receives the task manager's registered managers at
+// registration, so the manager this workflow leases through is the same
+// instance the task manager unlocks through. A missing or mistyped kind
+// fails the registration at boot.
+func (w *workflow) UseResources(managers map[leasing.Kind]any) error {
+	manager, ok := managers[proxies.Kind].(*proxies.Manager)
+	if !ok {
+		return fmt.Errorf("{{.Name}}: needs a *proxies.Manager registered under kind %q", proxies.Kind)
+	}
+	w.proxies = manager
+	return nil
+}
+{{end}}
 // ValidateInput ensures the caller passed a states.Input.
-func (w workflow) ValidateInput(input any) error {
+func (w *workflow) ValidateInput(input any) error {
 	if _, ok := input.(states.Input); !ok {
 		return fmt.Errorf("{{.Name}}: expected states.Input, got %T", input)
 	}
@@ -44,7 +54,7 @@ func (w workflow) ValidateInput(input any) error {
 }
 
 // NewInstance builds a fresh, per-task instance bound to input and deps.
-func (w workflow) NewInstance(input any, deps workflows.Deps) (workflows.Instance, error) {
+func (w *workflow) NewInstance(input any, deps workflows.Deps) (workflows.Instance, error) {
 	in, ok := input.(states.Input)
 	if !ok {
 		return nil, fmt.Errorf("{{.Name}}: expected states.Input, got %T", input)
@@ -54,7 +64,7 @@ func (w workflow) NewInstance(input any, deps workflows.Deps) (workflows.Instanc
 {{if .Durable}}
 // RestoreInstance rebuilds an instance from a snapshot so a task can resume
 // after a crash, restart, or suspend.
-func (w workflow) RestoreInstance(deps workflows.Deps, snapshot []byte) (workflows.Instance, error) {
+func (w *workflow) RestoreInstance(deps workflows.Deps, snapshot []byte) (workflows.Instance, error) {
 	return states.RestoreContext(deps, snapshot{{if .Proxy}}, w.proxies{{end}})
 }
 {{end}}

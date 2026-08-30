@@ -8,7 +8,7 @@ import (
 // TestGroupRefsTravelOpaquely verifies group refs round-trip through the
 // repository and a manager restart untouched and unread, because consumers
 // hang cross-resource references (like a forwarding inbox) on them and the
-// mechanism layer must carry those bytes the way it carries Attrs.
+// mechanism layer must carry those bytes the way it carries a model's own fields.
 func TestGroupRefsTravelOpaquely(t *testing.T) {
 	repo := newFakeRepo()
 	m := newTestManager(t, repo)
@@ -20,14 +20,14 @@ func TestGroupRefsTravelOpaquely(t *testing.T) {
 	}
 
 	restarted := rebuildManager(t, repo)
-	if err := restarted.Add(ctx, res{ID: "p1", GroupID: "g1"}); err != nil {
+	if err := restarted.Add(ctx, res{Resource: Resource{ID: "p1", GroupID: "g1"}}); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	l, err := restarted.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "g1"})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	defer l.Release(true)
+	defer l.Release()
 	got := l.Group().Refs
 	if got["email"] != "inbox-1" || got["other"] != "x" {
 		t.Fatalf("refs after restart = %v, want %v", got, refs)
@@ -45,7 +45,7 @@ func TestLeaseExposesItsGroup(t *testing.T) {
 	if err := m.CreateGroup(ctx, Group{ID: "g1", Refs: map[string]string{"email": "inbox-1"}}); err != nil {
 		t.Fatalf("create group: %v", err)
 	}
-	if err := m.Add(ctx, res{ID: "p1", GroupID: "g1"}); err != nil {
+	if err := m.Add(ctx, res{Resource: Resource{ID: "p1", GroupID: "g1"}}); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 
@@ -58,13 +58,13 @@ func TestLeaseExposesItsGroup(t *testing.T) {
 	if l.Group().ID != "g1" || l.Group().Refs["email"] != "inbox-1" {
 		t.Fatalf("lock lease group = %+v, want g1 with email ref", l.Group())
 	}
-	l.Release(true)
+	l.Release()
 
 	relock, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "g1"})
 	if err != nil {
 		t.Fatalf("re-acquire: %v", err)
 	}
-	defer relock.Release(true)
+	defer relock.Release()
 	if relock.Group().ID != "g1" || relock.Group().Refs["email"] != "inbox-1" {
 		t.Fatalf("bound lease group = %+v, want g1 with email ref", relock.Group())
 	}
@@ -83,9 +83,9 @@ func TestHeldAndLockedReportOnlyMatchingAssignments(t *testing.T) {
 		t.Fatalf("create group: %v", err)
 	}
 	seed := []res{
-		{ID: "p1", GroupID: "g1"},
-		{ID: "p2", GroupID: "g1"},
-		{ID: "p3", Attrs: payload{region: "elsewhere"}},
+		{Resource: Resource{ID: "p1", GroupID: "g1"}},
+		{Resource: Resource{ID: "p2", GroupID: "g1"}},
+		{Resource: Resource{ID: "p3"}, payload: payload{region: "elsewhere"}},
 	}
 	for _, p := range seed {
 		if err := m.Add(ctx, p); err != nil {
@@ -111,11 +111,11 @@ func TestHeldAndLockedReportOnlyMatchingAssignments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire outside: %v", err)
 	}
-	defer outside.Release(true)
+	defer outside.Release()
 
 	// t-locked releases its lease but keeps the durable lock: an idle lock
 	// must appear in Locked and vanish from Held.
-	locked.Release(true)
+	locked.Release()
 
 	gotHeld := m.Held(inG1)
 	if len(gotHeld) != 1 || gotHeld[0].TaskID != "t-live" {
@@ -126,7 +126,7 @@ func TestHeldAndLockedReportOnlyMatchingAssignments(t *testing.T) {
 		t.Fatalf("Locked = %v, want only t-locked", gotLocked)
 	}
 
-	held.Release(true)
+	held.Release()
 	if got := m.Held(inG1); len(got) != 0 {
 		t.Fatalf("Held after release = %v, want none", got)
 	}
