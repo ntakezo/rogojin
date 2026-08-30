@@ -1,9 +1,9 @@
 // Package sqlite is the SQLite persistence layer: one file-backed
 // implementation of every repository port the framework defines — accounts,
-// cards, proxies, email, and tasks — built on one open database.
+// payments, proxies, email, and tasks — built on one open database.
 //
 // Open opens the database once, on a single connection, and each store is
-// constructed on it: NewAccounts, NewCards, NewProxies, NewEmails, NewTasks.
+// constructed on it: NewAccounts, NewPayments, NewProxies, NewEmails, NewTasks.
 // The stores share the file and the connection but nothing else. Each records
 // its schema migrations under its own name in a shared ledger, so any subset
 // of them can live in one file, each advancing its own history without

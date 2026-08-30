@@ -5,7 +5,7 @@
 // without that resource.
 //
 // A kind is just a string naming one leasing manager — each resource package
-// publishes its own (proxies.Kind, accounts.Kind, cards.Kind). This package
+// publishes its own (proxies.Kind, accounts.Kind, payments.Kind). This package
 // stores and resolves placements under it and never interprets it, so a new
 // resource kind needs no change here.
 package tasks

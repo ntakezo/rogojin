@@ -1,4 +1,4 @@
-package cards
+package payments
 
 import (
 	"context"
@@ -17,12 +17,12 @@ import (
 type fakeRepo struct {
 	mu      sync.Mutex
 	order   []string
-	records map[string]Card
+	records map[string]Payment
 	groups  map[string]Group
 }
 
-func newFakeRepo(seed ...Card) *fakeRepo {
-	r := &fakeRepo{records: map[string]Card{}, groups: map[string]Group{}}
+func newFakeRepo(seed ...Payment) *fakeRepo {
+	r := &fakeRepo{records: map[string]Payment{}, groups: map[string]Group{}}
 	for _, c := range seed {
 		r.records[c.ID] = c
 		r.order = append(r.order, c.ID)
@@ -30,10 +30,10 @@ func newFakeRepo(seed ...Card) *fakeRepo {
 	return r
 }
 
-func (r *fakeRepo) List(ctx context.Context) ([]Card, error) {
+func (r *fakeRepo) List(ctx context.Context) ([]Payment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]Card, 0, len(r.order))
+	out := make([]Payment, 0, len(r.order))
 	for _, id := range r.order {
 		if c, ok := r.records[id]; ok {
 			out = append(out, c)
@@ -42,7 +42,7 @@ func (r *fakeRepo) List(ctx context.Context) ([]Card, error) {
 	return out, nil
 }
 
-func (r *fakeRepo) Save(ctx context.Context, c Card) error {
+func (r *fakeRepo) Save(ctx context.Context, c Payment) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.records[c.ID]; !ok {
@@ -83,7 +83,7 @@ func (r *fakeRepo) DeleteGroup(ctx context.Context, id string) error {
 	return nil
 }
 
-// instrument is a workflow-shaped view of a card's fields, standing in for
+// instrument is a workflow-shaped view of a payment's fields, standing in for
 // whatever a real checkout defines.
 type instrument struct {
 	Number string `json:"number"`
@@ -95,7 +95,7 @@ type instrument struct {
 // into the workflow's own shape at the point of use.
 func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	raw := json.RawMessage(`{"number":"4111111111111111","cvv":"123"}`)
-	repo := newFakeRepo(Card{Resource: leasing.Resource{ID: "c1"}, Fields: raw})
+	repo := newFakeRepo(Payment{Resource: leasing.Resource{ID: "c1"}, Fields: raw})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)
@@ -119,11 +119,11 @@ func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	}
 }
 
-// TestBindToleratesCardsWithoutFields verifies a card with no fields binds to
-// the zero value rather than erroring, and garbage reports the card it
+// TestBindToleratesPaymentsWithoutFields verifies a payment with no fields binds to
+// the zero value rather than erroring, and garbage reports the payment it
 // belongs to.
-func TestBindToleratesCardsWithoutFields(t *testing.T) {
-	got, err := Bind[instrument](Card{Resource: leasing.Resource{ID: "bare"}})
+func TestBindToleratesPaymentsWithoutFields(t *testing.T) {
+	got, err := Bind[instrument](Payment{Resource: leasing.Resource{ID: "bare"}})
 	if err != nil {
 		t.Fatalf("Bind of empty fields: %v", err)
 	}
@@ -131,16 +131,16 @@ func TestBindToleratesCardsWithoutFields(t *testing.T) {
 		t.Fatalf("bound = %+v, want the zero instrument", got)
 	}
 
-	if _, err := Bind[instrument](Card{Resource: leasing.Resource{ID: "c9"}, Fields: json.RawMessage(`{"number":`)}); err == nil {
+	if _, err := Bind[instrument](Payment{Resource: leasing.Resource{ID: "c9"}, Fields: json.RawMessage(`{"number":`)}); err == nil {
 		t.Fatal("expected an error for malformed fields")
 	}
 }
 
-// TestCardsRotateWithNoConfiguration verifies the strategy-less default: two
-// tasks drawing from the pool get different cards, with nothing configured but
+// TestPaymentsRotateWithNoConfiguration verifies the strategy-less default: two
+// tasks drawing from the pool get different payments, with nothing configured but
 // the repository.
-func TestCardsRotateWithNoConfiguration(t *testing.T) {
-	repo := newFakeRepo(Card{Resource: leasing.Resource{ID: "c1"}}, Card{Resource: leasing.Resource{ID: "c2"}})
+func TestPaymentsRotateWithNoConfiguration(t *testing.T) {
+	repo := newFakeRepo(Payment{Resource: leasing.Resource{ID: "c1"}}, Payment{Resource: leasing.Resource{ID: "c2"}})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)

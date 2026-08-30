@@ -9,30 +9,30 @@ import (
 	"time"
 
 	"github.com/ntakezo/rogojin/accounts"
-	"github.com/ntakezo/rogojin/cards"
+	"github.com/ntakezo/rogojin/payments"
 )
 
-// satisfiesRepositoryPort fails to compile if Cards drifts from the persistence port it exists to implement.
-var _ cards.Repository = (*Cards)(nil)
+// satisfiesRepositoryPort fails to compile if Payments drifts from the persistence port it exists to implement.
+var _ payments.Repository = (*Payments)(nil)
 
-// newTestCards opens the cards store on a fresh temp-file database.
-func newTestCards(t *testing.T) cards.Repository {
+// newTestPayments opens the payments store on a fresh temp-file database.
+func newTestPayments(t *testing.T) payments.Repository {
 	t.Helper()
-	repo, err := NewCards(openTestDB(t))
+	repo, err := NewPayments(openTestDB(t))
 	if err != nil {
-		t.Fatalf("NewCards: %v", err)
+		t.Fatalf("NewPayments: %v", err)
 	}
 	return repo
 }
 
-// TestCardsSaveListRoundTrip verifies every field — the lock owner and
+// TestPaymentsSaveListRoundTrip verifies every field — the lock owner and
 // the workflow's own JSON — survives storage, because lock reclamation and
 // payment both read them back verbatim.
-func TestCardsSaveListRoundTrip(t *testing.T) {
-	repo := newTestCards(t)
+func TestPaymentsSaveListRoundTrip(t *testing.T) {
+	repo := newTestPayments(t)
 	ctx := context.Background()
 
-	locked := cards.Card{
+	locked := payments.Payment{
 		Resource: leasing.Resource{ID: "c1", GroupID: "bin", OwnerID: "t1"},
 		Fields: mustJSON(t, map[string]string{
 			"number": "4111111111111111",
@@ -40,7 +40,7 @@ func TestCardsSaveListRoundTrip(t *testing.T) {
 			"cvv":    "737",
 		}),
 	}
-	free := cards.Card{Resource: leasing.Resource{ID: "c2", GroupID: "bin", MaxHolders: 2}}
+	free := payments.Payment{Resource: leasing.Resource{ID: "c2", GroupID: "bin", MaxHolders: 2}}
 	if err := repo.Save(ctx, locked); err != nil {
 		t.Fatalf("save locked: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestCardsSaveListRoundTrip(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	if len(listed) != 2 {
-		t.Fatalf("got %d cards, want 2", len(listed))
+		t.Fatalf("got %d payments, want 2", len(listed))
 	}
 	if listed[0].ID != "c1" || listed[1].ID != "c2" {
 		t.Fatalf("order = %s, %s; want c1, c2", listed[0].ID, listed[1].ID)
@@ -72,12 +72,12 @@ func TestCardsSaveListRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCardsFieldsAreOpaqueToTheSchema verifies the point of the JSON column: a raw
+// TestPaymentsFieldsAreOpaqueToTheSchema verifies the point of the JSON column: a raw
 // PAN, a gateway token, and a wrapped ciphertext are all just text here, so a
 // store that encrypts and one that does not share the same table and the same
 // migration history.
-func TestCardsFieldsAreOpaqueToTheSchema(t *testing.T) {
-	repo := newTestCards(t)
+func TestPaymentsFieldsAreOpaqueToTheSchema(t *testing.T) {
+	repo := newTestPayments(t)
 	ctx := context.Background()
 
 	type raw struct {
@@ -97,25 +97,25 @@ func TestCardsFieldsAreOpaqueToTheSchema(t *testing.T) {
 		Billing: map[string]string{"zip": "10001", "country": "US"},
 	}
 
-	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, wantRaw)}); err != nil {
-		t.Fatalf("save raw card: %v", err)
+	if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, wantRaw)}); err != nil {
+		t.Fatalf("save raw payment: %v", err)
 	}
-	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c2"}, Fields: mustJSON(t, wantTokenized)}); err != nil {
-		t.Fatalf("save tokenized card: %v", err)
+	if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c2"}, Fields: mustJSON(t, wantTokenized)}); err != nil {
+		t.Fatalf("save tokenized payment: %v", err)
 	}
 
 	listed, err := repo.List(ctx)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	gotRaw, err := cards.Bind[raw](listed[0])
+	gotRaw, err := payments.Bind[raw](listed[0])
 	if err != nil {
 		t.Fatalf("bind raw: %v", err)
 	}
 	if gotRaw != wantRaw {
 		t.Fatalf("raw = %+v, want %+v", gotRaw, wantRaw)
 	}
-	gotTokenized, err := cards.Bind[tokenized](listed[1])
+	gotTokenized, err := payments.Bind[tokenized](listed[1])
 	if err != nil {
 		t.Fatalf("bind tokenized: %v", err)
 	}
@@ -124,14 +124,14 @@ func TestCardsFieldsAreOpaqueToTheSchema(t *testing.T) {
 	}
 }
 
-// TestCardsSaveRejectsFieldsThatAreNotJSON verifies a bad payload is refused at the
+// TestPaymentsSaveRejectsFieldsThatAreNotJSON verifies a bad payload is refused at the
 // write, not discovered as a decode failure inside a later run — which for a
-// card is at the last state before payment.
-func TestCardsSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
-	repo := newTestCards(t)
+// payment is at the last state before payment.
+func TestPaymentsSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
+	repo := newTestPayments(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}, Fields: json.RawMessage("not json")}); err == nil {
+	if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: json.RawMessage("not json")}); err == nil {
 		t.Fatal("expected invalid JSON fields to be refused")
 	}
 	listed, err := repo.List(ctx)
@@ -139,23 +139,23 @@ func TestCardsSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	if len(listed) != 0 {
-		t.Fatalf("refused save still stored %d cards", len(listed))
+		t.Fatalf("refused save still stored %d payments", len(listed))
 	}
 }
 
-// TestCardsSavePreservesCreatedAt verifies a lock, an unlock, or a stat update does
-// not get to revise when the card was added.
-func TestCardsSavePreservesCreatedAt(t *testing.T) {
-	repo := newTestCards(t)
+// TestPaymentsSavePreservesCreatedAt verifies a lock, an unlock, or a stat update does
+// not get to revise when the payment was added.
+func TestPaymentsSavePreservesCreatedAt(t *testing.T) {
+	repo := newTestPayments(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
-	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1", CreatedAt: created, UpdatedAt: created}}); err != nil {
+	if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1", CreatedAt: created, UpdatedAt: created}}); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 
 	updated := time.Now().UTC().Truncate(time.Millisecond)
-	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}}); err != nil {
+	if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}}); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
 
@@ -171,13 +171,13 @@ func TestCardsSavePreservesCreatedAt(t *testing.T) {
 	}
 }
 
-// TestCardsDeleteIsIdempotent verifies deleting an absent row is not an error, so a
+// TestPaymentsDeleteIsIdempotent verifies deleting an absent row is not an error, so a
 // manager cleaning up after a partial failure can retry.
-func TestCardsDeleteIsIdempotent(t *testing.T) {
-	repo := newTestCards(t)
+func TestPaymentsDeleteIsIdempotent(t *testing.T) {
+	repo := newTestPayments(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}}); err != nil {
+	if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := repo.Delete(ctx, "c1"); err != nil {
@@ -191,18 +191,18 @@ func TestCardsDeleteIsIdempotent(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	if len(listed) != 0 {
-		t.Fatalf("got %d cards, want none", len(listed))
+		t.Fatalf("got %d payments, want none", len(listed))
 	}
 }
 
-// TestCardsGroupRoundTrip verifies groups persist with their strategy — normally
+// TestPaymentsGroupRoundTrip verifies groups persist with their strategy — normally
 // the empty string, resolving to round robin — and their timestamps.
-func TestCardsGroupRoundTrip(t *testing.T) {
-	repo := newTestCards(t)
+func TestPaymentsGroupRoundTrip(t *testing.T) {
+	repo := newTestPayments(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Truncate(time.Millisecond)
-	want := cards.Group{ID: "bin", CreatedAt: created, UpdatedAt: created}
+	want := payments.Group{ID: "bin", CreatedAt: created, UpdatedAt: created}
 	if err := repo.SaveGroup(ctx, want); err != nil {
 		t.Fatalf("save group: %v", err)
 	}
@@ -226,11 +226,11 @@ func TestCardsGroupRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCardsAndAccountsShareOneDatabase verifies two stores build on one open
+// TestPaymentsAndAccountsShareOneDatabase verifies two stores build on one open
 // database. Each records its migrations under its own name, so neither reads
 // the other's progress as its own — which under the per-file counter left the
 // second store with no tables at all.
-func TestCardsAndAccountsShareOneDatabase(t *testing.T) {
+func TestPaymentsAndAccountsShareOneDatabase(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
@@ -238,16 +238,16 @@ func TestCardsAndAccountsShareOneDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open accounts: %v", err)
 	}
-	cardStore, err := NewCards(db)
+	paymentStore, err := NewPayments(db)
 	if err != nil {
-		t.Fatalf("open cards on the same database: %v", err)
+		t.Fatalf("open payments on the same database: %v", err)
 	}
 
 	if err := accountStore.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", GroupID: "site"}}); err != nil {
 		t.Fatalf("save account: %v", err)
 	}
-	if err := cardStore.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1", GroupID: "bin"}}); err != nil {
-		t.Fatalf("save card: %v", err)
+	if err := paymentStore.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1", GroupID: "bin"}}); err != nil {
+		t.Fatalf("save payment: %v", err)
 	}
 
 	listedAccounts, err := accountStore.List(ctx)
@@ -257,27 +257,27 @@ func TestCardsAndAccountsShareOneDatabase(t *testing.T) {
 	if len(listedAccounts) != 1 || listedAccounts[0].ID != "a1" {
 		t.Fatalf("accounts = %+v, want the stored account", listedAccounts)
 	}
-	listedCards, err := cardStore.List(ctx)
+	listedPayments, err := paymentStore.List(ctx)
 	if err != nil {
-		t.Fatalf("list cards: %v", err)
+		t.Fatalf("list payments: %v", err)
 	}
-	if len(listedCards) != 1 || listedCards[0].ID != "c1" {
-		t.Fatalf("cards = %+v, want the stored card", listedCards)
+	if len(listedPayments) != 1 || listedPayments[0].ID != "c1" {
+		t.Fatalf("payments = %+v, want the stored payment", listedPayments)
 	}
 }
 
-// TestCardsSchemaReopensCleanly verifies the migration counter holds: a second open
+// TestPaymentsSchemaReopensCleanly verifies the migration counter holds: a second open
 // of the same file applies nothing and loses nothing.
-func TestCardsSchemaReopensCleanly(t *testing.T) {
-	dsn := filepath.Join(t.TempDir(), "cards.db")
+func TestPaymentsSchemaReopensCleanly(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "payments.db")
 	ctx := context.Background()
 
 	firstDB := openAt(t, dsn)
-	first, err := NewCards(firstDB)
+	first, err := NewPayments(firstDB)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := first.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, map[string]string{"number": "4111111111111111"})}); err != nil {
+	if err := first.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, map[string]string{"number": "4111111111111111"})}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := firstDB.Close(); err != nil {
@@ -285,7 +285,7 @@ func TestCardsSchemaReopensCleanly(t *testing.T) {
 	}
 
 	secondDB := openAt(t, dsn)
-	second, err := NewCards(secondDB)
+	second, err := NewPayments(secondDB)
 	if err != nil {
 		t.Fatalf("second open: %v", err)
 	}
@@ -296,6 +296,6 @@ func TestCardsSchemaReopensCleanly(t *testing.T) {
 		t.Fatalf("list after reopen: %v", err)
 	}
 	if len(listed) != 1 || listed[0].ID != "c1" {
-		t.Fatalf("got %+v, want the stored card", listed)
+		t.Fatalf("got %+v, want the stored payment", listed)
 	}
 }

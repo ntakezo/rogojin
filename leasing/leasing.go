@@ -31,7 +31,7 @@ const GlobalGroup = "global"
 
 // A Kind names one resource kind: one leasing manager and the pool it guards.
 // Each resource package publishes its own as a typed constant (proxies.Kind,
-// accounts.Kind, cards.Kind) — the key placements, registrations, and a
+// accounts.Kind, payments.Kind) — the key placements, registrations, and a
 // workflow's manager lookups are all filed under, so every layer agrees on
 // the name by construction.
 type Kind string
