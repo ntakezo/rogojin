@@ -1,4 +1,4 @@
-package cardsqlite
+package sqlite
 
 import (
 	"context"
@@ -10,38 +10,26 @@ import (
 
 	"github.com/ntakezo/rogojin/accounts"
 	"github.com/ntakezo/rogojin/cards"
-	"github.com/ntakezo/rogojin/persistence/accountsqlite"
 )
 
-// satisfiesRepositoryPort fails to compile if SQLite drifts from the persistence port it exists to implement.
-var _ cards.Repository = (*SQLite)(nil)
+// satisfiesRepositoryPort fails to compile if Cards drifts from the persistence port it exists to implement.
+var _ cards.Repository = (*Cards)(nil)
 
-// newTestRepo opens a SQLite repository backed by a fresh temp-file database.
-func newTestRepo(t *testing.T) *SQLite {
+// newTestCards opens the cards store on a fresh temp-file database.
+func newTestCards(t *testing.T) cards.Repository {
 	t.Helper()
-	dsn := filepath.Join(t.TempDir(), "cards.db")
-	repo, err := NewSQLite(dsn)
+	repo, err := NewCards(openTestDB(t))
 	if err != nil {
-		t.Fatalf("NewSQLite: %v", err)
+		t.Fatalf("NewCards: %v", err)
 	}
-	t.Cleanup(func() { repo.Close() })
 	return repo
 }
 
-func mustJSON(t *testing.T, v any) json.RawMessage {
-	t.Helper()
-	raw, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	return raw
-}
-
-// TestSaveListRoundTrip verifies every field — the lock owner and
+// TestCardsSaveListRoundTrip verifies every field — the lock owner and
 // the workflow's own JSON — survives storage, because lock reclamation and
 // payment both read them back verbatim.
-func TestSaveListRoundTrip(t *testing.T) {
-	repo := newTestRepo(t)
+func TestCardsSaveListRoundTrip(t *testing.T) {
+	repo := newTestCards(t)
 	ctx := context.Background()
 
 	locked := cards.Card{
@@ -84,12 +72,12 @@ func TestSaveListRoundTrip(t *testing.T) {
 	}
 }
 
-// TestFieldsAreOpaqueToTheSchema verifies the point of the JSON column: a raw
+// TestCardsFieldsAreOpaqueToTheSchema verifies the point of the JSON column: a raw
 // PAN, a gateway token, and a wrapped ciphertext are all just text here, so a
 // store that encrypts and one that does not share the same table and the same
 // migration history.
-func TestFieldsAreOpaqueToTheSchema(t *testing.T) {
-	repo := newTestRepo(t)
+func TestCardsFieldsAreOpaqueToTheSchema(t *testing.T) {
+	repo := newTestCards(t)
 	ctx := context.Background()
 
 	type raw struct {
@@ -136,11 +124,11 @@ func TestFieldsAreOpaqueToTheSchema(t *testing.T) {
 	}
 }
 
-// TestSaveRejectsFieldsThatAreNotJSON verifies a bad payload is refused at the
+// TestCardsSaveRejectsFieldsThatAreNotJSON verifies a bad payload is refused at the
 // write, not discovered as a decode failure inside a later run — which for a
 // card is at the last state before payment.
-func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
-	repo := newTestRepo(t)
+func TestCardsSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
+	repo := newTestCards(t)
 	ctx := context.Background()
 
 	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}, Fields: json.RawMessage("not json")}); err == nil {
@@ -155,10 +143,10 @@ func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
 	}
 }
 
-// TestSavePreservesCreatedAt verifies a lock, an unlock, or a stat update does
+// TestCardsSavePreservesCreatedAt verifies a lock, an unlock, or a stat update does
 // not get to revise when the card was added.
-func TestSavePreservesCreatedAt(t *testing.T) {
-	repo := newTestRepo(t)
+func TestCardsSavePreservesCreatedAt(t *testing.T) {
+	repo := newTestCards(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
@@ -183,10 +171,10 @@ func TestSavePreservesCreatedAt(t *testing.T) {
 	}
 }
 
-// TestDeleteIsIdempotent verifies deleting an absent row is not an error, so a
+// TestCardsDeleteIsIdempotent verifies deleting an absent row is not an error, so a
 // manager cleaning up after a partial failure can retry.
-func TestDeleteIsIdempotent(t *testing.T) {
-	repo := newTestRepo(t)
+func TestCardsDeleteIsIdempotent(t *testing.T) {
+	repo := newTestCards(t)
 	ctx := context.Background()
 
 	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}}); err != nil {
@@ -207,10 +195,10 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestGroupRoundTrip verifies groups persist with their strategy — normally
+// TestCardsGroupRoundTrip verifies groups persist with their strategy — normally
 // the empty string, resolving to round robin — and their timestamps.
-func TestGroupRoundTrip(t *testing.T) {
-	repo := newTestRepo(t)
+func TestCardsGroupRoundTrip(t *testing.T) {
+	repo := newTestCards(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Truncate(time.Millisecond)
@@ -238,24 +226,22 @@ func TestGroupRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCardsAndAccountsShareOneFile verifies two stores can be pointed at one
-// database file. Each records its migrations under its own name, so neither
-// reads the other's progress as its own — which under the per-file counter left
-// the second store with no tables at all.
-func TestCardsAndAccountsShareOneFile(t *testing.T) {
-	dsn := filepath.Join(t.TempDir(), "rogojin.db")
+// TestCardsAndAccountsShareOneDatabase verifies two stores build on one open
+// database. Each records its migrations under its own name, so neither reads
+// the other's progress as its own — which under the per-file counter left the
+// second store with no tables at all.
+func TestCardsAndAccountsShareOneDatabase(t *testing.T) {
+	db := openTestDB(t)
 	ctx := context.Background()
 
-	accountStore, err := accountsqlite.NewSQLite(dsn)
+	accountStore, err := NewAccounts(db)
 	if err != nil {
 		t.Fatalf("open accounts: %v", err)
 	}
-	defer accountStore.Close()
-	cardStore, err := NewSQLite(dsn)
+	cardStore, err := NewCards(db)
 	if err != nil {
-		t.Fatalf("open cards on the same file: %v", err)
+		t.Fatalf("open cards on the same database: %v", err)
 	}
-	defer cardStore.Close()
 
 	if err := accountStore.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", GroupID: "site"}}); err != nil {
 		t.Fatalf("save account: %v", err)
@@ -280,28 +266,30 @@ func TestCardsAndAccountsShareOneFile(t *testing.T) {
 	}
 }
 
-// TestSchemaReopensCleanly verifies the migration counter holds: a second open
+// TestCardsSchemaReopensCleanly verifies the migration counter holds: a second open
 // of the same file applies nothing and loses nothing.
-func TestSchemaReopensCleanly(t *testing.T) {
+func TestCardsSchemaReopensCleanly(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "cards.db")
 	ctx := context.Background()
 
-	first, err := NewSQLite(dsn)
+	firstDB := openAt(t, dsn)
+	first, err := NewCards(firstDB)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
 	if err := first.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, map[string]string{"number": "4111111111111111"})}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if err := first.Close(); err != nil {
+	if err := firstDB.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	second, err := NewSQLite(dsn)
+	secondDB := openAt(t, dsn)
+	second, err := NewCards(secondDB)
 	if err != nil {
 		t.Fatalf("second open: %v", err)
 	}
-	defer second.Close()
+	defer secondDB.Close()
 
 	listed, err := second.List(ctx)
 	if err != nil {

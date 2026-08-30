@@ -1,55 +1,34 @@
-// Package emailsqlite provides a file-backed, durable implementation of the
-// email.Repository port. A consumer that does not want to write its own
-// email store can inject SQLite.
-//
-// Inbox credentials are stored as one JSON text column, in the clear: wrap
-// this store to encrypt them if the database is not trusted. An empty
-// vendor column marks an address-only email — one with no inbox at all.
-package emailsqlite
+package sqlite
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/ntakezo/rogojin/email"
-	"github.com/ntakezo/rogojin/persistence/sqlitemigrate"
 )
 
-// SQLite is a durable email.Repository backed by a single SQLite database file.
-type SQLite struct {
+// Emails is the email.Repository: one row per email, its inbox credentials
+// in a JSON text column, in the clear. An empty vendor column marks an
+// address-only email — one with no inbox at all.
+type Emails struct {
 	db *sql.DB
 }
 
-// NewSQLite opens (creating if absent) the database at dsn and ensures the schema exists.
-func NewSQLite(dsn string) (*SQLite, error) {
-	db, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	// SQLite serializes writes per file; one connection avoids "database is locked" under concurrent saves.
-	db.SetMaxOpenConns(1)
-
-	if err := ensureSchema(db); err != nil {
-		db.Close()
+// NewEmails builds the email store on db, bringing its tables up to the
+// current schema.
+func NewEmails(db *DB) (email.Repository, error) {
+	if err := migrate(db.db, "email", emailMigrations); err != nil {
 		return nil, err
 	}
-	return &SQLite{db: db}, nil
+	return &Emails{db: db.db}, nil
 }
 
-// ensureSchema brings the database up to the latest schema version, applying any
-// migrations it has not yet seen.
-func ensureSchema(db *sql.DB) error {
-	return sqlitemigrate.Run(db, "email", migrations)
-}
-
-// migrations is the ordered schema history of the email store. Append new
-// steps to the end; never edit or reorder shipped ones: the ledger records
+// emailMigrations is the ordered schema history of the email store. Append
+// new steps to the end; never edit or reorder shipped ones: the ledger records
 // which of them have already run on existing databases by position.
-var migrations = []sqlitemigrate.Migration{
+var emailMigrations = []migration{
 	{
 		Name: "create emails table",
 		SQL: `CREATE TABLE IF NOT EXISTS emails (
@@ -65,14 +44,9 @@ var migrations = []sqlitemigrate.Migration{
 	},
 }
 
-// Close closes the underlying database.
-func (s *SQLite) Close() error {
-	return s.db.Close()
-}
-
 // List returns every stored email in stable id order, so the manager's
 // inventory order is deterministic.
-func (s *SQLite) List(ctx context.Context) ([]email.Email, error) {
+func (s *Emails) List(ctx context.Context) ([]email.Email, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, address, vendor, auth, last_uid, uid_validity, created_at, updated_at
 		 FROM emails ORDER BY id`)
@@ -109,7 +83,7 @@ func (s *SQLite) List(ctx context.Context) ([]email.Email, error) {
 // Save upserts the email's record: address, inbox credentials, cursor, and
 // updated_at. created_at is written on insert and never overwritten, so a
 // cursor advance cannot revise it.
-func (s *SQLite) Save(ctx context.Context, e email.Email) error {
+func (s *Emails) Save(ctx context.Context, e email.Email) error {
 	vendor, auth, lastUID, uidValidity, err := formatInbox(e.Inbox)
 	if err != nil {
 		return fmt.Errorf("save email %s: %w", e.ID, err)
@@ -130,7 +104,7 @@ func (s *SQLite) Save(ctx context.Context, e email.Email) error {
 }
 
 // Delete removes the email's record; absent rows are a no-op.
-func (s *SQLite) Delete(ctx context.Context, id string) error {
+func (s *Emails) Delete(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM emails WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete email %s: %w", id, err)
@@ -163,21 +137,4 @@ func parseInbox(id, vendor, auth string, lastUID, uidValidity uint32) (*email.In
 		}
 	}
 	return in, nil
-}
-
-// formatTime stores timestamps as RFC3339Nano UTC text; the zero time stores
-// as "" so pre-timestamp rows keep round-tripping.
-func formatTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	return t.UTC().Format(time.RFC3339Nano)
-}
-
-// parseTime is the inverse of formatTime.
-func parseTime(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, nil
-	}
-	return time.Parse(time.RFC3339Nano, s)
 }

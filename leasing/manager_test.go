@@ -1520,3 +1520,150 @@ func TestUpdateCannotResurrectStaleLock(t *testing.T) {
 		t.Fatalf("stored secret = %q, want the update to survive the unlock", stored.secret)
 	}
 }
+
+// TestReadSurface verifies the manager's read accessors: groups listed sorted,
+// resources in adoption order, lookups reporting existence, and every record
+// handed out as a copy that shows durable locks without exposing the pool to
+// mutation.
+func TestReadSurface(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo(
+		res{Resource: Resource{ID: "p2"}, payload: payload{region: "eu"}},
+		res{Resource: Resource{ID: "p1"}, payload: payload{region: "us"}},
+	)
+	m := newTestManager(t, repo)
+	if err := m.CreateGroup(ctx, Group{ID: "alpha", Strategy: "first"}); err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+
+	groups := m.ListGroups()
+	if len(groups) != 2 || groups[0].ID != "alpha" || groups[1].ID != GlobalGroup {
+		t.Fatalf("ListGroups() = %v, want [alpha global]", groups)
+	}
+	if g, ok := m.GetGroup(GlobalGroup); !ok || g.Strategy != "first" {
+		t.Fatalf("Group(global) = %v, %v; want the seeded group", g, ok)
+	}
+	if _, ok := m.GetGroup("missing"); ok {
+		t.Fatal("GetGroup(missing) reported an unknown group as existing")
+	}
+
+	// Resources keep adoption order — the seed order, not lexical.
+	pool := m.List()
+	if len(pool) != 2 || pool[0].ID != "p2" || pool[1].ID != "p1" {
+		t.Fatalf("List() = %v, want [p2 p1]", pool)
+	}
+
+	// A durable lock shows on the records read back.
+	lease, err := m.Lock(ctx, Assignment{TaskID: "t1", GroupID: GlobalGroup})
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	locked, ok := m.Get(lease.Resource().ID)
+	if !ok || locked.OwnerID != "t1" {
+		t.Fatalf("Resource(%s) = %v, %v; want OwnerID t1", lease.Resource().ID, locked, ok)
+	}
+
+	// Reads are copies: mutating one changes nothing behind it.
+	locked.OwnerID, locked.region = "intruder", "mars"
+	if again, _ := m.Get(lease.Resource().ID); again.OwnerID != "t1" || again.region == "mars" {
+		t.Fatalf("pool mutated through a read copy: %+v", again)
+	}
+	if _, ok := m.Get("missing"); ok {
+		t.Fatal("Get(missing) reported an unknown resource as existing")
+	}
+}
+
+// TestUpdateGroup verifies UpdateGroup completes the group CRUD: edits persist
+// write-through the cache, identity fields survive whatever fn does to them,
+// an unknown strategy rejects the whole edit, and a missing group errors.
+func TestUpdateGroup(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
+	m := newTestManager(t, repo)
+
+	created, _ := m.GetGroup(GlobalGroup)
+	if err := m.UpdateGroup(ctx, GlobalGroup, func(g *Group) {
+		g.Refs = map[string]string{"email": "inbox-1"}
+		g.ID, g.CreatedAt = "hijacked", created.CreatedAt.Add(-1) // not fn's to change
+	}); err != nil {
+		t.Fatalf("UpdateGroup: %v", err)
+	}
+	got, found := m.GetGroup(GlobalGroup)
+	if !found || got.Refs["email"] != "inbox-1" {
+		t.Fatalf("GetGroup after update = %v, %v; want the new ref", got, found)
+	}
+	if got.ID != GlobalGroup || !got.CreatedAt.Equal(created.CreatedAt) {
+		t.Fatalf("identity fields mutated: %+v", got)
+	}
+	stored, err := repo.ListGroups(ctx)
+	if err != nil || len(stored) != 1 || stored[0].Refs["email"] != "inbox-1" {
+		t.Fatalf("store after update = %v, %v; want the edit persisted", stored, err)
+	}
+
+	// An unknown strategy rejects the edit whole: nothing cached, nothing saved.
+	if err := m.UpdateGroup(ctx, GlobalGroup, func(g *Group) {
+		g.Strategy = "nonsense"
+		g.Refs = nil
+	}); err == nil {
+		t.Fatal("UpdateGroup accepted an unknown strategy")
+	}
+	if got, _ := m.GetGroup(GlobalGroup); got.Refs["email"] != "inbox-1" {
+		t.Fatalf("rejected edit still landed: %+v", got)
+	}
+
+	if err := m.UpdateGroup(ctx, "missing", func(g *Group) {}); !errors.Is(err, ErrGroupNotFound) {
+		t.Fatalf("UpdateGroup(missing) err = %v, want ErrGroupNotFound", err)
+	}
+}
+
+// TestUpdateGroupStrategyChange verifies a strategy change takes effect on the
+// next selection with a fresh instance, while an update that keeps the
+// strategy keeps its rotation state.
+func TestUpdateGroupStrategyChange(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo(
+		res{Resource: Resource{ID: "p1", MaxHolders: UnlimitedHolders}},
+		res{Resource: Resource{ID: "p2", MaxHolders: UnlimitedHolders}},
+	)
+	// The global group starts round robin so rotation state is observable.
+	if err := repo.SaveGroup(ctx, Group{ID: GlobalGroup, Strategy: StrategyRoundRobin}); err != nil {
+		t.Fatalf("seed global group: %v", err)
+	}
+	m := rebuildManager(t, repo)
+
+	first, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: GlobalGroup})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	first.Release()
+
+	// A refs-only update keeps the cursor: the next pick advances, not repeats.
+	if err := m.UpdateGroup(ctx, GlobalGroup, func(g *Group) {
+		g.Refs = map[string]string{"note": "kept"}
+	}); err != nil {
+		t.Fatalf("UpdateGroup refs: %v", err)
+	}
+	second, err := m.Acquire(ctx, Assignment{TaskID: "t2", GroupID: GlobalGroup})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if second.Resource().ID == first.Resource().ID {
+		t.Fatalf("refs-only update reset rotation: picked %s twice", first.Resource().ID)
+	}
+	second.Release()
+
+	// Switching to the deterministic "first" strategy installs it immediately.
+	if err := m.UpdateGroup(ctx, GlobalGroup, func(g *Group) { g.Strategy = "first" }); err != nil {
+		t.Fatalf("UpdateGroup strategy: %v", err)
+	}
+	for range 2 {
+		l, err := m.Acquire(ctx, Assignment{TaskID: "t3", GroupID: GlobalGroup})
+		if err != nil {
+			t.Fatalf("Acquire: %v", err)
+		}
+		if l.Resource().ID != "p1" {
+			t.Fatalf("after strategy change picked %s, want the deterministic first p1", l.Resource().ID)
+		}
+		l.Release()
+	}
+}

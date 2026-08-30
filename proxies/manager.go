@@ -34,7 +34,7 @@ type Option = leasing.Option[Proxy, *Proxy]
 
 // WithStrategy registers a custom selection strategy under name.
 func WithStrategy(name string, factory StrategyFactory) Option {
-	return leasing.WithStrategy[Proxy](name, factory)
+	return leasing.WithStrategy(name, factory)
 }
 
 // NewManager loads the groups and pool from the repository, persisting the

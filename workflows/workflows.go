@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/ntakezo/rogojin/comms"
+	"github.com/ntakezo/rogojin/leasing"
 )
 
 // A State names one node in a workflow's graph.
@@ -94,6 +95,19 @@ type PersistableWorkflow interface {
 	RestoreInstance(deps Deps, snapshot []byte) (Instance, error)
 }
 
+// ResourceReceiver is the opt-in wiring capability. RegisterWorkflow calls
+// UseResources exactly once, before the workflow is available for task
+// creation, with every manager registered on the task manager under its kind —
+// concretely typed behind any. The workflow asserts the kinds it leases
+// through back to their concrete types and rejects the registration on a
+// missing or mistyped one, so a wiring hole is a boot error, not a mid-run
+// one. Receiving managers here rather than at construction guarantees the
+// manager a workflow leases from is the same instance the task manager
+// unlocks through — two instances over one store silently strand locks.
+type ResourceReceiver interface {
+	UseResources(managers map[leasing.Kind]any) error
+}
+
 // Status is a task's lifecycle status and the durable outcome stamped when a
 // run exits. The zero value means not started.
 type Status string
@@ -121,10 +135,10 @@ type Deps struct {
 	TaskID string
 	Bus    comms.Bus
 	// Assignments is the task's resolved placement per resource kind, keyed by
-	// the kind the consumer names its managers with ("proxy", "account"). A
+	// the kind each resource package publishes (proxies.Kind, accounts.Kind). A
 	// kind the task has no placement for is absent, which reads as the zero
 	// Assignment — so a lookup needs no branching.
-	Assignments map[string]Assignment
+	Assignments map[leasing.Kind]Assignment
 }
 
 // An Assignment is a task's resolved placement for one resource kind: the

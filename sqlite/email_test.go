@@ -1,4 +1,4 @@
-package emailsqlite
+package sqlite
 
 import (
 	"context"
@@ -7,29 +7,26 @@ import (
 	"time"
 
 	"github.com/ntakezo/rogojin/email"
-	"github.com/ntakezo/rogojin/persistence/accountsqlite"
 )
 
-// satisfiesRepositoryPort fails to compile if SQLite drifts from the persistence port it exists to implement.
-var _ email.Repository = (*SQLite)(nil)
+// satisfiesRepositoryPort fails to compile if Emails drifts from the persistence port it exists to implement.
+var _ email.Repository = (*Emails)(nil)
 
-// newTestRepo opens a SQLite repository backed by a fresh temp-file database.
-func newTestRepo(t *testing.T) *SQLite {
+// newTestEmails opens the email store on a fresh temp-file database.
+func newTestEmails(t *testing.T) email.Repository {
 	t.Helper()
-	dsn := filepath.Join(t.TempDir(), "email.db")
-	repo, err := NewSQLite(dsn)
+	repo, err := NewEmails(openTestDB(t))
 	if err != nil {
-		t.Fatalf("NewSQLite: %v", err)
+		t.Fatalf("NewEmails: %v", err)
 	}
-	t.Cleanup(func() { repo.Close() })
 	return repo
 }
 
-// TestSaveListRoundTrip verifies every field — the address, the credentials,
+// TestEmailsSaveListRoundTrip verifies every field — the address, the credentials,
 // and the cursor — survives storage verbatim, because the next listener
 // session authenticates and resumes from exactly what it reads back.
-func TestSaveListRoundTrip(t *testing.T) {
-	repo := newTestRepo(t)
+func TestEmailsSaveListRoundTrip(t *testing.T) {
+	repo := newTestEmails(t)
 	ctx := context.Background()
 
 	withInbox := email.Email{
@@ -77,10 +74,10 @@ func TestSaveListRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCursorUpsertPreservesCreatedAt verifies the cursor advance a listener
+// TestEmailsCursorUpsertPreservesCreatedAt verifies the cursor advance a listener
 // makes on every batch cannot revise when the email was created.
-func TestCursorUpsertPreservesCreatedAt(t *testing.T) {
-	repo := newTestRepo(t)
+func TestEmailsCursorUpsertPreservesCreatedAt(t *testing.T) {
+	repo := newTestEmails(t)
 	ctx := context.Background()
 
 	created := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
@@ -114,10 +111,10 @@ func TestCursorUpsertPreservesCreatedAt(t *testing.T) {
 	}
 }
 
-// TestDeleteIsIdempotent verifies absent rows are a no-op, matching the
+// TestEmailsDeleteIsIdempotent verifies absent rows are a no-op, matching the
 // repository contract every store here shares.
-func TestDeleteIsIdempotent(t *testing.T) {
-	repo := newTestRepo(t)
+func TestEmailsDeleteIsIdempotent(t *testing.T) {
+	repo := newTestEmails(t)
 	ctx := context.Background()
 
 	if err := repo.Save(ctx, email.Email{ID: "e1", Address: "a@example.com"}); err != nil {
@@ -135,31 +132,30 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestSharesADatabaseFileWithOtherStores verifies the "email" migration
-// ledger coexists with another store's in one file, because consumers point
-// every adapter at a single database.
-func TestSharesADatabaseFileWithOtherStores(t *testing.T) {
+// TestEmailsSharesADatabaseWithOtherStores verifies the "email" migration
+// ledger coexists with another store's on one database, because consumers
+// build every store on a single Open.
+func TestEmailsSharesADatabaseWithOtherStores(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "shared.db")
-	other, err := accountsqlite.NewSQLite(dsn)
-	if err != nil {
+	db := openAt(t, dsn)
+	if _, err := NewAccounts(db); err != nil {
 		t.Fatalf("accounts store: %v", err)
 	}
-	defer other.Close()
-
-	repo, err := NewSQLite(dsn)
+	repo, err := NewEmails(db)
 	if err != nil {
-		t.Fatalf("email store in the same file: %v", err)
+		t.Fatalf("email store on the same database: %v", err)
 	}
-	defer repo.Close()
 
 	if err := repo.Save(context.Background(), email.Email{ID: "e1", Address: "a@example.com"}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	reopened, err := NewSQLite(dsn)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := NewEmails(openAt(t, dsn))
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer reopened.Close()
 	listed, err := reopened.List(context.Background())
 	if err != nil || len(listed) != 1 {
 		t.Fatalf("list after reopen = %v, %v; want the saved email", listed, err)

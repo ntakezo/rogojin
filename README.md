@@ -68,7 +68,7 @@ cd _examples && go run ./workflows/example
 
 ### Learn the API
 
-The [API reference](https://pkg.go.dev/github.com/ntakezo/rogojin) documents each package: `workflows` (the programming model), `tasks` (the runtime), `comms`, `proxies`, `accounts`, `cards`, and `persistence`. `proxies`, `accounts`, and `cards` are all thin layers over `leasing`, which owns the pooling, grouping, and locking they share — build a fourth resource kind on it the same way.
+The [API reference](https://pkg.go.dev/github.com/ntakezo/rogojin) documents each package: `workflows` (the programming model), `tasks` (the runtime), `comms`, `proxies`, `accounts`, `cards`, `email`, and `sqlite`. `proxies`, `accounts`, and `cards` are all thin layers over `leasing`, which owns the pooling, grouping, and locking they share — build a fourth resource kind on it the same way.
 
 ## Contributing
 

@@ -1,51 +1,32 @@
-// Package proxysqlite provides a file-backed, durable implementation of the
-// proxies.Repository port. A consumer that does not want to write its own
-// proxy store can inject SQLite.
-package proxysqlite
+package sqlite
 
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"time"
 
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/ntakezo/rogojin/persistence/sqlitemigrate"
 	"github.com/ntakezo/rogojin/proxies"
 )
 
-// SQLite is a durable proxies.Repository backed by a single SQLite database file.
-type SQLite struct {
+// Proxies is the proxies.Repository: one row per proxy, with the URL and the
+// success and failure counts the bayesian strategy learns from.
+type Proxies struct {
 	db *sql.DB
 }
 
-// NewSQLite opens (creating if absent) the database at dsn and ensures the schema exists.
-func NewSQLite(dsn string) (*SQLite, error) {
-	db, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	// SQLite serializes writes per file; one connection avoids "database is locked" under concurrent saves.
-	db.SetMaxOpenConns(1)
-
-	if err := ensureSchema(db); err != nil {
-		db.Close()
+// NewProxies builds the proxies store on db, bringing its tables up to the
+// current schema.
+func NewProxies(db *DB) (proxies.Repository, error) {
+	if err := migrate(db.db, "proxies", proxyMigrations); err != nil {
 		return nil, err
 	}
-	return &SQLite{db: db}, nil
+	return &Proxies{db: db.db}, nil
 }
 
-// ensureSchema brings the database up to the latest schema version, applying any
-// migrations it has not yet seen.
-func ensureSchema(db *sql.DB) error {
-	return sqlitemigrate.Run(db, "proxies", migrations)
-}
-
-// migrations is the ordered schema history of the proxies store. Append new steps
-// to the end; never edit or reorder shipped ones: the ledger records which of
-// them have already run on existing databases by position.
-var migrations = []sqlitemigrate.Migration{
+// proxyMigrations is the ordered schema history of the proxies store. Append
+// new steps to the end; never edit or reorder shipped ones: the ledger records
+// which of them have already run on existing databases by position.
+var proxyMigrations = []migration{
 	{
 		Name: "create proxies table",
 		SQL: `CREATE TABLE IF NOT EXISTS proxies (
@@ -88,14 +69,9 @@ var migrations = []sqlitemigrate.Migration{
 	},
 }
 
-// Close closes the underlying database.
-func (s *SQLite) Close() error {
-	return s.db.Close()
-}
-
 // List returns every stored proxy in stable id order, so the manager's pool
 // order is deterministic.
-func (s *SQLite) List(ctx context.Context) ([]proxies.Proxy, error) {
+func (s *Proxies) List(ctx context.Context) ([]proxies.Proxy, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, url, group_id, owner_id, max_holders, successes, failures, created_at, updated_at
 		 FROM proxies ORDER BY id`)
@@ -125,10 +101,10 @@ func (s *SQLite) List(ctx context.Context) ([]proxies.Proxy, error) {
 	return listed, nil
 }
 
-// Save upserts the proxy's record: url, group, holder policy, lock owner,
+// Save upserts the proxy's record: URL, group, holder policy, lock owner,
 // stats, and updated_at. created_at is written on insert and never
 // overwritten, so a lock or a stat update cannot revise it.
-func (s *SQLite) Save(ctx context.Context, p proxies.Proxy) error {
+func (s *Proxies) Save(ctx context.Context, p proxies.Proxy) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO proxies (id, url, group_id, owner_id, max_holders, successes, failures, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -145,7 +121,7 @@ func (s *SQLite) Save(ctx context.Context, p proxies.Proxy) error {
 }
 
 // Delete removes the proxy's record; absent rows are a no-op.
-func (s *SQLite) Delete(ctx context.Context, id string) error {
+func (s *Proxies) Delete(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM proxies WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete proxy %s: %w", id, err)
@@ -156,7 +132,7 @@ func (s *SQLite) Delete(ctx context.Context, id string) error {
 // ListGroups returns every stored proxy group in stable id order. The
 // max_holders column is legacy — holder policy lives on the proxy — and is
 // left unread.
-func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
+func (s *Proxies) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, strategy, refs, created_at, updated_at FROM proxy_groups ORDER BY id`)
 	if err != nil {
@@ -171,7 +147,7 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 		if err := rows.Scan(&g.ID, &g.Strategy, &refs, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list proxy groups: %w", err)
 		}
-		if g.Refs, err = parseRefs(refs); err != nil {
+		if g.Refs, err = parseMap[string](refs); err != nil {
 			return nil, fmt.Errorf("list proxy groups: decode refs of %s: %w", g.ID, err)
 		}
 		if g.CreatedAt, err = parseTime(created); err != nil {
@@ -191,10 +167,10 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 // SaveGroup upserts the group's record. created_at is written on insert and
 // never overwritten: when a group was created is not something a later save
 // gets to revise.
-func (s *SQLite) SaveGroup(ctx context.Context, g proxies.Group) error {
-	refs, err := formatRefs(g.Refs)
+func (s *Proxies) SaveGroup(ctx context.Context, g proxies.Group) error {
+	refs, err := formatMap(g.Refs)
 	if err != nil {
-		return fmt.Errorf("save proxy group %s: %w", g.ID, err)
+		return fmt.Errorf("save proxy group %s: encode refs: %w", g.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO proxy_groups (id, strategy, refs, created_at, updated_at)
@@ -208,54 +184,12 @@ func (s *SQLite) SaveGroup(ctx context.Context, g proxies.Group) error {
 	return nil
 }
 
-// formatRefs stores a group's refs as JSON text; no refs store as "" so
-// pre-refs rows keep round-tripping.
-func formatRefs(refs map[string]string) (string, error) {
-	if len(refs) == 0 {
-		return "", nil
-	}
-	encoded, err := json.Marshal(refs)
-	if err != nil {
-		return "", fmt.Errorf("encode refs: %w", err)
-	}
-	return string(encoded), nil
-}
-
-// parseRefs is the inverse of formatRefs.
-func parseRefs(refs string) (map[string]string, error) {
-	if refs == "" {
-		return nil, nil
-	}
-	decoded := make(map[string]string)
-	if err := json.Unmarshal([]byte(refs), &decoded); err != nil {
-		return nil, err
-	}
-	return decoded, nil
-}
-
 // DeleteGroup removes the group's record; absent rows are a no-op. Member
 // proxies are the manager's to delete — the store cascades nothing.
-func (s *SQLite) DeleteGroup(ctx context.Context, id string) error {
+func (s *Proxies) DeleteGroup(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM proxy_groups WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete proxy group %s: %w", id, err)
 	}
 	return nil
-}
-
-// formatTime stores timestamps as RFC3339Nano UTC text; the zero time stores
-// as "" so pre-timestamp rows keep round-tripping.
-func formatTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	return t.UTC().Format(time.RFC3339Nano)
-}
-
-// parseTime is the inverse of formatTime.
-func parseTime(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, nil
-	}
-	return time.Parse(time.RFC3339Nano, s)
 }

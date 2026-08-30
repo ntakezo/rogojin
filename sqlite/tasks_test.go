@@ -1,4 +1,4 @@
-package tasksqlite
+package sqlite
 
 import (
 	"context"
@@ -8,23 +8,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/tasks"
 )
 
-// newTestRepo opens a SQLite repository backed by a fresh temp-file database.
-func newTestRepo(t *testing.T) *SQLite {
+// newTestTasks opens the tasks store on a fresh temp-file database.
+func newTestTasks(t *testing.T) tasks.Repository {
 	t.Helper()
-	dsn := filepath.Join(t.TempDir(), "tasks.db")
-	repo, err := NewSQLite(dsn)
+	repo, err := NewTasks(openTestDB(t))
 	if err != nil {
-		t.Fatalf("NewSQLite: %v", err)
+		t.Fatalf("NewTasks: %v", err)
 	}
-	t.Cleanup(func() { repo.Close() })
 	return repo
 }
 
-// satisfiesRepositoryPort fails to compile if SQLite drifts from the persistence port it exists to implement.
-var _ tasks.Repository = (*SQLite)(nil)
+// satisfiesRepositoryPort fails to compile if Tasks drifts from the persistence port it exists to implement.
+var _ tasks.Repository = (*Tasks)(nil)
 
 // The resource kinds these tests store placements under. The store never
 // interprets a kind; it is only a key in the JSON column.
@@ -35,7 +34,7 @@ const (
 
 // seedTask inserts a task in the global group with fresh timestamps, the
 // placement most tests do not care about.
-func seedTask(t *testing.T, repo *SQLite, id, workflowID string) {
+func seedTask(t *testing.T, repo tasks.Repository, id, workflowID string) {
 	t.Helper()
 	now := time.Now().UTC()
 	rec := tasks.Task{ID: id, WorkflowID: workflowID, GroupID: tasks.GlobalGroup, CreatedAt: now, UpdatedAt: now}
@@ -44,10 +43,10 @@ func seedTask(t *testing.T, repo *SQLite, id, workflowID string) {
 	}
 }
 
-// TestCreateTaskRecoverable verifies a created task is recoverable by id with its workflow and no checkpoint yet,
+// TestTasksCreateTaskRecoverable verifies a created task is recoverable by id with its workflow and no checkpoint yet,
 // because recovery must be able to resolve the workflow before any state has run.
-func TestCreateTaskRecoverable(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksCreateTaskRecoverable(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	seedTask(t, repo, "t1", "wf1")
@@ -64,10 +63,10 @@ func TestCreateTaskRecoverable(t *testing.T) {
 	}
 }
 
-// TestSaveCheckpointPersistsState verifies a checkpoint's status, state, and snapshot survive recovery,
+// TestTasksSaveCheckpointPersistsState verifies a checkpoint's status, state, and snapshot survive recovery,
 // because recovery resumes the engine from exactly the bytes and state last checkpointed.
-func TestSaveCheckpointPersistsState(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksSaveCheckpointPersistsState(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	seedTask(t, repo, "t1", "wf1")
@@ -88,10 +87,10 @@ func TestSaveCheckpointPersistsState(t *testing.T) {
 	}
 }
 
-// TestSaveCheckpointOverwrites verifies a later checkpoint replaces an earlier one,
+// TestTasksSaveCheckpointOverwrites verifies a later checkpoint replaces an earlier one,
 // because the repository records only a task's last checkpoint, not a history.
-func TestSaveCheckpointOverwrites(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksSaveCheckpointOverwrites(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	seedTask(t, repo, "t1", "wf1")
@@ -108,10 +107,10 @@ func TestSaveCheckpointOverwrites(t *testing.T) {
 	}
 }
 
-// TestMarkTerminalKeepsStateAndSnapshot verifies a terminal outcome updates status but leaves state and snapshot intact,
+// TestTasksMarkTerminalKeepsStateAndSnapshot verifies a terminal outcome updates status but leaves state and snapshot intact,
 // because a terminal record must stay a valid resume entry for a consumer-driven re-run.
-func TestMarkTerminalKeepsStateAndSnapshot(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksMarkTerminalKeepsStateAndSnapshot(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	seedTask(t, repo, "t1", "wf1")
@@ -131,11 +130,11 @@ func TestMarkTerminalKeepsStateAndSnapshot(t *testing.T) {
 	}
 }
 
-// TestMarkTerminalPersistsOutput verifies the workflow's output is stored with the
+// TestTasksMarkTerminalPersistsOutput verifies the workflow's output is stored with the
 // terminal stamp and survives recovery, because delivering output from Start is
 // only half the contract — a finished task's result must also be durably readable.
-func TestMarkTerminalPersistsOutput(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksMarkTerminalPersistsOutput(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	seedTask(t, repo, "t1", "wf1")
@@ -153,21 +152,21 @@ func TestMarkTerminalPersistsOutput(t *testing.T) {
 	}
 }
 
-// TestRecoverTaskNotFound verifies recovering an unknown task is an errors.Is(ErrNotFound) failure,
+// TestTasksRecoverTaskNotFound verifies recovering an unknown task is an errors.Is(ErrTaskNotFound) failure,
 // because the service distinguishes a missing task from a store error.
-func TestRecoverTaskNotFound(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksRecoverTaskNotFound(t *testing.T) {
+	repo := newTestTasks(t)
 
 	_, err := repo.RecoverTask(context.Background(), "nope")
-	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("err = %v, want ErrNotFound", err)
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("err = %v, want ErrTaskNotFound", err)
 	}
 }
 
-// TestRecoverAll verifies every persisted task is returned, terminal ones included,
+// TestTasksRecoverAll verifies every persisted task is returned, terminal ones included,
 // because the caller decides which recovered tasks to restart.
-func TestRecoverAll(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksRecoverAll(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	seedTask(t, repo, "t1", "wf1")
@@ -192,9 +191,9 @@ func TestRecoverAll(t *testing.T) {
 	}
 }
 
-// TestRecoverAllEmpty verifies a store with no tasks returns an empty, non-nil slice and no error.
-func TestRecoverAllEmpty(t *testing.T) {
-	repo := newTestRepo(t)
+// TestTasksRecoverAllEmpty verifies a store with no tasks returns an empty, non-nil slice and no error.
+func TestTasksRecoverAllEmpty(t *testing.T) {
+	repo := newTestTasks(t)
 
 	recs, err := repo.RecoverAll(context.Background())
 	if err != nil {
@@ -205,10 +204,10 @@ func TestRecoverAllEmpty(t *testing.T) {
 	}
 }
 
-// TestDeleteTask verifies a deleted task is no longer recoverable,
+// TestTasksDeleteTask verifies a deleted task is no longer recoverable,
 // because DeleteTask removes the record the service has dropped from its registry.
-func TestDeleteTask(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksDeleteTask(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	seedTask(t, repo, "t1", "wf1")
@@ -216,32 +215,34 @@ func TestDeleteTask(t *testing.T) {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 
-	if _, err := repo.RecoverTask(ctx, "t1"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("err = %v, want ErrNotFound after delete", err)
+	if _, err := repo.RecoverTask(ctx, "t1"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("err = %v, want ErrTaskNotFound after delete", err)
 	}
 }
 
-// TestPersistsAcrossReopen verifies records survive closing and reopening the same database file,
+// TestTasksPersistsAcrossReopen verifies records survive closing and reopening the same database file,
 // because durability is the whole point of a file-backed repository.
-func TestPersistsAcrossReopen(t *testing.T) {
+func TestTasksPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dsn := filepath.Join(t.TempDir(), "tasks.db")
 
-	repo, err := NewSQLite(dsn)
+	repoDB := openAt(t, dsn)
+	repo, err := NewTasks(repoDB)
 	if err != nil {
-		t.Fatalf("NewSQLite: %v", err)
+		t.Fatalf("NewTasks: %v", err)
 	}
 	seedTask(t, repo, "t1", "wf1")
 	if err := repo.SaveCheckpoint(ctx, "t1", "suspended", "wait", []byte("snap")); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
-	repo.Close()
+	repoDB.Close()
 
-	reopened, err := NewSQLite(dsn)
+	reopenedDB := openAt(t, dsn)
+	reopened, err := NewTasks(reopenedDB)
 	if err != nil {
-		t.Fatalf("reopen NewSQLite: %v", err)
+		t.Fatalf("reopen NewTasks: %v", err)
 	}
-	t.Cleanup(func() { reopened.Close() })
+	t.Cleanup(func() { reopenedDB.Close() })
 
 	rec, err := reopened.RecoverTask(ctx, "t1")
 	if err != nil {
@@ -252,11 +253,11 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// TestMigratesLegacyDatabaseAddingOutput verifies opening a pre-output database
+// TestTasksMigratesLegacyDatabaseAddingOutput verifies opening a pre-output database
 // (the original tasks schema, with no output column and no recorded version)
 // migrates it in place: the output column is added and existing task rows survive
 // untouched, because a version upgrade must never drop a consumer's durable tasks.
-func TestMigratesLegacyDatabaseAddingOutput(t *testing.T) {
+func TestTasksMigratesLegacyDatabaseAddingOutput(t *testing.T) {
 	ctx := context.Background()
 	dsn := filepath.Join(t.TempDir(), "legacy.db")
 
@@ -281,12 +282,13 @@ func TestMigratesLegacyDatabaseAddingOutput(t *testing.T) {
 	}
 	raw.Close()
 
-	// Opening through NewSQLite must migrate the existing file in place.
-	repo, err := NewSQLite(dsn)
+	// Opening through NewTasks must migrate the existing file in place.
+	repoDB := openAt(t, dsn)
+	repo, err := NewTasks(repoDB)
 	if err != nil {
-		t.Fatalf("NewSQLite on legacy db: %v", err)
+		t.Fatalf("NewTasks on legacy db: %v", err)
 	}
-	t.Cleanup(func() { repo.Close() })
+	t.Cleanup(func() { repoDB.Close() })
 
 	// The legacy row survives the migration, now reporting a nil output.
 	rec, err := repo.RecoverTask(ctx, "t1")
@@ -311,13 +313,13 @@ func TestMigratesLegacyDatabaseAddingOutput(t *testing.T) {
 	}
 }
 
-// TestAssignmentTriStateRoundTrips verifies the three distinct assignments a
+// TestTasksAssignmentTriStateRoundTrips verifies the three distinct assignments a
 // task can carry survive storage as JSON: nil (inherit the task group's), ""
 // (lease none of the kind), and a named group. JSON has one null but two empty
 // strings' worth of meaning here — collapsing nil and "" would silently turn an
 // inheriting task into an opted-out one.
-func TestAssignmentTriStateRoundTrips(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksAssignmentTriStateRoundTrips(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	none, named := "", "residential"
@@ -330,7 +332,7 @@ func TestAssignmentTriStateRoundTrips(t *testing.T) {
 		{"named", &named},
 	} {
 		rec := tasks.Task{ID: tc.id, WorkflowID: "wf1", GroupID: "g1",
-			Assignments: map[string]tasks.Assignment{proxyKind: {GroupID: tc.assigned}}}
+			Assignments: map[leasing.Kind]tasks.Assignment{proxyKind: {GroupID: tc.assigned}}}
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask %s: %v", tc.id, err)
 		}
@@ -353,15 +355,15 @@ func TestAssignmentTriStateRoundTrips(t *testing.T) {
 	}
 }
 
-// TestAssignmentsAreIndependentPerKind verifies one record carries a distinct
+// TestTasksAssignmentsAreIndependentPerKind verifies one record carries a distinct
 // placement for each kind, each with its own tri-state. Nothing about storing
 // them in one column may let one kind read as another.
-func TestAssignmentsAreIndependentPerKind(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksAssignmentsAreIndependentPerKind(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	proxyGroup, none, accountPin := "residential", "", "buyer-1"
-	rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[string]tasks.Assignment{
+	rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[leasing.Kind]tasks.Assignment{
 		proxyKind:   {GroupID: &proxyGroup, ResourceID: &none},
 		accountKind: {ResourceID: &accountPin},
 	}}
@@ -388,11 +390,11 @@ func TestAssignmentsAreIndependentPerKind(t *testing.T) {
 	}
 }
 
-// TestTimestampsRoundTripAndRefresh verifies CreatedAt survives storage
+// TestTasksTimestampsRoundTripAndRefresh verifies CreatedAt survives storage
 // unchanged while writes move UpdatedAt forward, so a consumer can tell when a
 // task last progressed.
-func TestTimestampsRoundTripAndRefresh(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksTimestampsRoundTripAndRefresh(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
@@ -421,11 +423,11 @@ func TestTimestampsRoundTripAndRefresh(t *testing.T) {
 	}
 }
 
-// TestGroupCRUD verifies a task group round-trips with its per-kind resource
+// TestTasksGroupCRUD verifies a task group round-trips with its per-kind resource
 // assignments, that a missing group reports found=false rather than an error,
 // and that deletion removes it.
-func TestGroupCRUD(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksGroupCRUD(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	if _, found, err := repo.GetGroup(ctx, "ghost"); err != nil || found {
@@ -433,7 +435,7 @@ func TestGroupCRUD(t *testing.T) {
 	}
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	g := tasks.Group{ID: "g1", CreatedAt: now, UpdatedAt: now, ResourceGroups: map[string]string{
+	g := tasks.Group{ID: "g1", CreatedAt: now, UpdatedAt: now, ResourceGroups: map[leasing.Kind]string{
 		proxyKind:   "residential",
 		accountKind: "shoppers",
 	}}
@@ -465,10 +467,10 @@ func TestGroupCRUD(t *testing.T) {
 	}
 }
 
-// TestTasksInGroup verifies membership lookup returns exactly the group's
+// TestTasksTasksInGroup verifies membership lookup returns exactly the group's
 // tasks, because the service drives its cascade delete off this list.
-func TestTasksInGroup(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksTasksInGroup(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	for _, tc := range []struct{ id, group string }{
@@ -491,10 +493,10 @@ func TestTasksInGroup(t *testing.T) {
 	}
 }
 
-// TestLegacyRowsLandInGlobalGroup verifies the group migration places
+// TestTasksLegacyRowsLandInGlobalGroup verifies the group migration places
 // pre-group tasks in the global namespace rather than an empty one, so an
 // upgraded database's tasks stay addressable as a group.
-func TestLegacyRowsLandInGlobalGroup(t *testing.T) {
+func TestTasksLegacyRowsLandInGlobalGroup(t *testing.T) {
 	ctx := context.Background()
 	dsn := filepath.Join(t.TempDir(), "legacy.db")
 
@@ -516,11 +518,12 @@ func TestLegacyRowsLandInGlobalGroup(t *testing.T) {
 	}
 	raw.Close()
 
-	repo, err := NewSQLite(dsn)
+	repoDB := openAt(t, dsn)
+	repo, err := NewTasks(repoDB)
 	if err != nil {
-		t.Fatalf("NewSQLite on legacy db: %v", err)
+		t.Fatalf("NewTasks on legacy db: %v", err)
 	}
-	t.Cleanup(func() { repo.Close() })
+	t.Cleanup(func() { repoDB.Close() })
 
 	rec, err := repo.RecoverTask(ctx, "t1")
 	if err != nil {
@@ -541,27 +544,27 @@ func TestLegacyRowsLandInGlobalGroup(t *testing.T) {
 	}
 }
 
-// TestWritesToMissingTaskFailLoud verifies a checkpoint or terminal stamp for
-// an id with no record fails with ErrNotFound instead of silently updating
+// TestTasksWritesToMissingTaskFailLoud verifies a checkpoint or terminal stamp for
+// an id with no record fails with ErrTaskNotFound instead of silently updating
 // zero rows — the engine would otherwise believe progress is durable when
 // nothing was written.
-func TestWritesToMissingTaskFailLoud(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksWritesToMissingTaskFailLoud(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
-	if err := repo.SaveCheckpoint(ctx, "ghost", "running", "s1", nil); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("SaveCheckpoint on missing task: err = %v, want ErrNotFound", err)
+	if err := repo.SaveCheckpoint(ctx, "ghost", "running", "s1", nil); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("SaveCheckpoint on missing task: err = %v, want ErrTaskNotFound", err)
 	}
-	if err := repo.MarkTerminal(ctx, "ghost", "done", nil); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("MarkTerminal on missing task: err = %v, want ErrNotFound", err)
+	if err := repo.MarkTerminal(ctx, "ghost", "done", nil); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("MarkTerminal on missing task: err = %v, want ErrTaskNotFound", err)
 	}
 }
 
-// TestPinRoundTrips verifies a task's pin survives storage on the same
+// TestTasksPinRoundTrips verifies a task's pin survives storage on the same
 // three-way distinction as its group: nil (unpinned, rotate), "" (explicitly
 // none), and a named resource.
-func TestPinRoundTrips(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksPinRoundTrips(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	group, none, named := "residential", "", "p7"
@@ -574,7 +577,7 @@ func TestPinRoundTrips(t *testing.T) {
 		{"pinned", &named},
 	} {
 		rec := tasks.Task{ID: tc.id, WorkflowID: "wf1", GroupID: "g1",
-			Assignments: map[string]tasks.Assignment{proxyKind: {GroupID: &group, ResourceID: tc.pinned}}}
+			Assignments: map[leasing.Kind]tasks.Assignment{proxyKind: {GroupID: &group, ResourceID: tc.pinned}}}
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask %s: %v", tc.id, err)
 		}
@@ -594,17 +597,17 @@ func TestPinRoundTrips(t *testing.T) {
 	}
 }
 
-// TestSaveAssignmentRepointsOneKind verifies a reassignment rewrites both
+// TestTasksSaveAssignmentRepointsOneKind verifies a reassignment rewrites both
 // halves of one kind's placement, leaves every other kind and the checkpoint
 // alone, and reports a task that does not exist rather than silently updating
 // no rows. Editing one kind in place is what makes a stored map safe to
 // repoint without reading it back first.
-func TestSaveAssignmentRepointsOneKind(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksSaveAssignmentRepointsOneKind(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	group, pin, accountPin := "residential", "p1", "buyer-1"
-	rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[string]tasks.Assignment{
+	rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[leasing.Kind]tasks.Assignment{
 		proxyKind:   {GroupID: &group, ResourceID: &pin},
 		accountKind: {ResourceID: &accountPin},
 	}}
@@ -661,11 +664,11 @@ func TestSaveAssignmentRepointsOneKind(t *testing.T) {
 	}
 }
 
-// TestSaveAssignmentOnUnplacedTask verifies the first assignment on a task
+// TestTasksSaveAssignmentOnUnplacedTask verifies the first assignment on a task
 // stored with no placement lands, rather than failing on the empty column the
 // task was created with.
-func TestSaveAssignmentOnUnplacedTask(t *testing.T) {
-	repo := newTestRepo(t)
+func TestTasksSaveAssignmentOnUnplacedTask(t *testing.T) {
+	repo := newTestTasks(t)
 	ctx := context.Background()
 
 	seedTask(t, repo, "t1", "wf1")

@@ -1,22 +1,4 @@
-// Package sqlitemigrate applies ordered schema migrations to a SQLite database
-// and records what it applied in a schema_migrations ledger.
-//
-// Migrations are recorded per store — the name a caller gives its own ordered
-// list — so several stores can share one database file, each advancing its own
-// history without seeing the others'. That is the reason for the ledger: SQLite
-// has a built-in counter for exactly this job, PRAGMA user_version, but it is
-// one integer in the file header and so can only ever describe one migration
-// list per file. Pointing a second store at the same file under that scheme
-// made it read the first store's count as its own and skip its own tables.
-//
-// Databases written before the ledger are adopted on their next open, taking
-// the old counter as that store's own progress. That attribution is the one
-// thing adoption cannot check: a pre-ledger file was only ever reachable by the
-// single store that wrote it, so the store opening it is that store. Pointing a
-// different one at an un-adopted legacy file breaks the assumption — it is
-// refused outright when the counter exceeds that store's history, and otherwise
-// fails when the migrations it then runs meet tables it did not create.
-package sqlitemigrate
+package sqlite
 
 import (
 	"database/sql"
@@ -25,10 +7,10 @@ import (
 	"time"
 )
 
-// A Migration is one step of a store's schema history: the SQL to run and a
+// A migration is one step of a store's schema history: the SQL to run and a
 // name recorded alongside it, so the ledger reads as a history rather than a
 // column of integers.
-type Migration struct {
+type migration struct {
 	Name string
 	SQL  string
 }
@@ -36,6 +18,11 @@ type Migration struct {
 // ledger is the table every store records its applied migrations in. It is
 // shared across stores and keyed by store name, which is what lets one file
 // hold several independent histories.
+//
+// SQLite has a built-in counter for this job, PRAGMA user_version, but it is
+// one integer in the file header and so can only ever describe one migration
+// list per file. Pointing a second store at the same file under that scheme
+// made it read the first store's count as its own and skip its own tables.
 const ledger = `CREATE TABLE IF NOT EXISTS schema_migrations (
 	store      TEXT NOT NULL,
 	version    INTEGER NOT NULL,
@@ -44,20 +31,24 @@ const ledger = `CREATE TABLE IF NOT EXISTS schema_migrations (
 	PRIMARY KEY (store, version)
 )`
 
-// Run applies every migration of store not yet recorded in the ledger, in
-// order, each in its own transaction. It is safe to call on every open: already
-// applied steps are skipped, so a database on the current schema is untouched.
+// migrate applies every migration of store not yet recorded in the ledger,
+// in order, each in its own transaction. It is safe to call on every open:
+// already applied steps are skipped, so a database on the current schema is
+// untouched.
 //
-// store names the caller's migration list ("tasks", "proxies"). It is recorded
-// with every row and is the only thing separating one store's history from
-// another's in a shared file, so it must be stable across releases — renaming
-// it presents an already-migrated store as a fresh one.
-func Run(db *sql.DB, store string, migrations []Migration) error {
+// store names the caller's migration list ("tasks", "proxies"). It is
+// recorded with every row and is the only thing separating one store's
+// history from another's in a shared file, so it must be stable across
+// releases — renaming it presents an already-migrated store as a fresh one.
+//
+// Databases written before the ledger are adopted on their next open, taking
+// the old counter as that store's own progress — see adopt.
+func migrate(db *sql.DB, store string, migrations []migration) error {
 	if store == "" {
-		return errors.New("sqlitemigrate: store name is required")
+		return errors.New("sqlite: store name is required")
 	}
 	if _, err := db.Exec(ledger); err != nil {
-		return fmt.Errorf("sqlitemigrate: create ledger: %w", err)
+		return fmt.Errorf("sqlite: create ledger: %w", err)
 	}
 	if err := adopt(db, store, migrations); err != nil {
 		return err
@@ -68,12 +59,12 @@ func Run(db *sql.DB, store string, migrations []Migration) error {
 		return err
 	}
 	if current > len(migrations) {
-		return fmt.Errorf("sqlitemigrate: store %q is at version %d, newer than the %d known migrations", store, current, len(migrations))
+		return fmt.Errorf("sqlite: store %q is at version %d, newer than the %d known migrations", store, current, len(migrations))
 	}
 	for i := current; i < len(migrations); i++ {
 		version := i + 1
 		if err := apply(db, store, migrations[i], version); err != nil {
-			return fmt.Errorf("sqlitemigrate: %s migration %d (%s): %w", store, version, migrations[i].Name, err)
+			return fmt.Errorf("sqlite: %s migration %d (%s): %w", store, version, migrations[i].Name, err)
 		}
 	}
 	return nil
@@ -93,12 +84,16 @@ func Run(db *sql.DB, store string, migrations []Migration) error {
 // A counter larger than the adopting store's whole history did not come from
 // this store, so adoption refuses it and writes nothing: the file is left as it
 // was found, for the store that owns it to adopt properly. A counter that fits
-// is taken at face value, which is the one thing adoption cannot verify — see
-// the package doc.
-func adopt(db *sql.DB, store string, migrations []Migration) error {
+// is taken at face value, which is the one thing adoption cannot verify: a
+// pre-ledger file was only ever reachable by the single store that wrote it,
+// so the store opening it is that store. Pointing a different one at an
+// un-adopted legacy file breaks the assumption — it is refused outright when
+// the counter exceeds that store's history, and otherwise fails when the
+// migrations it then runs meet tables it did not create.
+func adopt(db *sql.DB, store string, migrations []migration) error {
 	var rows int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&rows); err != nil {
-		return fmt.Errorf("sqlitemigrate: read ledger: %w", err)
+		return fmt.Errorf("sqlite: read ledger: %w", err)
 	}
 	if rows > 0 {
 		return nil
@@ -108,12 +103,12 @@ func adopt(db *sql.DB, store string, migrations []Migration) error {
 		return err
 	}
 	if legacy > len(migrations) {
-		return fmt.Errorf("sqlitemigrate: cannot adopt %q: the database counts %d applied migrations but %s knows only %d, so the counter belongs to another store", store, legacy, store, len(migrations))
+		return fmt.Errorf("sqlite: cannot adopt %q: the database counts %d applied migrations but %s knows only %d, so the counter belongs to another store", store, legacy, store, len(migrations))
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
-		return fmt.Errorf("sqlitemigrate: adopt %s: %w", store, err)
+		return fmt.Errorf("sqlite: adopt %s: %w", store, err)
 	}
 	defer tx.Rollback()
 
@@ -121,14 +116,14 @@ func adopt(db *sql.DB, store string, migrations []Migration) error {
 		if _, err := tx.Exec(
 			`INSERT INTO schema_migrations (store, version, name, applied_at) VALUES (?, ?, ?, ?)`,
 			store, version, migrations[version-1].Name, now()); err != nil {
-			return fmt.Errorf("sqlitemigrate: adopt %s: %w", store, err)
+			return fmt.Errorf("sqlite: adopt %s: %w", store, err)
 		}
 	}
 	if _, err := tx.Exec(`PRAGMA user_version = 0`); err != nil {
-		return fmt.Errorf("sqlitemigrate: adopt %s: %w", store, err)
+		return fmt.Errorf("sqlite: adopt %s: %w", store, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlitemigrate: adopt %s: %w", store, err)
+		return fmt.Errorf("sqlite: adopt %s: %w", store, err)
 	}
 	return nil
 }
@@ -141,7 +136,7 @@ func adopt(db *sql.DB, store string, migrations []Migration) error {
 func applied(db *sql.DB, store string) (int, error) {
 	rows, err := db.Query(`SELECT version FROM schema_migrations WHERE store = ? ORDER BY version`, store)
 	if err != nil {
-		return 0, fmt.Errorf("sqlitemigrate: read %s history: %w", store, err)
+		return 0, fmt.Errorf("sqlite: read %s history: %w", store, err)
 	}
 	defer rows.Close()
 
@@ -149,15 +144,15 @@ func applied(db *sql.DB, store string) (int, error) {
 	for rows.Next() {
 		var version int
 		if err := rows.Scan(&version); err != nil {
-			return 0, fmt.Errorf("sqlitemigrate: read %s history: %w", store, err)
+			return 0, fmt.Errorf("sqlite: read %s history: %w", store, err)
 		}
 		count++
 		if version != count {
-			return 0, fmt.Errorf("sqlitemigrate: store %q records migration %d with %d missing; the history has a gap", store, version, count)
+			return 0, fmt.Errorf("sqlite: store %q records migration %d with %d missing; the history has a gap", store, version, count)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("sqlitemigrate: read %s history: %w", store, err)
+		return 0, fmt.Errorf("sqlite: read %s history: %w", store, err)
 	}
 	return count, nil
 }
@@ -167,14 +162,14 @@ func applied(db *sql.DB, store string) (int, error) {
 func userVersion(db *sql.DB) (int, error) {
 	var v int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
-		return 0, fmt.Errorf("sqlitemigrate: read user_version: %w", err)
+		return 0, fmt.Errorf("sqlite: read user_version: %w", err)
 	}
 	return v, nil
 }
 
 // apply runs one migration and records it in the same transaction, so a step
 // that fails leaves neither its effects nor its ledger row behind.
-func apply(db *sql.DB, store string, m Migration, version int) error {
+func apply(db *sql.DB, store string, m migration, version int) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err

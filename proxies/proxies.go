@@ -15,6 +15,12 @@ import (
 	"github.com/ntakezo/rogojin/leasing"
 )
 
+// Kind is the resource kind proxies register with the task manager under —
+// the key a task's proxy placement is filed on. It is the one name the
+// manager, the task service, and a workflow reading its Deps must agree on,
+// so it lives here and nowhere else.
+const Kind leasing.Kind = "proxy"
+
 // GlobalGroup is the namespace proxies land in when added without a group.
 const GlobalGroup = leasing.GlobalGroup
 

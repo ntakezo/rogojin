@@ -184,6 +184,50 @@ func (m *Manager[R, P]) CreateGroup(ctx context.Context, g Group) error {
 	return nil
 }
 
+// UpdateGroup edits one group through fn and persists the result — Update's
+// counterpart for groups, completing their create, read, update, delete
+// surface. ID, CreatedAt, and UpdatedAt are not fn's to change: whatever it
+// does to them is undone before the save. A strategy change is validated
+// against the registered factories and installs a fresh strategy instance, so
+// rotation state (a cursor, a sampler's history) starts over; an unchanged
+// strategy keeps its state. The global group is updatable — its refs and
+// strategy are as legitimate as any other group's. fn runs under the
+// manager's lock, so it must not block.
+func (m *Manager[R, P]) UpdateGroup(ctx context.Context, id string, fn func(*Group)) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	g, ok := m.groups[id]
+	if !ok {
+		return fmt.Errorf("update group %s: %w", id, ErrGroupNotFound)
+	}
+	kept := g
+	fn(&g)
+	g.ID, g.CreatedAt = kept.ID, kept.CreatedAt
+	factory, err := m.validateGroup(g)
+	if err != nil {
+		return err
+	}
+	g.UpdatedAt = time.Now().UTC()
+	if err := m.repo.SaveGroup(ctx, g); err != nil {
+		return fmt.Errorf("persist group %s: %w", id, err)
+	}
+	m.groups[id] = g
+	if strategyName(g) != strategyName(kept) {
+		m.strategies[id] = factory()
+	}
+	return nil
+}
+
+// strategyName is the strategy a group actually runs: its own, or round robin
+// when it names none.
+func strategyName(g Group) string {
+	if g.Strategy == "" {
+		return StrategyRoundRobin
+	}
+	return g.Strategy
+}
+
 // DeleteGroup cascade-deletes a group and every resource in it, reporting the
 // tasks whose durable locks the cascade released so the caller can decide their
 // fate. It refuses with ErrGroupInUse while any live lease is held on a member
@@ -469,6 +513,54 @@ func (m *Manager[R, P]) CheckAssignment(a Assignment) error {
 		return fmt.Errorf("group %s: %w", a.GroupID, ErrGroupNotFound)
 	}
 	return m.checkPin(a)
+}
+
+// GetGroup reports one group by id and whether the manager knows it, named
+// for the same read on the persistence ports.
+func (m *Manager[R, P]) GetGroup(id string) (Group, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.groups[id]
+	return g, ok
+}
+
+// ListGroups returns every group, sorted by ID so listings read stably. It is
+// the Repository read of the same name, served from the manager's own state.
+func (m *Manager[R, P]) ListGroups() []Group {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Group, 0, len(m.groups))
+	for _, g := range m.groups {
+		out = append(out, g)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Get reports one resource by id and whether the manager knows it. The
+// record is a copy: its embedded Resource shows the durable lock (OwnerID) as
+// of the read, and mutating it changes nothing — Add, Update, and Delete are
+// the write surface.
+func (m *Manager[R, P]) Get(id string) (R, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.pool[id]
+	return p, ok
+}
+
+// List returns a copy of the pool in the stable order resources were adopted
+// or added — the Repository read of the same name, served from the manager's
+// own state. Records show durable locks; live leases are Held's to report.
+func (m *Manager[R, P]) List() []R {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]R, 0, len(m.order))
+	for _, id := range m.order {
+		if p, ok := m.pool[id]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Held reports the assignment of every live lease — in acquire or lock mode —

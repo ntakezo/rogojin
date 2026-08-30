@@ -14,14 +14,11 @@ import (
 {{- if .Proxy}}{{if not .ProxyPersist}}
 	"github.com/ntakezo/rogojin/leasing"
 {{- end}}{{end}}
-{{- if and .Proxy .ProxyPersist}}
-	"github.com/ntakezo/rogojin/persistence/proxysqlite"
-{{- end}}
-{{- if .TaskPersist}}
-	"github.com/ntakezo/rogojin/persistence/tasksqlite"
-{{- end}}
 {{- if .Proxy}}
 	"github.com/ntakezo/rogojin/proxies"
+{{- end}}
+{{- if or .TaskPersist .ProxyPersist}}
+	"github.com/ntakezo/rogojin/sqlite"
 {{- end}}
 	"github.com/ntakezo/rogojin/tasks"
 	"{{.ModulePath}}/{{.Package}}"
@@ -31,24 +28,31 @@ import (
 func main() {
 	ctx := context.Background()
 
-{{- if .Proxy}}
+{{- if or .TaskPersist .ProxyPersist}}
 
-{{- if .ProxyPersist}}
-
-{{- if .TaskPersist}}
-	// Every store records its migrations under its own name, so the proxy pool
-	// and the task history share one database file. Point them at separate
-	// files if you would rather keep them apart.
+{{- if and .TaskPersist .ProxyPersist}}
+	// One database holds both the proxy pool and the task history: every store
+	// records its migrations under its own name in a shared ledger. Open a
+	// second file if you would rather keep them apart.
 {{- end}}
-	proxyRepo, err := proxysqlite.NewSQLite("{{.Package}}.db")
+	db, err := sqlite.Open("{{.Package}}.db")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer proxyRepo.Close()
+	defer db.Close()
+{{- end}}
+
+{{- if .Proxy}}
+
+{{- if .ProxyPersist}}
+	proxyRepo, err := sqlite.NewProxies(db)
+	if err != nil {
+		log.Fatal(err)
+	}
 {{- else}}
 
 	// An in-memory proxy pool to get started. Seed it with real proxies, or
-	// swap in proxysqlite for a durable pool.
+	// swap in sqlite.NewProxies for a durable pool.
 	proxyRepo := newMemProxyRepo(
 		proxies.Proxy{Resource: leasing.Resource{ID: "proxy-1"}, URL: "http://127.0.0.1:8080"},
 	)
@@ -62,36 +66,43 @@ func main() {
 
 {{- if .TaskPersist}}
 
-	repo, err := tasksqlite.NewSQLite("{{.Package}}.db")
+	repo, err := sqlite.NewTasks(db)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer repo.Close()
 {{- else}}
 
 	// A nil task repository runs tasks purely in memory: no checkpoints, no
-	// recovery. Swap in tasksqlite (or your own Repository) for durability.
+	// recovery. Swap in sqlite.NewTasks (or your own Repository) for durability.
 {{- end}}
 {{- if .Proxy}}
 	// Proxy locks outlive the process, so the manager registers under its kind:
 	// deleting a task frees its lock, and repointing one drops the lock its new
 	// placement no longer fits. Nothing else ever clears them. Add a second kind
-	// the same way.
-	svc := tasks.NewManager({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
-		tasks.WithResource("proxy", manager))
+	// the same way. This is the manager's one entry point: RegisterWorkflow
+	// hands it to the workflow through UseResources, so the instance a task
+	// leases through is the instance a deletion unlocks through.
+	svc, err := tasks.NewManager(ctx, {{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
+		tasks.WithResource(proxies.Kind, manager))
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New(manager)); err != nil {
+	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New()); err != nil {
 		log.Fatal(err)
 	}
 {{- else}}
-	svc := tasks.NewManager({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus())
+	svc, err := tasks.NewManager(ctx, {{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus())
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New()); err != nil {
 		log.Fatal(err)
 	}
 {{- end}}
 
-	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://example.com"}{{if .Proxy}}, tasks.WithResourceGroup("proxy", proxies.GlobalGroup){{end}})
+	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://example.com"}{{if .Proxy}}, tasks.WithResourceGroup(proxies.Kind, proxies.GlobalGroup){{end}})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -100,12 +111,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("task %s finished with status %q, output %s", task.ID(), task.Status(), output)
+	log.Printf("task %s finished with status %q, output %s", task.ID, task.Status, output)
 {{- else}}
 	if _, err := task.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("task %s finished with status %q", task.ID(), task.Status())
+	log.Printf("task %s finished with status %q", task.ID, task.Status)
 {{- end}}
 }
 {{if and .Proxy (not .ProxyPersist)}}

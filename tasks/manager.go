@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -31,7 +32,7 @@ type Option func(*manager)
 // WithResource registers one resource kind's leasing manager, which is the
 // whole of that wiring:
 //
-//	tasks.WithResource("proxy", manager)
+//	tasks.WithResource(proxies.Kind, manager)
 //
 // Deleting a task then unlocks the kind, and repointing one drops only the
 // lock its new placement no longer fits. Register every kind whose locks
@@ -42,7 +43,7 @@ type Option func(*manager)
 //
 // It panics on a nil manager and on a kind registered twice, which could only
 // unlock it twice.
-func WithResource(kind string, rm ResourceManager) Option {
+func WithResource(kind leasing.Kind, rm ResourceManager) Option {
 	return func(m *manager) {
 		if rm == nil {
 			panic(fmt.Sprintf("tasks: resource kind %q registered with a nil manager", kind))
@@ -59,7 +60,7 @@ func WithResource(kind string, rm ResourceManager) Option {
 // a resource is one registered kind's manager, kept in registration order so a
 // failure names its kinds the same way every run.
 type resource struct {
-	kind    string
+	kind    leasing.Kind
 	manager ResourceManager
 }
 
@@ -68,18 +69,18 @@ type resource struct {
 type Manager interface {
 	// RegisterWorkflow makes workflow available under id for task creation.
 	RegisterWorkflow(id string, workflow workflows.Workflow) error
-	// CreateTask validates input and returns a new unstarted Handle of the
+	// CreateTask validates input and returns a new unstarted Task of the
 	// workflow, placed by opts (the global group, inheriting its resource
 	// assignments, when none are given).
-	CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (Handle, error)
+	CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (*Task, error)
 	// RecoverTask rehydrates a persisted task and returns it unstarted, or the
 	// live task if it is already running. A task that never checkpointed is
 	// returned but cannot be started; its Start fails with ErrNoCheckpoint.
-	RecoverTask(ctx context.Context, id string) (Handle, error)
+	RecoverTask(ctx context.Context, id string) (*Task, error)
 	// RecoverAll rehydrates every persisted task and returns them unstarted,
 	// terminal ones included. The caller decides what to Start; terminal tasks
 	// recover for inspection only, and their Start fails with ErrAlreadyTerminal.
-	RecoverAll(ctx context.Context) ([]Handle, error)
+	RecoverAll(ctx context.Context) ([]*Task, error)
 	// DeleteTask removes a task from the registry and the repository, releasing
 	// its external resources first. It refuses a running task.
 	DeleteTask(ctx context.Context, id string) error
@@ -89,14 +90,35 @@ type Manager interface {
 	// not a lease — is what resolves the two disagreeing. It takes effect the
 	// next time the task is recovered: a live run keeps the placement it was
 	// wired with, and the lease it already holds. Other kinds are untouched.
-	AssignResource(ctx context.Context, id string, kind string, assignment Assignment) error
+	AssignResource(ctx context.Context, id string, kind leasing.Kind, assignment Assignment) error
 	// CreateGroup persists a new task group. The global group needs no record
 	// and cannot be re-created.
 	CreateGroup(ctx context.Context, group Group) error
+	// UpdateGroup edits one task group through fn and persists the result —
+	// the manager's only write to an existing group, so the cache and the
+	// store never diverge. The edit takes effect on tasks at their next
+	// creation or recovery; a live run keeps the placement it was wired with.
+	// The global group may be updated even though it exists without a record —
+	// saving one is exactly how it gains resource groups. A missing non-global
+	// group is an error.
+	UpdateGroup(ctx context.Context, id string, fn func(*Group)) error
 	// DeleteGroup cascade-deletes a task group and every task in it, releasing
 	// each task's external resources. It refuses if any member is running, and
 	// refuses the global group.
 	DeleteGroup(ctx context.Context, id string) error
+	// GetGroup reports one task group and whether it exists, named for the same
+	// read on the Repository but served from the manager's group cache. It
+	// answers as placement would resolve: the global group always exists,
+	// implicitly when unstored — and with no repository, where groups are
+	// purely implicit, so does any group asked for.
+	GetGroup(id string) (Group, bool)
+	// ListGroups returns every task group from the manager's cache, the
+	// implicit global group included, sorted by ID. With no repository only
+	// the global group lists.
+	ListGroups() []Group
+	// TasksInGroup returns the ids of every task in the group, sorted. With no
+	// repository it answers from the live registry, the only store there is.
+	TasksInGroup(ctx context.Context, groupID string) ([]string, error)
 	// IsRunning reports whether a known task is started and not yet terminal.
 	// A suspended task counts: it is parked, not finished.
 	IsRunning(id string) bool
@@ -105,7 +127,7 @@ type Manager interface {
 type manager struct {
 	workflowRegistry map[string]workflows.Workflow
 
-	taskRegistry map[string]*handle
+	taskRegistry map[string]*Task
 
 	repository Repository
 
@@ -113,26 +135,45 @@ type manager struct {
 
 	resources []resource
 
+	// groups is the group cache, loaded once at construction and maintained
+	// write-through by CreateGroup and DeleteGroup, so reads and placement
+	// resolution never round-trip to the repository. The global group is
+	// always present, stored record or not.
+	groups map[string]Group
+
 	workflowRegistryMu sync.RWMutex
 	taskRegistryMu     sync.RWMutex
+	groupsMu           sync.RWMutex
 }
 
 // NewManager returns a Manager that persists tasks in repository and injects
-// bus into each task's workflow instance. A nil repository selects purely
+// bus into each task's workflow instance, loading the task groups from the
+// repository once — the cache is authoritative afterwards, and changes only
+// through CreateGroup and DeleteGroup. A nil repository selects purely
 // in-memory operation: tasks run without checkpoints, durable terminal stamps,
 // or stored groups, and there is nothing to recover after a restart. Use it
 // when durability and crash recovery are not needed.
-func NewManager(repository Repository, bus comms.Bus, opts ...Option) Manager {
+func NewManager(ctx context.Context, repository Repository, bus comms.Bus, opts ...Option) (Manager, error) {
 	s := &manager{
 		repository:       repository,
 		workflowRegistry: make(map[string]workflows.Workflow),
-		taskRegistry:     make(map[string]*handle),
+		taskRegistry:     make(map[string]*Task),
 		bus:              bus,
+		groups:           map[string]Group{GlobalGroup: {ID: GlobalGroup}},
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
-	return s
+	if repository != nil {
+		listed, err := repository.ListGroups(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load task groups: %w", err)
+		}
+		for _, g := range listed {
+			s.groups[g.ID] = g
+		}
+	}
+	return s, nil
 }
 
 func (m *manager) RegisterWorkflow(id string, workflow workflows.Workflow) error {
@@ -143,8 +184,28 @@ func (m *manager) RegisterWorkflow(id string, workflow workflows.Workflow) error
 		return errors.New("workflow already registered")
 	}
 
+	// A ResourceReceiver is wired here, from the same registry that unlocks:
+	// the manager a workflow leases through is the instance this manager holds,
+	// never a second one over the same store. A workflow missing a kind it
+	// needs refuses, failing the registration at boot.
+	if r, ok := workflow.(workflows.ResourceReceiver); ok {
+		if err := r.UseResources(m.managers()); err != nil {
+			return fmt.Errorf("failed to wire resource managers into workflow %s: %w", id, err)
+		}
+	}
+
 	m.workflowRegistry[id] = workflow
 	return nil
+}
+
+// managers exposes every registered kind's manager, concretely typed behind
+// any, for a ResourceReceiver to assert back to what it leases through.
+func (m *manager) managers() map[leasing.Kind]any {
+	out := make(map[leasing.Kind]any, len(m.resources))
+	for _, r := range m.resources {
+		out[r.kind] = r.manager
+	}
+	return out
 }
 
 func (m *manager) getWorkflow(id string) (workflows.Workflow, error) {
@@ -158,27 +219,69 @@ func (m *manager) getWorkflow(id string) (workflows.Workflow, error) {
 	return workflow, nil
 }
 
-// getGroup resolves a task group. The global group (and, with no repository,
-// any group) resolves to an implicit empty record when unstored; a missing
-// non-global group is an error.
-func (m *manager) getGroup(ctx context.Context, id string) (Group, error) {
-	if m.repository == nil {
-		return Group{ID: id}, nil
+// getGroup resolves a task group for placement, erroring on one that does not
+// exist rather than reporting the miss.
+func (m *manager) getGroup(id string) (Group, error) {
+	group, found := m.GetGroup(id)
+	if !found {
+		return Group{}, fmt.Errorf("task group %s does not exist", id)
 	}
-	group, found, err := m.repository.GetGroup(ctx, id)
-	if err != nil {
-		return Group{}, fmt.Errorf("failed to get task group %s: %w", id, err)
-	}
-	if found {
-		return group, nil
-	}
-	if id == GlobalGroup {
-		return Group{ID: GlobalGroup}, nil
-	}
-	return Group{}, fmt.Errorf("task group %s does not exist", id)
+	return group, nil
 }
 
-func (m *manager) CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (Handle, error) {
+// GetGroup reports one task group and whether it exists, from the cache,
+// answering as placement would resolve: the global group exists implicitly
+// when unstored — and with no repository, where groups are purely implicit,
+// so does any group asked for.
+func (m *manager) GetGroup(id string) (Group, bool) {
+	if m.repository == nil {
+		return Group{ID: id}, true
+	}
+	m.groupsMu.RLock()
+	defer m.groupsMu.RUnlock()
+	g, ok := m.groups[id]
+	return g, ok
+}
+
+// ListGroups returns every task group from the cache sorted by ID, the global
+// group included even when it has no stored record, so listings and placement
+// agree on what exists.
+func (m *manager) ListGroups() []Group {
+	m.groupsMu.RLock()
+	defer m.groupsMu.RUnlock()
+	out := make([]Group, 0, len(m.groups))
+	for _, g := range m.groups {
+		out = append(out, g)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// TasksInGroup returns the ids of every task in the group, sorted. With no
+// repository it answers from the live registry, the only store in-memory
+// operation has.
+func (m *manager) TasksInGroup(ctx context.Context, groupID string) ([]string, error) {
+	if m.repository == nil {
+		m.taskRegistryMu.RLock()
+		defer m.taskRegistryMu.RUnlock()
+		ids := make([]string, 0)
+		for id, t := range m.taskRegistry {
+			if groupOf(t.record()) == groupID {
+				ids = append(ids, id)
+			}
+		}
+		sort.Strings(ids)
+		return ids, nil
+	}
+	ids, err := m.repository.TasksInGroup(ctx, groupID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tasks of group %s: %w", groupID, err)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+func (m *manager) CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (*Task, error) {
 	m.taskRegistryMu.Lock()
 	defer m.taskRegistryMu.Unlock()
 
@@ -191,12 +294,12 @@ func (m *manager) CreateTask(ctx context.Context, workflowID string, input any, 
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	group, err := m.getGroup(ctx, cfg.groupID)
+	group, err := m.getGroup(cfg.groupID)
 	if err != nil {
 		return nil, err
 	}
 
-	task, err := createHandle(workflow, input, m.bus, m.repository, resolveAll(cfg.assignments, group))
+	task, err := createTask(workflow, workflowID, input, m.bus, m.repository, cfg.groupID, cfg.assignments, resolveAll(cfg.assignments, group))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create task: %w", err)
 	}
@@ -204,21 +307,12 @@ func (m *manager) CreateTask(ctx context.Context, workflowID string, input any, 
 	// A nil repository is purely in-memory: skip persistence and keep the task
 	// only in the registry.
 	if m.repository != nil {
-		now := time.Now().UTC()
-		record := Task{
-			ID:          task.ID(),
-			WorkflowID:  workflowID,
-			GroupID:     cfg.groupID,
-			Assignments: cfg.assignments,
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		}
-		if err := m.repository.CreateTask(ctx, record); err != nil {
+		if err := m.repository.CreateTask(ctx, task.record()); err != nil {
 			return nil, fmt.Errorf("failed to create task in repository: %w", err)
 		}
 	}
 
-	m.taskRegistry[task.ID()] = task
+	m.taskRegistry[task.ID] = task
 
 	return task, nil
 }
@@ -231,7 +325,7 @@ func (m *manager) IsRunning(id string) bool {
 	return ok && t.IsRunning()
 }
 
-func (m *manager) RecoverTask(ctx context.Context, id string) (Handle, error) {
+func (m *manager) RecoverTask(ctx context.Context, id string) (*Task, error) {
 	m.taskRegistryMu.Lock()
 	defer m.taskRegistryMu.Unlock()
 
@@ -250,7 +344,7 @@ func (m *manager) RecoverTask(ctx context.Context, id string) (Handle, error) {
 		return nil, fmt.Errorf("failed to recover task: %w", err)
 	}
 
-	group, err := m.getGroup(ctx, groupOf(record))
+	group, err := m.getGroup(groupOf(record))
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +357,7 @@ func (m *manager) RecoverTask(ctx context.Context, id string) (Handle, error) {
 	return task, nil
 }
 
-func (m *manager) RecoverAll(ctx context.Context) ([]Handle, error) {
+func (m *manager) RecoverAll(ctx context.Context) ([]*Task, error) {
 	// A nil repository persists nothing, so there is nothing to recover; a
 	// startup recovery sweep stays a safe no-op in in-memory mode.
 	if m.repository == nil {
@@ -274,24 +368,19 @@ func (m *manager) RecoverAll(ctx context.Context) ([]Handle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to recover tasks: %w", err)
 	}
-	// Load the groups once: resolving each record's own would be a query per
-	// task against a store that serializes them.
-	listed, err := m.repository.ListGroups(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list task groups: %w", err)
+	// Snapshot the group cache once: resolving each record's own would take
+	// the read lock per task for an answer that cannot change mid-sweep.
+	m.groupsMu.RLock()
+	groups := make(map[string]Group, len(m.groups))
+	for id, g := range m.groups {
+		groups[id] = g
 	}
-	groups := make(map[string]Group, len(listed)+1)
-	for _, g := range listed {
-		groups[g.ID] = g
-	}
-	if _, ok := groups[GlobalGroup]; !ok {
-		groups[GlobalGroup] = Group{ID: GlobalGroup}
-	}
+	m.groupsMu.RUnlock()
 
 	m.taskRegistryMu.Lock()
 	defer m.taskRegistryMu.Unlock()
 
-	tasks := make([]Handle, 0, len(records))
+	tasks := make([]*Task, 0, len(records))
 	for _, record := range records {
 		if existing, ok := m.taskRegistry[record.ID]; ok && existing.IsRunning() {
 			tasks = append(tasks, existing)
@@ -322,18 +411,18 @@ func groupOf(record Task) string {
 
 // rehydrate rebuilds an unstarted task from a persisted record, resolving its
 // workflow from the registry and its effective placement per kind.
-func (m *manager) rehydrate(record Task, group Group) (*handle, error) {
+func (m *manager) rehydrate(record Task, group Group) (*Task, error) {
 	workflow, err := m.getWorkflow(record.WorkflowID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workflow for recovery: %w", err)
 	}
-	return rehydrateHandle(workflow, record.ID, record.Snapshot, workflows.State(record.State), workflows.Status(record.Status), m.bus, m.repository, resolveAll(record.Assignments, group)), nil
+	return rehydrateTask(workflow, record, m.bus, m.repository, resolveAll(record.Assignments, group)), nil
 }
 
 // resolve settles one kind's placement: the task's own assignment wherever it
 // sets a field, the task group's resource group otherwise. An unset field
 // inherits; one set to the empty string is an explicit "none" and does not.
-func resolve(own Assignment, group Group, kind string) workflows.Assignment {
+func resolve(own Assignment, group Group, kind leasing.Kind) workflows.Assignment {
 	resolved := workflows.Assignment{GroupID: group.ResourceGroups[kind]}
 	if own.GroupID != nil {
 		resolved.GroupID = *own.GroupID
@@ -347,8 +436,8 @@ func resolve(own Assignment, group Group, kind string) workflows.Assignment {
 // resolveAll settles every kind either the task or its group names. A kind
 // neither names is absent, which reads as the zero Assignment — the same answer
 // resolving it would give.
-func resolveAll(assignments map[string]Assignment, group Group) map[string]workflows.Assignment {
-	resolved := make(map[string]workflows.Assignment, len(assignments)+len(group.ResourceGroups))
+func resolveAll(assignments map[leasing.Kind]Assignment, group Group) map[leasing.Kind]workflows.Assignment {
+	resolved := make(map[leasing.Kind]workflows.Assignment, len(assignments)+len(group.ResourceGroups))
 	for kind := range group.ResourceGroups {
 		resolved[kind] = resolve(assignments[kind], group, kind)
 	}
@@ -368,7 +457,7 @@ func resolveAll(assignments map[string]Assignment, group Group) map[string]workf
 // It refuses nothing. Reassigning a live task is legitimate and takes effect at
 // its next recovery, since a run is wired with its placement at start and keeps
 // the lease it already holds.
-func (m *manager) AssignResource(ctx context.Context, id string, kind string, assignment Assignment) error {
+func (m *manager) AssignResource(ctx context.Context, id string, kind leasing.Kind, assignment Assignment) error {
 	m.taskRegistryMu.Lock()
 	defer m.taskRegistryMu.Unlock()
 
@@ -379,7 +468,7 @@ func (m *manager) AssignResource(ctx context.Context, id string, kind string, as
 	if err != nil {
 		return fmt.Errorf("failed to load task %s: %w", id, err)
 	}
-	group, err := m.getGroup(ctx, groupOf(record))
+	group, err := m.getGroup(groupOf(record))
 	if err != nil {
 		return err
 	}
@@ -449,7 +538,7 @@ func (m *manager) releaseTask(ctx context.Context, id string) error {
 
 // managerFor returns the registered manager for the kind, or nil when no
 // manager of that kind is wired.
-func (m *manager) managerFor(kind string) ResourceManager {
+func (m *manager) managerFor(kind leasing.Kind) ResourceManager {
 	for _, r := range m.resources {
 		if r.kind == kind {
 			return r.manager
@@ -469,9 +558,9 @@ func (m *manager) CreateGroup(ctx context.Context, group Group) error {
 		return errors.New("cannot create task group: no repository configured")
 	}
 
-	if _, found, err := m.repository.GetGroup(ctx, group.ID); err != nil {
-		return fmt.Errorf("failed to get task group %s: %w", group.ID, err)
-	} else if found {
+	m.groupsMu.Lock()
+	defer m.groupsMu.Unlock()
+	if _, found := m.groups[group.ID]; found {
 		return fmt.Errorf("task group %s already exists", group.ID)
 	}
 
@@ -480,6 +569,40 @@ func (m *manager) CreateGroup(ctx context.Context, group Group) error {
 	if err := m.repository.SaveGroup(ctx, group); err != nil {
 		return fmt.Errorf("failed to save task group %s: %w", group.ID, err)
 	}
+	m.groups[group.ID] = group
+	return nil
+}
+
+// UpdateGroup edits the group through fn under the cache lock, then persists
+// and re-caches it — the same shape as leasing.Manager.Update, for the same
+// reason: the cache is where placement resolves from and the save is what
+// makes a change durable, so the edit has to go through both. ID, CreatedAt,
+// and UpdatedAt are not fn's to change; whatever it does to them is undone
+// before the save. fn runs under the lock, so it must not block.
+func (m *manager) UpdateGroup(ctx context.Context, id string, fn func(*Group)) error {
+	if m.repository == nil {
+		return errors.New("cannot update task group: no repository configured")
+	}
+
+	m.groupsMu.Lock()
+	defer m.groupsMu.Unlock()
+
+	g, ok := m.groups[id]
+	if !ok {
+		return fmt.Errorf("task group %s does not exist", id)
+	}
+	kept := g
+	fn(&g)
+	g.ID, g.CreatedAt = kept.ID, kept.CreatedAt
+	if g.CreatedAt.IsZero() {
+		// The implicit global group gains its stored record here.
+		g.CreatedAt = time.Now().UTC()
+	}
+	g.UpdatedAt = time.Now().UTC()
+	if err := m.repository.SaveGroup(ctx, g); err != nil {
+		return fmt.Errorf("failed to save task group %s: %w", id, err)
+	}
+	m.groups[id] = g
 	return nil
 }
 
@@ -491,9 +614,7 @@ func (m *manager) DeleteGroup(ctx context.Context, id string) error {
 		return errors.New("cannot delete task group: no repository configured")
 	}
 
-	if _, found, err := m.repository.GetGroup(ctx, id); err != nil {
-		return fmt.Errorf("failed to get task group %s: %w", id, err)
-	} else if !found {
+	if _, found := m.GetGroup(id); !found {
 		return fmt.Errorf("task group %s does not exist", id)
 	}
 
@@ -510,7 +631,7 @@ func (m *manager) DeleteGroup(ctx context.Context, id string) error {
 	// Seal every member before touching anything. Start never goes through the
 	// manager, so a plain is-it-running check would leave a member free to
 	// begin between the check and its deletion.
-	sealed := make([]*handle, 0, len(ids))
+	sealed := make([]*Task, 0, len(ids))
 	for _, taskID := range ids {
 		t, known := m.taskRegistry[taskID]
 		if !known {
@@ -542,11 +663,14 @@ func (m *manager) DeleteGroup(ctx context.Context, id string) error {
 	if err := m.repository.DeleteGroup(ctx, id); err != nil {
 		return fmt.Errorf("failed to delete task group %s: %w", id, err)
 	}
+	m.groupsMu.Lock()
+	delete(m.groups, id)
+	m.groupsMu.Unlock()
 	return nil
 }
 
 // unsealAll reopens tasks sealed for a cascade that was abandoned.
-func unsealAll(tasks []*handle) {
+func unsealAll(tasks []*Task) {
 	for _, t := range tasks {
 		t.unseal()
 	}

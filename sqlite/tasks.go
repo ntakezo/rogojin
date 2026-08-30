@@ -1,7 +1,4 @@
-// Package tasksqlite provides a file-backed, durable implementation of the
-// tasks.Repository port. A consumer that does not want to write its own byte
-// store can inject SQLite.
-package tasksqlite
+package sqlite
 
 import (
 	"context"
@@ -11,46 +8,33 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/ntakezo/rogojin/persistence/sqlitemigrate"
+	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/tasks"
 )
 
-// ErrNotFound is returned when no record exists for the id, so the service can
-// tell a missing task apart from a store failure.
-var ErrNotFound = errors.New("task not found")
+// ErrTaskNotFound is returned when no record exists for the id, so the task
+// manager can tell a missing task apart from a store failure.
+var ErrTaskNotFound = errors.New("task not found")
 
-// SQLite is a durable tasks.Repository backed by a single SQLite database file.
-type SQLite struct {
+// Tasks is the tasks.Repository: one row per task carrying its placement,
+// last checkpoint, and terminal outcome, and one per task group.
+type Tasks struct {
 	db *sql.DB
 }
 
-// NewSQLite opens (creating if absent) the database at dsn and ensures the schema exists.
-func NewSQLite(dsn string) (*SQLite, error) {
-	db, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	// SQLite serializes writes per file; one connection avoids "database is locked" under concurrent checkpoints.
-	db.SetMaxOpenConns(1)
-
-	if err := ensureSchema(db); err != nil {
-		db.Close()
+// NewTasks builds the tasks store on db, bringing its tables up to the
+// current schema.
+func NewTasks(db *DB) (tasks.Repository, error) {
+	if err := migrate(db.db, "tasks", taskMigrations); err != nil {
 		return nil, err
 	}
-	return &SQLite{db: db}, nil
+	return &Tasks{db: db.db}, nil
 }
 
-// ensureSchema brings the database up to the latest schema version, applying any
-// migrations it has not yet seen.
-func ensureSchema(db *sql.DB) error {
-	return sqlitemigrate.Run(db, "tasks", migrations)
-}
-
-// migrations is the ordered schema history of the tasks store. Append new steps
-// to the end; never edit or reorder shipped ones: the ledger records which of
-// them have already run on existing databases by position.
-var migrations = []sqlitemigrate.Migration{
+// taskMigrations is the ordered schema history of the tasks store. Append new
+// steps to the end; never edit or reorder shipped ones: the ledger records
+// which of them have already run on existing databases by position.
+var taskMigrations = []migration{
 	{
 		Name: "create tasks table",
 		SQL: `CREATE TABLE IF NOT EXISTS tasks (
@@ -95,14 +79,9 @@ var migrations = []sqlitemigrate.Migration{
 	},
 }
 
-// Close closes the underlying database.
-func (s *SQLite) Close() error {
-	return s.db.Close()
-}
-
 // CreateTask inserts a fresh task row from its record: workflow, placement,
 // and timestamps, with no checkpoint yet.
-func (s *SQLite) CreateTask(ctx context.Context, rec tasks.Task) error {
+func (s *Tasks) CreateTask(ctx context.Context, rec tasks.Task) error {
 	assignments, err := encodeAssignments(rec.Assignments)
 	if err != nil {
 		return fmt.Errorf("create task %s: %w", rec.ID, err)
@@ -118,10 +97,10 @@ func (s *SQLite) CreateTask(ctx context.Context, rec tasks.Task) error {
 }
 
 // SaveCheckpoint overwrites the task's last-checkpointed status, state, and
-// snapshot, refreshing updated_at. It fails with ErrNotFound if no record
+// snapshot, refreshing updated_at. It fails with ErrTaskNotFound if no record
 // exists: a checkpoint that lands nowhere must not report durability the
 // store does not have.
-func (s *SQLite) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
+func (s *Tasks) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE tasks SET status = ?, state = ?, snapshot = ?, updated_at = ? WHERE id = ?`,
 		status, state, snapshot, formatTime(time.Now().UTC()), id)
@@ -135,7 +114,7 @@ func (s *SQLite) SaveCheckpoint(ctx context.Context, id, status, state string, s
 // kind and the rest of the record untouched. A nil field stores JSON null: no
 // group assignment of its own, or no pin. json_set edits the stored object in
 // place, so one kind is rewritten without reading the others back first.
-func (s *SQLite) SaveAssignment(ctx context.Context, id string, kind string, a tasks.Assignment) error {
+func (s *Tasks) SaveAssignment(ctx context.Context, id string, kind leasing.Kind, a tasks.Assignment) error {
 	encoded, err := json.Marshal(a)
 	if err != nil {
 		return fmt.Errorf("assign %s placement of task %s: %w", kind, id, err)
@@ -162,8 +141,8 @@ func (s *SQLite) SaveAssignment(ctx context.Context, id string, kind string, a t
 // MarkTerminal stamps the terminal outcome and the run's output, refreshing
 // updated_at and leaving state and snapshot intact as a valid resume entry.
 // output is nil for runs that produce no result or did not complete cleanly.
-// It fails with ErrNotFound if no record exists.
-func (s *SQLite) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
+// It fails with ErrTaskNotFound if no record exists.
+func (s *Tasks) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE tasks SET status = ?, output = ?, updated_at = ? WHERE id = ?`,
 		outcome, output, formatTime(time.Now().UTC()), id)
@@ -173,27 +152,27 @@ func (s *SQLite) MarkTerminal(ctx context.Context, id, outcome string, output []
 	return errRowMissing("mark terminal", id, res)
 }
 
-// errRowMissing turns an update that matched no row into ErrNotFound, so a
-// write to a deleted task fails loud instead of silently landing nowhere.
+// errRowMissing turns an update that matched no row into ErrTaskNotFound, so
+// a write to a deleted task fails loud instead of silently landing nowhere.
 func errRowMissing(op, id string, res sql.Result) error {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", op, id, err)
 	}
 	if n == 0 {
-		return fmt.Errorf("%s %s: %w", op, id, ErrNotFound)
+		return fmt.Errorf("%s %s: %w", op, id, ErrTaskNotFound)
 	}
 	return nil
 }
 
-// RecoverTask returns the record for id, or ErrNotFound if none exists.
-func (s *SQLite) RecoverTask(ctx context.Context, id string) (tasks.Task, error) {
+// RecoverTask returns the record for id, or ErrTaskNotFound if none exists.
+func (s *Tasks) RecoverTask(ctx context.Context, id string) (tasks.Task, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
 		 FROM tasks WHERE id = ?`, id)
-	rec, err := scanRecord(row)
+	rec, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return tasks.Task{}, fmt.Errorf("recover task %s: %w", id, ErrNotFound)
+		return tasks.Task{}, fmt.Errorf("recover task %s: %w", id, ErrTaskNotFound)
 	}
 	if err != nil {
 		return tasks.Task{}, fmt.Errorf("recover task %s: %w", id, err)
@@ -202,7 +181,7 @@ func (s *SQLite) RecoverTask(ctx context.Context, id string) (tasks.Task, error)
 }
 
 // RecoverAll returns every persisted record, terminal ones included.
-func (s *SQLite) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
+func (s *Tasks) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
 		 FROM tasks`)
@@ -213,7 +192,7 @@ func (s *SQLite) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
 
 	records := make([]tasks.Task, 0)
 	for rows.Next() {
-		rec, err := scanRecord(rows)
+		rec, err := scanTask(rows)
 		if err != nil {
 			return nil, fmt.Errorf("recover all: %w", err)
 		}
@@ -226,7 +205,7 @@ func (s *SQLite) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
 }
 
 // DeleteTask removes the task's record; absent rows are a no-op.
-func (s *SQLite) DeleteTask(ctx context.Context, id string) error {
+func (s *Tasks) DeleteTask(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete task %s: %w", id, err)
@@ -237,10 +216,10 @@ func (s *SQLite) DeleteTask(ctx context.Context, id string) error {
 // SaveGroup upserts the task group's record. created_at is written on insert
 // and never overwritten: when a group was created is not something a later
 // save gets to revise.
-func (s *SQLite) SaveGroup(ctx context.Context, g tasks.Group) error {
-	resourceGroups, err := encodeResourceGroups(g.ResourceGroups)
+func (s *Tasks) SaveGroup(ctx context.Context, g tasks.Group) error {
+	resourceGroups, err := formatMap(g.ResourceGroups)
 	if err != nil {
-		return fmt.Errorf("save task group %s: %w", g.ID, err)
+		return fmt.Errorf("save task group %s: encode resource groups: %w", g.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO task_groups (id, resource_groups, created_at, updated_at)
@@ -255,10 +234,10 @@ func (s *SQLite) SaveGroup(ctx context.Context, g tasks.Group) error {
 }
 
 // GetGroup returns the group and whether a record exists for the id.
-func (s *SQLite) GetGroup(ctx context.Context, id string) (tasks.Group, bool, error) {
+func (s *Tasks) GetGroup(ctx context.Context, id string) (tasks.Group, bool, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, resource_groups, created_at, updated_at FROM task_groups WHERE id = ?`, id)
-	g, err := scanGroup(row)
+	g, err := scanTaskGroup(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return tasks.Group{}, false, nil
 	}
@@ -269,7 +248,7 @@ func (s *SQLite) GetGroup(ctx context.Context, id string) (tasks.Group, bool, er
 }
 
 // ListGroups returns every stored task group in stable id order.
-func (s *SQLite) ListGroups(ctx context.Context) ([]tasks.Group, error) {
+func (s *Tasks) ListGroups(ctx context.Context) ([]tasks.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, resource_groups, created_at, updated_at FROM task_groups ORDER BY id`)
 	if err != nil {
@@ -279,7 +258,7 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]tasks.Group, error) {
 
 	listed := make([]tasks.Group, 0)
 	for rows.Next() {
-		g, err := scanGroup(rows)
+		g, err := scanTaskGroup(rows)
 		if err != nil {
 			return nil, fmt.Errorf("list task groups: %w", err)
 		}
@@ -292,8 +271,8 @@ func (s *SQLite) ListGroups(ctx context.Context) ([]tasks.Group, error) {
 }
 
 // DeleteGroup removes the group's record; absent rows are a no-op. Member
-// tasks are the service's to delete — the store cascades nothing.
-func (s *SQLite) DeleteGroup(ctx context.Context, id string) error {
+// tasks are the task manager's to delete — the store cascades nothing.
+func (s *Tasks) DeleteGroup(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM task_groups WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete task group %s: %w", id, err)
@@ -302,7 +281,7 @@ func (s *SQLite) DeleteGroup(ctx context.Context, id string) error {
 }
 
 // TasksInGroup returns the ids of every task in the group, in stable id order.
-func (s *SQLite) TasksInGroup(ctx context.Context, groupID string) ([]string, error) {
+func (s *Tasks) TasksInGroup(ctx context.Context, groupID string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM tasks WHERE group_id = ? ORDER BY id`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("tasks in group %s: %w", groupID, err)
@@ -323,13 +302,8 @@ func (s *SQLite) TasksInGroup(ctx context.Context, groupID string) ([]string, er
 	return ids, nil
 }
 
-// scanner is the read surface shared by sql.Row and sql.Rows.
-type scanner interface {
-	Scan(dest ...any) error
-}
-
-// scanRecord reads one row into a tasks.Task.
-func scanRecord(row scanner) (tasks.Task, error) {
+// scanTask reads one row into a tasks.Task.
+func scanTask(row scanner) (tasks.Task, error) {
 	var rec tasks.Task
 	var assignments, created, updated string
 	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &assignments, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated); err != nil {
@@ -348,16 +322,16 @@ func scanRecord(row scanner) (tasks.Task, error) {
 	return rec, nil
 }
 
-// scanGroup reads one row into a tasks.Group.
-func scanGroup(row scanner) (tasks.Group, error) {
+// scanTaskGroup reads one row into a tasks.Group.
+func scanTaskGroup(row scanner) (tasks.Group, error) {
 	var g tasks.Group
 	var resourceGroups, created, updated string
 	if err := row.Scan(&g.ID, &resourceGroups, &created, &updated); err != nil {
 		return tasks.Group{}, err
 	}
 	var err error
-	if g.ResourceGroups, err = decodeResourceGroups(resourceGroups); err != nil {
-		return tasks.Group{}, err
+	if g.ResourceGroups, err = parseMap[leasing.Kind](resourceGroups); err != nil {
+		return tasks.Group{}, fmt.Errorf("decode resource groups: %w", err)
 	}
 	if g.CreatedAt, err = parseTime(created); err != nil {
 		return tasks.Group{}, err
@@ -371,7 +345,7 @@ func scanGroup(row scanner) (tasks.Group, error) {
 // encodeAssignments renders a record's per-kind placement for its column. An
 // empty map stores as the column default, so a task placed nowhere reads back
 // alike whether it was written here or predates the column.
-func encodeAssignments(a map[string]tasks.Assignment) (string, error) {
+func encodeAssignments(a map[leasing.Kind]tasks.Assignment) (string, error) {
 	if len(a) == 0 {
 		return "", nil
 	}
@@ -385,55 +359,13 @@ func encodeAssignments(a map[string]tasks.Assignment) (string, error) {
 // decodeAssignments is the inverse of encodeAssignments. A JSON null field
 // decodes to a nil *string, which is what carries "inherit" back out of the
 // store intact.
-func decodeAssignments(raw string) (map[string]tasks.Assignment, error) {
+func decodeAssignments(raw string) (map[leasing.Kind]tasks.Assignment, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	var a map[string]tasks.Assignment
+	var a map[leasing.Kind]tasks.Assignment
 	if err := json.Unmarshal([]byte(raw), &a); err != nil {
 		return nil, fmt.Errorf("decode assignments: %w", err)
 	}
 	return a, nil
-}
-
-// encodeResourceGroups renders a task group's per-kind assignment for its
-// column, empty storing as the column default.
-func encodeResourceGroups(g map[string]string) (string, error) {
-	if len(g) == 0 {
-		return "", nil
-	}
-	encoded, err := json.Marshal(g)
-	if err != nil {
-		return "", fmt.Errorf("encode resource groups: %w", err)
-	}
-	return string(encoded), nil
-}
-
-// decodeResourceGroups is the inverse of encodeResourceGroups.
-func decodeResourceGroups(raw string) (map[string]string, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	var g map[string]string
-	if err := json.Unmarshal([]byte(raw), &g); err != nil {
-		return nil, fmt.Errorf("decode resource groups: %w", err)
-	}
-	return g, nil
-}
-
-// formatTime stores timestamps as RFC3339Nano UTC text; the zero time stores
-// as "" so pre-timestamp rows keep round-tripping.
-func formatTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	return t.UTC().Format(time.RFC3339Nano)
-}
-
-// parseTime is the inverse of formatTime.
-func parseTime(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, nil
-	}
-	return time.Parse(time.RFC3339Nano, s)
 }

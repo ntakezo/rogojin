@@ -1,6 +1,10 @@
 package tasks
 
-import "time"
+import (
+	"time"
+
+	"github.com/ntakezo/rogojin/leasing"
+)
 
 // GlobalGroup is the task group tasks land in when created without one. It
 // exists implicitly — it needs no stored record, resolves to no resource group
@@ -14,23 +18,23 @@ const GlobalGroup = "global"
 // does not validate the names — an unknown one surfaces as an error when a
 // member first tries to lease.
 type Group struct {
-	ID             string            `json:"id"`
-	ResourceGroups map[string]string `json:"resourceGroups,omitempty"`
-	CreatedAt      time.Time         `json:"createdAt"`
-	UpdatedAt      time.Time         `json:"updatedAt"`
+	ID             string                  `json:"id"`
+	ResourceGroups map[leasing.Kind]string `json:"resourceGroups,omitempty"`
+	CreatedAt      time.Time               `json:"createdAt"`
+	UpdatedAt      time.Time               `json:"updatedAt"`
 }
 
 // createConfig collects the optional placement of a new task.
 type createConfig struct {
 	groupID     string
-	assignments map[string]Assignment
+	assignments map[leasing.Kind]Assignment
 }
 
 // assign records an option's placement for one kind, merging it into whatever
 // an earlier option set for that kind.
-func (c *createConfig) assign(kind string, apply func(*Assignment)) {
+func (c *createConfig) assign(kind leasing.Kind, apply func(*Assignment)) {
 	if c.assignments == nil {
-		c.assignments = make(map[string]Assignment)
+		c.assignments = make(map[leasing.Kind]Assignment)
 	}
 	a := c.assignments[kind]
 	apply(&a)
@@ -47,9 +51,9 @@ func InGroup(groupID string) CreateOption {
 }
 
 // WithResourceGroup assigns the task its own group of the named resource kind
-// — "proxy", "account", or whatever a consumer calls its manager — overriding
-// its task group's assignment for that kind.
-func WithResourceGroup(kind, groupID string) CreateOption {
+// — proxies.Kind, accounts.Kind, or whatever a consumer's own kind publishes —
+// overriding its task group's assignment for that kind.
+func WithResourceGroup(kind leasing.Kind, groupID string) CreateOption {
 	return func(c *createConfig) {
 		c.assign(kind, func(a *Assignment) { a.GroupID = &groupID })
 	}
@@ -60,7 +64,7 @@ func WithResourceGroup(kind, groupID string) CreateOption {
 // lease it takes of that kind is that resource. This package owns no resource
 // pool and cannot check the pin, so a resource that does not exist, or is in
 // another group, surfaces as an error at the task's first lease.
-func WithPin(kind, resourceID string) CreateOption {
+func WithPin(kind leasing.Kind, resourceID string) CreateOption {
 	return func(c *createConfig) {
 		c.assign(kind, func(a *Assignment) { a.ResourceID = &resourceID })
 	}
@@ -68,7 +72,7 @@ func WithPin(kind, resourceID string) CreateOption {
 
 // Without makes the task lease no resource of the kind even if its task group
 // assigns one, clearing any pin along with it.
-func Without(kind string) CreateOption {
+func Without(kind leasing.Kind) CreateOption {
 	return func(c *createConfig) {
 		none := ""
 		c.assign(kind, func(a *Assignment) { a.GroupID, a.ResourceID = &none, &none })

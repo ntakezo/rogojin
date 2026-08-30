@@ -1,4 +1,4 @@
-package states
+package example_checkout
 
 import (
 	"context"
@@ -16,14 +16,6 @@ import (
 	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/proxies"
 	"github.com/ntakezo/rogojin/workflows"
-)
-
-// The resource kinds this workflow leases under. A kind is just the key its
-// placement is filed on the task record; the framework defines none, so this is
-// the one place the two managers and the task service must agree.
-const (
-	ProxyKind   = "proxy"
-	AccountKind = "account"
 )
 
 // VerificationSender is the address the site's sign-in mail comes from —
@@ -91,14 +83,14 @@ func NewContext(input StaticContext, deps workflows.Deps, manager *proxies.Manag
 			// inside it. No branching here.
 			assignment: proxies.Assignment{
 				TaskID:     deps.TaskID,
-				GroupID:    deps.Assignments[ProxyKind].GroupID,
-				ResourceID: deps.Assignments[ProxyKind].ResourceID,
+				GroupID:    deps.Assignments[proxies.Kind].GroupID,
+				ResourceID: deps.Assignments[proxies.Kind].ResourceID,
 			},
 			accounts: accountManager,
 			account: accounts.Assignment{
 				TaskID:     deps.TaskID,
-				GroupID:    deps.Assignments[AccountKind].GroupID,
-				ResourceID: deps.Assignments[AccountKind].ResourceID,
+				GroupID:    deps.Assignments[accounts.Kind].GroupID,
+				ResourceID: deps.Assignments[accounts.Kind].ResourceID,
 			},
 			bus: deps.Bus,
 		},

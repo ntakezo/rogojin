@@ -32,6 +32,10 @@ import (
 	"github.com/ntakezo/rogojin/leasing"
 )
 
+// Kind is the resource kind accounts register with the task manager under —
+// the key a task's account placement is filed on. See proxies.Kind.
+const Kind leasing.Kind = "account"
+
 // GlobalGroup is the namespace accounts land in when added without a group;
 // a non-global group is normally one target site.
 const GlobalGroup = leasing.GlobalGroup

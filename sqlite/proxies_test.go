@@ -1,4 +1,4 @@
-package proxysqlite
+package sqlite
 
 import (
 	"context"
@@ -11,26 +11,24 @@ import (
 	"github.com/ntakezo/rogojin/proxies"
 )
 
-// satisfiesRepositoryPort fails to compile if SQLite drifts from the persistence port it exists to implement.
-var _ proxies.Repository = (*SQLite)(nil)
+// satisfiesRepositoryPort fails to compile if Proxies drifts from the persistence port it exists to implement.
+var _ proxies.Repository = (*Proxies)(nil)
 
-// newTestRepo opens a SQLite repository backed by a fresh temp-file database.
-func newTestRepo(t *testing.T) *SQLite {
+// newTestProxies opens the proxies store on a fresh temp-file database.
+func newTestProxies(t *testing.T) proxies.Repository {
 	t.Helper()
-	dsn := filepath.Join(t.TempDir(), "proxies.db")
-	repo, err := NewSQLite(dsn)
+	repo, err := NewProxies(openTestDB(t))
 	if err != nil {
-		t.Fatalf("NewSQLite: %v", err)
+		t.Fatalf("NewProxies: %v", err)
 	}
-	t.Cleanup(func() { repo.Close() })
 	return repo
 }
 
-// TestSaveListRoundTrip verifies every field — URL, OwnerID, and stats —
+// TestProxiesSaveListRoundTrip verifies every field — URL, OwnerID, and stats —
 // survives storage, because lock reclamation and bayesian learning read them
 // back verbatim.
-func TestSaveListRoundTrip(t *testing.T) {
-	repo := newTestRepo(t)
+func TestProxiesSaveListRoundTrip(t *testing.T) {
+	repo := newTestProxies(t)
 	ctx := context.Background()
 
 	locked := proxies.Proxy{Resource: leasing.Resource{ID: "p1", OwnerID: "t1"}, Successes: 3, Failures: 2, URL: "http://u:p@h1:80"}
@@ -61,10 +59,10 @@ func TestSaveListRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSaveUpserts verifies a second Save with the same ID replaces the record,
+// TestProxiesSaveUpserts verifies a second Save with the same ID replaces the record,
 // because Save is how both stat updates and binding changes are persisted.
-func TestSaveUpserts(t *testing.T) {
-	repo := newTestRepo(t)
+func TestProxiesSaveUpserts(t *testing.T) {
+	repo := newTestProxies(t)
 	ctx := context.Background()
 
 	if err := repo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "p1"}, URL: "http://h:80"}); err != nil {
@@ -87,10 +85,10 @@ func TestSaveUpserts(t *testing.T) {
 	}
 }
 
-// TestDelete verifies a deleted proxy no longer appears, because DeleteProxy
+// TestProxiesDelete verifies a deleted proxy no longer appears, because DeleteProxy
 // removes records the manager has dropped from its pool.
-func TestDelete(t *testing.T) {
-	repo := newTestRepo(t)
+func TestProxiesDelete(t *testing.T) {
+	repo := newTestProxies(t)
 	ctx := context.Background()
 
 	if err := repo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "p1"}}); err != nil {
@@ -109,10 +107,10 @@ func TestDelete(t *testing.T) {
 	}
 }
 
-// TestListEmpty verifies an empty store lists cleanly, because a fresh install
+// TestProxiesListEmpty verifies an empty store lists cleanly, because a fresh install
 // starts with no proxies.
-func TestListEmpty(t *testing.T) {
-	listed, err := newTestRepo(t).List(context.Background())
+func TestProxiesListEmpty(t *testing.T) {
+	listed, err := newTestProxies(t).List(context.Background())
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -121,11 +119,11 @@ func TestListEmpty(t *testing.T) {
 	}
 }
 
-// TestGroupAndHolderPolicyRoundTrip verifies a proxy's group and holder policy
+// TestProxiesGroupAndHolderPolicyRoundTrip verifies a proxy's group and holder policy
 // survive storage, including UnlimitedHolders — a negative sentinel a naive
 // unsigned column would mangle into a cap nobody asked for.
-func TestGroupAndHolderPolicyRoundTrip(t *testing.T) {
-	repo := newTestRepo(t)
+func TestProxiesGroupAndHolderPolicyRoundTrip(t *testing.T) {
+	repo := newTestProxies(t)
 	ctx := context.Background()
 
 	for _, p := range []proxies.Proxy{
@@ -157,10 +155,10 @@ func TestGroupAndHolderPolicyRoundTrip(t *testing.T) {
 	}
 }
 
-// TestProxyTimestampsRoundTrip verifies stamped times survive storage to the
+// TestProxiesProxyTimestampsRoundTrip verifies stamped times survive storage to the
 // millisecond, so a consumer can tell when a proxy was added and last used.
-func TestProxyTimestampsRoundTrip(t *testing.T) {
-	repo := newTestRepo(t)
+func TestProxiesProxyTimestampsRoundTrip(t *testing.T) {
+	repo := newTestProxies(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
@@ -178,11 +176,11 @@ func TestProxyTimestampsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCreatedAtSurvivesUpserts verifies a re-save never revises creation time.
+// TestProxiesCreatedAtSurvivesUpserts verifies a re-save never revises creation time.
 // Every lease outcome re-saves its proxy, so a Save that carried created_at
 // through would let routine stat updates rewrite when a proxy was added.
-func TestCreatedAtSurvivesUpserts(t *testing.T) {
-	repo := newTestRepo(t)
+func TestProxiesCreatedAtSurvivesUpserts(t *testing.T) {
+	repo := newTestProxies(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Millisecond)
@@ -220,10 +218,10 @@ func TestCreatedAtSurvivesUpserts(t *testing.T) {
 	}
 }
 
-// TestGroupCRUD verifies a proxy group round-trips with its strategy, lists in
+// TestProxiesGroupCRUD verifies a proxy group round-trips with its strategy, lists in
 // id order, and deletes cleanly.
-func TestGroupCRUD(t *testing.T) {
-	repo := newTestRepo(t)
+func TestProxiesGroupCRUD(t *testing.T) {
+	repo := newTestProxies(t)
 	ctx := context.Background()
 
 	if listed, err := repo.ListGroups(ctx); err != nil || len(listed) != 0 {
@@ -262,10 +260,10 @@ func TestGroupCRUD(t *testing.T) {
 	}
 }
 
-// TestLegacyProxiesLandInGlobalGroup verifies the group migration places
+// TestProxiesLegacyProxiesLandInGlobalGroup verifies the group migration places
 // pre-group proxies in the global namespace, so an upgraded pool keeps
 // rotating instead of referencing a group that does not exist.
-func TestLegacyProxiesLandInGlobalGroup(t *testing.T) {
+func TestProxiesLegacyProxiesLandInGlobalGroup(t *testing.T) {
 	ctx := context.Background()
 	dsn := filepath.Join(t.TempDir(), "legacy.db")
 
@@ -288,11 +286,12 @@ func TestLegacyProxiesLandInGlobalGroup(t *testing.T) {
 	}
 	raw.Close()
 
-	repo, err := NewSQLite(dsn)
+	repoDB := openAt(t, dsn)
+	repo, err := NewProxies(repoDB)
 	if err != nil {
-		t.Fatalf("NewSQLite on legacy db: %v", err)
+		t.Fatalf("NewProxies on legacy db: %v", err)
 	}
-	t.Cleanup(func() { repo.Close() })
+	t.Cleanup(func() { repoDB.Close() })
 
 	listed, err := repo.List(ctx)
 	if err != nil {
@@ -313,28 +312,30 @@ func TestLegacyProxiesLandInGlobalGroup(t *testing.T) {
 	}
 }
 
-// TestPersistsAcrossReopen verifies records — including the OwnerID lock —
+// TestProxiesPersistsAcrossReopen verifies records — including the OwnerID lock —
 // survive closing and reopening the database file, because durable locks past
 // a process's lifetime are the requirement this store exists for.
-func TestPersistsAcrossReopen(t *testing.T) {
+func TestProxiesPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dsn := filepath.Join(t.TempDir(), "proxies.db")
 
-	repo, err := NewSQLite(dsn)
+	repoDB := openAt(t, dsn)
+	repo, err := NewProxies(repoDB)
 	if err != nil {
-		t.Fatalf("NewSQLite: %v", err)
+		t.Fatalf("NewProxies: %v", err)
 	}
 	saved := proxies.Proxy{Resource: leasing.Resource{ID: "p1", OwnerID: "t1"}, Successes: 7, Failures: 3, URL: "http://h:80"}
 	if err := repo.Save(ctx, saved); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	repo.Close()
+	repoDB.Close()
 
-	reopened, err := NewSQLite(dsn)
+	reopenedDB := openAt(t, dsn)
+	reopened, err := NewProxies(reopenedDB)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	t.Cleanup(func() { reopened.Close() })
+	t.Cleanup(func() { reopenedDB.Close() })
 
 	listed, err := reopened.List(ctx)
 	if err != nil {

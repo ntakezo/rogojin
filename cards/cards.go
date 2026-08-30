@@ -27,6 +27,10 @@ import (
 	"github.com/ntakezo/rogojin/leasing"
 )
 
+// Kind is the resource kind cards register with the task manager under —
+// the key a task's card placement is filed on. See proxies.Kind.
+const Kind leasing.Kind = "card"
+
 // GlobalGroup is the namespace cards land in when added without a group; a
 // non-global group is usually one funding source, BIN, or allotment.
 const GlobalGroup = leasing.GlobalGroup

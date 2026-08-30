@@ -1,4 +1,4 @@
-package states
+package example_checkout
 
 import "github.com/ntakezo/rogojin/workflows"
 

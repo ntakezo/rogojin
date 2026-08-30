@@ -1,4 +1,4 @@
-package accountsqlite
+package sqlite
 
 import (
 	"context"
@@ -12,35 +12,24 @@ import (
 	"github.com/ntakezo/rogojin/accounts"
 )
 
-// satisfiesRepositoryPort fails to compile if SQLite drifts from the persistence port it exists to implement.
-var _ accounts.Repository = (*SQLite)(nil)
+// satisfiesRepositoryPort fails to compile if Accounts drifts from the persistence port it exists to implement.
+var _ accounts.Repository = (*Accounts)(nil)
 
-// newTestRepo opens a SQLite repository backed by a fresh temp-file database.
-func newTestRepo(t *testing.T) *SQLite {
+// newTestAccounts opens the accounts store on a fresh temp-file database.
+func newTestAccounts(t *testing.T) accounts.Repository {
 	t.Helper()
-	dsn := filepath.Join(t.TempDir(), "accounts.db")
-	repo, err := NewSQLite(dsn)
+	repo, err := NewAccounts(openTestDB(t))
 	if err != nil {
-		t.Fatalf("NewSQLite: %v", err)
+		t.Fatalf("NewAccounts: %v", err)
 	}
-	t.Cleanup(func() { repo.Close() })
 	return repo
 }
 
-func mustJSON(t *testing.T, v any) json.RawMessage {
-	t.Helper()
-	raw, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	return raw
-}
-
-// TestSaveListRoundTrip verifies every field — the lock owner and
+// TestAccountsSaveListRoundTrip verifies every field — the lock owner and
 // the workflow's own JSON — survives storage, because lock reclamation and
 // login both read them back verbatim.
-func TestSaveListRoundTrip(t *testing.T) {
-	repo := newTestRepo(t)
+func TestAccountsSaveListRoundTrip(t *testing.T) {
+	repo := newTestAccounts(t)
 	ctx := context.Background()
 
 	locked := accounts.Account{
@@ -86,11 +75,11 @@ func TestSaveListRoundTrip(t *testing.T) {
 	}
 }
 
-// TestFieldsAreOpaqueToTheSchema verifies the point of the JSON column: two
+// TestAccountsFieldsAreOpaqueToTheSchema verifies the point of the JSON column: two
 // workflows with unrelated account shapes share one table and one migration
 // history.
-func TestFieldsAreOpaqueToTheSchema(t *testing.T) {
-	repo := newTestRepo(t)
+func TestAccountsFieldsAreOpaqueToTheSchema(t *testing.T) {
+	repo := newTestAccounts(t)
 	ctx := context.Background()
 
 	type checkout struct {
@@ -132,10 +121,10 @@ func TestFieldsAreOpaqueToTheSchema(t *testing.T) {
 	}
 }
 
-// TestSaveRejectsFieldsThatAreNotJSON verifies a bad payload is refused at the
+// TestAccountsSaveRejectsFieldsThatAreNotJSON verifies a bad payload is refused at the
 // write, not discovered as a decode failure inside a later run.
-func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
-	repo := newTestRepo(t)
+func TestAccountsSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
+	repo := newTestAccounts(t)
 	ctx := context.Background()
 
 	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: json.RawMessage("not json")}); err == nil {
@@ -150,10 +139,10 @@ func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
 	}
 }
 
-// TestSavePreservesCreatedAt verifies a lock, an unlock, or a stat update does
+// TestAccountsSavePreservesCreatedAt verifies a lock, an unlock, or a stat update does
 // not get to revise when the account was added.
-func TestSavePreservesCreatedAt(t *testing.T) {
-	repo := newTestRepo(t)
+func TestAccountsSavePreservesCreatedAt(t *testing.T) {
+	repo := newTestAccounts(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
@@ -178,10 +167,10 @@ func TestSavePreservesCreatedAt(t *testing.T) {
 	}
 }
 
-// TestDeleteIsIdempotent verifies deleting an absent row is not an error, so a
+// TestAccountsDeleteIsIdempotent verifies deleting an absent row is not an error, so a
 // manager cleaning up after a partial failure can retry.
-func TestDeleteIsIdempotent(t *testing.T) {
-	repo := newTestRepo(t)
+func TestAccountsDeleteIsIdempotent(t *testing.T) {
+	repo := newTestAccounts(t)
 	ctx := context.Background()
 
 	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}}); err != nil {
@@ -202,10 +191,10 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestGroupRoundTrip verifies groups persist with their strategy — normally
+// TestAccountsGroupRoundTrip verifies groups persist with their strategy — normally
 // the empty string, resolving to round robin — and their timestamps.
-func TestGroupRoundTrip(t *testing.T) {
-	repo := newTestRepo(t)
+func TestAccountsGroupRoundTrip(t *testing.T) {
+	repo := newTestAccounts(t)
 	ctx := context.Background()
 
 	created := time.Now().UTC().Truncate(time.Millisecond)
@@ -236,11 +225,11 @@ func TestGroupRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAdoptsAPreLedgerDatabase verifies the upgrade path for a database written
+// TestAccountsAdoptsAPreLedgerDatabase verifies the upgrade path for a database written
 // before migrations were recorded in a ledger, when progress lived in the
 // file-header counter. Its rows must survive and its schema must not be
 // re-migrated, since the store is opened by the same code on every start.
-func TestAdoptsAPreLedgerDatabase(t *testing.T) {
+func TestAccountsAdoptsAPreLedgerDatabase(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "accounts.db")
 	ctx := context.Background()
 
@@ -250,7 +239,7 @@ func TestAdoptsAPreLedgerDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open raw: %v", err)
 	}
-	for _, m := range migrations[:2] {
+	for _, m := range accountMigrations[:2] {
 		if _, err := raw.Exec(m.SQL); err != nil {
 			t.Fatalf("seed %s: %v", m.Name, err)
 		}
@@ -265,11 +254,12 @@ func TestAdoptsAPreLedgerDatabase(t *testing.T) {
 		t.Fatalf("close raw: %v", err)
 	}
 
-	repo, err := NewSQLite(dsn)
+	repoDB := openAt(t, dsn)
+	repo, err := NewAccounts(repoDB)
 	if err != nil {
 		t.Fatalf("open a pre-ledger database: %v", err)
 	}
-	defer repo.Close()
+	defer repoDB.Close()
 
 	listed, err := repo.List(ctx)
 	if err != nil {
@@ -283,28 +273,30 @@ func TestAdoptsAPreLedgerDatabase(t *testing.T) {
 	}
 }
 
-// TestSchemaReopensCleanly verifies the migration counter holds: a second open
+// TestAccountsSchemaReopensCleanly verifies the migration counter holds: a second open
 // of the same file applies nothing and loses nothing.
-func TestSchemaReopensCleanly(t *testing.T) {
+func TestAccountsSchemaReopensCleanly(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "accounts.db")
 	ctx := context.Background()
 
-	first, err := NewSQLite(dsn)
+	firstDB := openAt(t, dsn)
+	first, err := NewAccounts(firstDB)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
 	if err := first.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: mustJSON(t, map[string]string{"email": "a@b.c"})}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if err := first.Close(); err != nil {
+	if err := firstDB.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	second, err := NewSQLite(dsn)
+	secondDB := openAt(t, dsn)
+	second, err := NewAccounts(secondDB)
 	if err != nil {
 		t.Fatalf("second open: %v", err)
 	}
-	defer second.Close()
+	defer secondDB.Close()
 
 	listed, err := second.List(ctx)
 	if err != nil {

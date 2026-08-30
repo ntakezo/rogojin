@@ -1,4 +1,4 @@
-package sqlitemigrate
+package sqlite
 
 import (
 	"database/sql"
@@ -9,16 +9,16 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// openDB opens a fresh temp-file database with the single-connection setting the
-// real repositories use, so tests exercise migrations the way production does.
-func openDB(t *testing.T) *sql.DB {
+// openRawDB opens a fresh temp-file database on a bare *sql.DB, with the
+// single-connection setting Open uses, so tests exercise migrations the way production does.
+func openRawDB(t *testing.T) *sql.DB {
 	t.Helper()
-	return openAt(t, filepath.Join(t.TempDir(), "m.db"))
+	return openRawAt(t, filepath.Join(t.TempDir(), "m.db"))
 }
 
-// openAt opens a named database, so a test can point two stores at one file or
+// openRawAt opens a named database, so a test can point two stores at one file or
 // close and reopen the same one.
-func openAt(t *testing.T, dsn string) *sql.DB {
+func openRawAt(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
@@ -50,13 +50,13 @@ func version(t *testing.T, db *sql.DB) int {
 
 // twoSteps is a representative history: create a table, then add a column — the
 // same shape as the tasks store's real output migration.
-var twoSteps = []Migration{
+var twoSteps = []migration{
 	{Name: "create t", SQL: `CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)`},
 	{Name: "add col", SQL: `ALTER TABLE t ADD COLUMN extra TEXT`},
 }
 
 // otherSteps is a second store's unrelated history, for the shared-file tests.
-var otherSteps = []Migration{
+var otherSteps = []migration{
 	{Name: "create u", SQL: `CREATE TABLE IF NOT EXISTS u (id TEXT PRIMARY KEY)`},
 }
 
@@ -64,8 +64,8 @@ var otherSteps = []Migration{
 // in order and ends recorded at the latest version, so a new install lands on the
 // current schema in a single open.
 func TestRunAppliesAllOnFreshDatabase(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "main", twoSteps); err != nil {
+	db := openRawDB(t)
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := recorded(t, db, "main"); got != 2 {
@@ -81,8 +81,8 @@ func TestRunAppliesAllOnFreshDatabase(t *testing.T) {
 // counter: each row carries the step's name and when it ran, which is what makes
 // a database's schema state legible without diffing tables.
 func TestLedgerRecordsNames(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "main", twoSteps); err != nil {
+	db := openRawDB(t)
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -114,11 +114,11 @@ func TestLedgerRecordsNames(t *testing.T) {
 // column), proving applied steps are skipped rather than repeated — the property
 // that makes it safe to call on every open.
 func TestRunIsIdempotent(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "main", twoSteps); err != nil {
+	db := openRawDB(t)
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
-	if err := Run(db, "main", twoSteps); err != nil {
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("second Run must be a no-op, got: %v", err)
 	}
 	if got := recorded(t, db, "main"); got != 2 {
@@ -130,8 +130,8 @@ func TestRunIsIdempotent(t *testing.T) {
 // ones run, so an upgrade applies exactly the new steps and never re-touches
 // already-applied ones.
 func TestRunResumesFromPartialHistory(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "main", twoSteps[:1]); err != nil {
+	db := openRawDB(t)
+	if err := migrate(db, "main", twoSteps[:1]); err != nil {
 		t.Fatalf("Run of the first step: %v", err)
 	}
 	if got := recorded(t, db, "main"); got != 1 {
@@ -140,7 +140,7 @@ func TestRunResumesFromPartialHistory(t *testing.T) {
 
 	// The upgrade ships a second step; only that one may run, since re-running
 	// the ALTER would fail as a duplicate column.
-	if err := Run(db, "main", twoSteps); err != nil {
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("Run after the upgrade: %v", err)
 	}
 	if got := recorded(t, db, "main"); got != 2 {
@@ -148,16 +148,16 @@ func TestRunResumesFromPartialHistory(t *testing.T) {
 	}
 }
 
-// TestRunRollsBackFailedMigration verifies a failing migration leaves the ledger
+// TestRunRollsBackFailedmigration verifies a failing migration leaves the ledger
 // unchanged and its effects rolled back, so a botched step can be fixed and
 // retried from a clean point instead of leaving a half-applied schema.
-func TestRunRollsBackFailedMigration(t *testing.T) {
-	db := openDB(t)
-	steps := []Migration{
+func TestRunRollsBackFailedmigration(t *testing.T) {
+	db := openRawDB(t)
+	steps := []migration{
 		{Name: "good", SQL: `CREATE TABLE good (id TEXT)`},
 		{Name: "bad", SQL: `CREATE TABLE good (id TEXT)`}, // re-creating the table fails
 	}
-	if err := Run(db, "main", steps); err == nil {
+	if err := migrate(db, "main", steps); err == nil {
 		t.Fatal("Run: want error from duplicate table, got nil")
 	}
 	// The first migration committed at version 1; the failed second did not record.
@@ -170,12 +170,12 @@ func TestRunRollsBackFailedMigration(t *testing.T) {
 // knows is refused rather than silently operated on, because older code must not
 // run against a schema from a future version.
 func TestRunRejectsNewerDatabase(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "main", twoSteps); err != nil {
+	db := openRawDB(t)
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	// Older code, shipping only the first of the two steps it later grew.
-	err := Run(db, "main", twoSteps[:1])
+	err := migrate(db, "main", twoSteps[:1])
 	if err == nil {
 		t.Fatal("Run: want error for a newer database, got nil")
 	}
@@ -188,15 +188,15 @@ func TestRunRejectsNewerDatabase(t *testing.T) {
 // refused. Resuming from a plain count would treat the hole as applied and skip
 // it forever, so the gap has to stop the open instead.
 func TestRunRejectsGappedHistory(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "main", twoSteps); err != nil {
+	db := openRawDB(t)
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if _, err := db.Exec(`DELETE FROM schema_migrations WHERE store = 'main' AND version = 1`); err != nil {
 		t.Fatalf("punch a hole: %v", err)
 	}
 
-	err := Run(db, "main", twoSteps)
+	err := migrate(db, "main", twoSteps)
 	if err == nil {
 		t.Fatal("Run: want error for a gapped history, got nil")
 	}
@@ -210,11 +210,11 @@ func TestRunRejectsGappedHistory(t *testing.T) {
 // the other's progress as its own. Under the old per-file counter the second
 // store found it already advanced and created no tables at all.
 func TestStoresShareOneFile(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "first", twoSteps); err != nil {
+	db := openRawDB(t)
+	if err := migrate(db, "first", twoSteps); err != nil {
 		t.Fatalf("first store: %v", err)
 	}
-	if err := Run(db, "second", otherSteps); err != nil {
+	if err := migrate(db, "second", otherSteps); err != nil {
 		t.Fatalf("second store: %v", err)
 	}
 
@@ -236,14 +236,14 @@ func TestStoresShareOneFile(t *testing.T) {
 // TestSharedFileUpgradesIndependently verifies a shared file lets one store grow
 // its schema without disturbing the other's recorded history.
 func TestSharedFileUpgradesIndependently(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "first", twoSteps[:1]); err != nil {
+	db := openRawDB(t)
+	if err := migrate(db, "first", twoSteps[:1]); err != nil {
 		t.Fatalf("first store: %v", err)
 	}
-	if err := Run(db, "second", otherSteps); err != nil {
+	if err := migrate(db, "second", otherSteps); err != nil {
 		t.Fatalf("second store: %v", err)
 	}
-	if err := Run(db, "first", twoSteps); err != nil {
+	if err := migrate(db, "first", twoSteps); err != nil {
 		t.Fatalf("first store upgrade: %v", err)
 	}
 
@@ -260,7 +260,7 @@ func TestSharedFileUpgradesIndependently(t *testing.T) {
 // re-migrated. Re-running its ALTER would fail as a duplicate column, so a clean
 // open is the proof the counter was honored.
 func TestAdoptsPreLedgerDatabase(t *testing.T) {
-	db := openDB(t)
+	db := openRawDB(t)
 	// Hand-build the pre-ledger state: both steps applied, counter at 2, no ledger.
 	for _, m := range twoSteps {
 		if _, err := db.Exec(m.SQL); err != nil {
@@ -271,7 +271,7 @@ func TestAdoptsPreLedgerDatabase(t *testing.T) {
 		t.Fatalf("seed counter: %v", err)
 	}
 
-	if err := Run(db, "main", twoSteps); err != nil {
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("Run on a pre-ledger database: %v", err)
 	}
 	if got := recorded(t, db, "main"); got != 2 {
@@ -282,7 +282,7 @@ func TestAdoptsPreLedgerDatabase(t *testing.T) {
 	if got := version(t, db); got != 0 {
 		t.Fatalf("user_version = %d, want it cleared after adoption", got)
 	}
-	if err := Run(db, "second", otherSteps); err != nil {
+	if err := migrate(db, "second", otherSteps); err != nil {
 		t.Fatalf("second store joining an adopted file: %v", err)
 	}
 	if _, err := db.Exec(`INSERT INTO u (id) VALUES ('a')`); err != nil {
@@ -293,7 +293,7 @@ func TestAdoptsPreLedgerDatabase(t *testing.T) {
 // TestAdoptsPartiallyMigratedDatabase verifies adoption carries a counter that
 // stops short of the current schema, and that the remaining steps then run.
 func TestAdoptsPartiallyMigratedDatabase(t *testing.T) {
-	db := openDB(t)
+	db := openRawDB(t)
 	if _, err := db.Exec(twoSteps[0].SQL); err != nil {
 		t.Fatalf("seed table: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestAdoptsPartiallyMigratedDatabase(t *testing.T) {
 		t.Fatalf("seed counter: %v", err)
 	}
 
-	if err := Run(db, "main", twoSteps); err != nil {
+	if err := migrate(db, "main", twoSteps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := recorded(t, db, "main"); got != 2 {
@@ -318,12 +318,12 @@ func TestAdoptsPartiallyMigratedDatabase(t *testing.T) {
 // intact is the point: the store that actually owns the file must still be able
 // to adopt it afterwards.
 func TestAdoptionRefusesAForeignCounter(t *testing.T) {
-	db := openDB(t)
+	db := openRawDB(t)
 	if _, err := db.Exec(`PRAGMA user_version = 8`); err != nil {
 		t.Fatalf("seed counter: %v", err)
 	}
 
-	if err := Run(db, "main", twoSteps); err == nil {
+	if err := migrate(db, "main", twoSteps); err == nil {
 		t.Fatal("Run: want a foreign counter to be refused, got nil")
 	}
 	if got := version(t, db); got != 8 {
@@ -334,11 +334,11 @@ func TestAdoptionRefusesAForeignCounter(t *testing.T) {
 	}
 
 	// The store that owns the file — eight migrations deep — still adopts it.
-	owner := make([]Migration, 8)
+	owner := make([]migration, 8)
 	for i := range owner {
-		owner[i] = Migration{Name: "step", SQL: `SELECT 1`}
+		owner[i] = migration{Name: "step", SQL: `SELECT 1`}
 	}
-	if err := Run(db, "owner", owner); err != nil {
+	if err := migrate(db, "owner", owner); err != nil {
 		t.Fatalf("the owning store must still adopt: %v", err)
 	}
 	if got := recorded(t, db, "owner"); got != 8 {
@@ -349,8 +349,8 @@ func TestAdoptionRefusesAForeignCounter(t *testing.T) {
 // TestRunRequiresAStoreName verifies the key every row is filed under cannot be
 // empty, since an unnamed store would collide with the next one.
 func TestRunRequiresAStoreName(t *testing.T) {
-	db := openDB(t)
-	if err := Run(db, "", twoSteps); err == nil {
+	db := openRawDB(t)
+	if err := migrate(db, "", twoSteps); err == nil {
 		t.Fatal("Run: want an empty store name to be refused, got nil")
 	}
 }
@@ -359,16 +359,16 @@ func TestRunRequiresAStoreName(t *testing.T) {
 // applies nothing and keeps what it recorded.
 func TestLedgerSurvivesReopen(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "m.db")
-	first := openAt(t, dsn)
-	if err := Run(first, "main", twoSteps); err != nil {
+	first := openRawAt(t, dsn)
+	if err := migrate(first, "main", twoSteps); err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
 	if err := first.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	second := openAt(t, dsn)
-	if err := Run(second, "main", twoSteps); err != nil {
+	second := openRawAt(t, dsn)
+	if err := migrate(second, "main", twoSteps); err != nil {
 		t.Fatalf("Run after reopen: %v", err)
 	}
 	if got := recorded(t, second, "main"); got != 2 {
