@@ -1,14 +1,18 @@
 package proxies
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ntakezo/rogojin/leasing"
+)
 
 // TestBayesianPrefersProvenProxy verifies Thompson sampling overwhelmingly
 // picks the proxy with the dominant success history, because exploiting
 // known-good proxies is the point of the strategy.
 func TestBayesianPrefersProvenProxy(t *testing.T) {
 	b := NewBayesian(WithSeed(42))
-	good := Proxy{ID: "good", Successes: 100, Failures: 1}
-	bad := Proxy{ID: "bad", Successes: 1, Failures: 100}
+	good := Proxy{Resource: leasing.Resource{ID: "good"}, Successes: 100, Failures: 1}
+	bad := Proxy{Resource: leasing.Resource{ID: "bad"}, Successes: 1, Failures: 100}
 
 	counts := map[string]int{}
 	for i := range 1000 {
@@ -27,8 +31,8 @@ func TestBayesianPrefersProvenProxy(t *testing.T) {
 // starved, because exploration is what discovers proxy quality in the first place.
 func TestBayesianExploresUnproven(t *testing.T) {
 	b := NewBayesian(WithSeed(42))
-	a := Proxy{ID: "a"}
-	c := Proxy{ID: "c"}
+	a := Proxy{Resource: leasing.Resource{ID: "a"}}
+	c := Proxy{Resource: leasing.Resource{ID: "c"}}
 
 	counts := map[string]int{}
 	for i := range 1000 {

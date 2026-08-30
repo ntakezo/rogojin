@@ -11,6 +11,9 @@ import (
 {{- end}}{{end}}
 
 	"github.com/ntakezo/rogojin/comms"
+{{- if .Proxy}}{{if not .ProxyPersist}}
+	"github.com/ntakezo/rogojin/leasing"
+{{- end}}{{end}}
 {{- if and .Proxy .ProxyPersist}}
 	"github.com/ntakezo/rogojin/persistence/proxysqlite"
 {{- end}}
@@ -47,7 +50,7 @@ func main() {
 	// An in-memory proxy pool to get started. Seed it with real proxies, or
 	// swap in proxysqlite for a durable pool.
 	proxyRepo := newMemProxyRepo(
-		proxies.Proxy{ID: "proxy-1", Attrs: proxies.Attrs{URL: "http://127.0.0.1:8080"}},
+		proxies.Proxy{Resource: leasing.Resource{ID: "proxy-1"}, URL: "http://127.0.0.1:8080"},
 	)
 {{- end}}
 
@@ -74,14 +77,14 @@ func main() {
 	// deleting a task frees its lock, and repointing one drops the lock its new
 	// placement no longer fits. Nothing else ever clears them. Add a second kind
 	// the same way.
-	svc := tasks.NewService({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
+	svc := tasks.NewManager({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
 		tasks.WithResource("proxy", manager))
 
 	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New(manager)); err != nil {
 		log.Fatal(err)
 	}
 {{- else}}
-	svc := tasks.NewService({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus())
+	svc := tasks.NewManager({{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus())
 
 	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New()); err != nil {
 		log.Fatal(err)

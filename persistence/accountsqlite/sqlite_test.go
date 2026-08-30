@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"github.com/ntakezo/rogojin/leasing"
 	"path/filepath"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 	return raw
 }
 
-// TestSaveListRoundTrip verifies every field — the lock owner, the stats, and
+// TestSaveListRoundTrip verifies every field — the lock owner and
 // the workflow's own JSON — survives storage, because lock reclamation and
 // login both read them back verbatim.
 func TestSaveListRoundTrip(t *testing.T) {
@@ -43,20 +44,14 @@ func TestSaveListRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	locked := accounts.Account{
-		ID:      "a1",
-		GroupID: "site",
-		OwnerID: "t1",
-		Attrs: accounts.Attrs{
-			EmailID: "inbox-1",
-			Fields: mustJSON(t, map[string]string{
-				"email":    "buyer@example.com",
-				"password": "hunter2",
-			}),
-		},
-		Successes: 3,
-		Failures:  2,
+		Resource: leasing.Resource{ID: "a1", GroupID: "site", OwnerID: "t1"},
+		EmailID:  "inbox-1",
+		Fields: mustJSON(t, map[string]string{
+			"email":    "buyer@example.com",
+			"password": "hunter2",
+		}),
 	}
-	free := accounts.Account{ID: "a2", GroupID: "site", MaxHolders: 2}
+	free := accounts.Account{Resource: leasing.Resource{ID: "a2", GroupID: "site", MaxHolders: 2}}
 	if err := repo.Save(ctx, locked); err != nil {
 		t.Fatalf("save locked: %v", err)
 	}
@@ -74,20 +69,20 @@ func TestSaveListRoundTrip(t *testing.T) {
 	if listed[0].ID != "a1" || listed[1].ID != "a2" {
 		t.Fatalf("order = %s, %s; want a1, a2", listed[0].ID, listed[1].ID)
 	}
-	if got := listed[0]; got.OwnerID != "t1" || got.Successes != 3 || got.Failures != 2 || got.GroupID != "site" {
+	if got := listed[0]; got.OwnerID != "t1" || got.GroupID != "site" {
 		t.Fatalf("a1 round-trip: got %+v", got)
 	}
-	if string(listed[0].Attrs.Fields) != string(locked.Attrs.Fields) {
-		t.Fatalf("fields = %s, want %s", listed[0].Attrs.Fields, locked.Attrs.Fields)
+	if string(listed[0].Fields) != string(locked.Fields) {
+		t.Fatalf("fields = %s, want %s", listed[0].Fields, locked.Fields)
 	}
-	if listed[0].Attrs.EmailID != "inbox-1" {
-		t.Fatalf("email_id = %q, want the forwarding inbox inbox-1", listed[0].Attrs.EmailID)
+	if listed[0].EmailID != "inbox-1" {
+		t.Fatalf("email_id = %q, want the forwarding inbox inbox-1", listed[0].EmailID)
 	}
 	if listed[1].MaxHolders != 2 {
 		t.Fatalf("a2 max holders = %d, want 2", listed[1].MaxHolders)
 	}
-	if listed[1].Attrs.Fields != nil || listed[1].Attrs.EmailID != "" {
-		t.Fatalf("a2 attrs = %+v, want none", listed[1].Attrs)
+	if listed[1].Fields != nil || listed[1].EmailID != "" {
+		t.Fatalf("a2 = %+v, want no email and no fields", listed[1])
 	}
 }
 
@@ -110,10 +105,10 @@ func TestFieldsAreOpaqueToTheSchema(t *testing.T) {
 	wantCheckout := checkout{Email: "buyer@example.com", Card: "4111"}
 	wantForum := forum{Handle: "ada", Token: "t0k", Boards: []string{"a", "b"}}
 
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", Attrs: accounts.Attrs{Fields: mustJSON(t, wantCheckout)}}); err != nil {
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: mustJSON(t, wantCheckout)}); err != nil {
 		t.Fatalf("save checkout account: %v", err)
 	}
-	if err := repo.Save(ctx, accounts.Account{ID: "a2", Attrs: accounts.Attrs{Fields: mustJSON(t, wantForum)}}); err != nil {
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a2"}, Fields: mustJSON(t, wantForum)}); err != nil {
 		t.Fatalf("save forum account: %v", err)
 	}
 
@@ -143,7 +138,7 @@ func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", Attrs: accounts.Attrs{Fields: json.RawMessage("not json")}}); err == nil {
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: json.RawMessage("not json")}); err == nil {
 		t.Fatal("expected invalid JSON fields to be refused")
 	}
 	listed, err := repo.List(ctx)
@@ -162,12 +157,12 @@ func TestSavePreservesCreatedAt(t *testing.T) {
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", CreatedAt: created, UpdatedAt: created}); err != nil {
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", CreatedAt: created, UpdatedAt: created}}); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 
 	updated := time.Now().UTC().Truncate(time.Millisecond)
-	if err := repo.Save(ctx, accounts.Account{ID: "a1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}); err != nil {
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}}); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
 
@@ -189,7 +184,7 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, accounts.Account{ID: "a1"}); err != nil {
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := repo.Delete(ctx, "a1"); err != nil {
@@ -283,7 +278,7 @@ func TestAdoptsAPreLedgerDatabase(t *testing.T) {
 	if len(listed) != 1 || listed[0].ID != "a1" {
 		t.Fatalf("got %+v, want the row the old database held", listed)
 	}
-	if err := repo.Save(ctx, accounts.Account{ID: "a2"}); err != nil {
+	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a2"}}); err != nil {
 		t.Fatalf("save after adoption: %v", err)
 	}
 }
@@ -298,7 +293,7 @@ func TestSchemaReopensCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := first.Save(ctx, accounts.Account{ID: "a1", Attrs: accounts.Attrs{Fields: mustJSON(t, map[string]string{"email": "a@b.c"})}}); err != nil {
+	if err := first.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: mustJSON(t, map[string]string{"email": "a@b.c"})}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := first.Close(); err != nil {

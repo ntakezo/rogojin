@@ -12,72 +12,74 @@ import (
 	"github.com/ntakezo/rogojin/workflows"
 )
 
-// A Record is the durable shape of one task: its workflow, its placement (task
-// group, plus a per-kind resource assignment), its last-checkpointed status and
-// resume state, and the snapshot taken there. A kind absent from Assignments
-// inherits the task group's assignment for that kind; see Assignment for what
-// a stored one means. Status holds the lifecycle as of the last checkpoint or,
-// once the run exits, the terminal outcome. The framework never deletes a
-// record on its own.
-type Record struct {
-	ID          string                `json:"id"`
-	WorkflowID  string                `json:"workflowId"`
-	GroupID     string                `json:"groupId"`
-	Assignments map[string]Assignment `json:"assignments,omitempty"`
-	State       string                `json:"state"`
-	Snapshot    []byte                `json:"snapshot,omitempty"`
-	Status      string                `json:"status"`
-	// Output is the workflow's result, persisted when the run completes cleanly;
-	// nil for tasks that have not finished or produce no output.
-	Output    []byte    `json:"output,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+// ResourceManager is the lock surface this manager drives per registered kind:
+// Unlock frees a deleted task's durable lock, and ReleaseStaleLock drops a
+// repointed task's when its new placement no longer fits. Every
+// *leasing.Manager satisfies it, whatever model it is over.
+//
+// Both calls run while the manager holds its task registry lock. That is safe
+// because a leasing manager never calls back into this package — it decides
+// everything from the leases and locks it owns.
+type ResourceManager interface {
+	Unlock(ctx context.Context, taskID string) error
+	ReleaseStaleLock(ctx context.Context, a leasing.Assignment) error
 }
 
-// Repository is the persistence port the consumer implements: a dumb store of
-// task records and task groups with no liveness logic (the service infers
-// running tasks via IsRunning). Implementations must refresh the record's
-// UpdatedAt on every write, including checkpoints and terminal stamps. A nil
-// Repository is allowed and selects purely in-memory operation — see
-// NewService.
-type Repository interface {
-	CreateTask(ctx context.Context, record Record) error
-	SaveCheckpoint(ctx context.Context, id string, status string, state string, snapshot []byte) error
-	MarkTerminal(ctx context.Context, id string, outcome string, output []byte) error
-	RecoverTask(ctx context.Context, id string) (Record, error)
-	// SaveAssignment repoints a task's placement for one kind, leaving every
-	// other kind and the rest of the record untouched. A nil field clears the
-	// stored value.
-	SaveAssignment(ctx context.Context, id string, kind string, assignment Assignment) error
-	RecoverAll(ctx context.Context) ([]Record, error)
-	DeleteTask(ctx context.Context, id string) error
-	SaveGroup(ctx context.Context, group Group) error
-	// GetGroup reports the group and whether it exists, so a missing group is
-	// not conflated with a store failure.
-	GetGroup(ctx context.Context, id string) (Group, bool, error)
-	ListGroups(ctx context.Context) ([]Group, error)
-	DeleteGroup(ctx context.Context, id string) error
-	// TasksInGroup returns the ids of every task in the group.
-	TasksInGroup(ctx context.Context, groupID string) ([]string, error)
+// An Option configures a Manager at construction.
+type Option func(*manager)
+
+// WithResource registers one resource kind's leasing manager, which is the
+// whole of that wiring:
+//
+//	tasks.WithResource("proxy", manager)
+//
+// Deleting a task then unlocks the kind, and repointing one drops only the
+// lock its new placement no longer fits. Register every kind whose locks
+// outlive the process. A kind left unregistered still places tasks, but
+// nothing ever frees its locks: deleting a task strands the resource it held,
+// and repointing one leaves it leasing what it was moved off, since a binding
+// outranks the group.
+//
+// It panics on a nil manager and on a kind registered twice, which could only
+// unlock it twice.
+func WithResource(kind string, rm ResourceManager) Option {
+	return func(m *manager) {
+		if rm == nil {
+			panic(fmt.Sprintf("tasks: resource kind %q registered with a nil manager", kind))
+		}
+		for _, r := range m.resources {
+			if r.kind == kind {
+				panic(fmt.Sprintf("tasks: resource kind %q registered twice", kind))
+			}
+		}
+		m.resources = append(m.resources, resource{kind: kind, manager: rm})
+	}
 }
 
-// A Service registers workflows and creates, recovers, groups, and deletes
+// a resource is one registered kind's manager, kept in registration order so a
+// failure names its kinds the same way every run.
+type resource struct {
+	kind    string
+	manager ResourceManager
+}
+
+// A Manager registers workflows and creates, recovers, groups, and deletes
 // their tasks.
-type Service interface {
+type Manager interface {
 	// RegisterWorkflow makes workflow available under id for task creation.
 	RegisterWorkflow(id string, workflow workflows.Workflow) error
-	// CreateTask validates input and returns a new unstarted Task of the
+	// CreateTask validates input and returns a new unstarted Handle of the
 	// workflow, placed by opts (the global group, inheriting its resource
 	// assignments, when none are given).
-	CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (Task, error)
+	CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (Handle, error)
 	// RecoverTask rehydrates a persisted task and returns it unstarted, or the
 	// live task if it is already running. A task that never checkpointed is
 	// returned but cannot be started; its Start fails with ErrNoCheckpoint.
-	RecoverTask(ctx context.Context, id string) (Task, error)
+	RecoverTask(ctx context.Context, id string) (Handle, error)
 	// RecoverAll rehydrates every persisted task and returns them unstarted,
 	// terminal ones included. The caller decides what to Start; terminal tasks
 	// recover for inspection only, and their Start fails with ErrAlreadyTerminal.
-	RecoverAll(ctx context.Context) ([]Task, error)
+	RecoverAll(ctx context.Context) ([]Handle, error)
 	// DeleteTask removes a task from the registry and the repository, releasing
 	// its external resources first. It refuses a running task.
 	DeleteTask(ctx context.Context, id string) error
@@ -100,10 +102,10 @@ type Service interface {
 	IsRunning(id string) bool
 }
 
-type service struct {
+type manager struct {
 	workflowRegistry map[string]workflows.Workflow
 
-	taskRegistry map[string]*task
+	taskRegistry map[string]*handle
 
 	repository Repository
 
@@ -115,16 +117,16 @@ type service struct {
 	taskRegistryMu     sync.RWMutex
 }
 
-// NewService returns a Service that persists tasks in repository and injects
+// NewManager returns a Manager that persists tasks in repository and injects
 // bus into each task's workflow instance. A nil repository selects purely
 // in-memory operation: tasks run without checkpoints, durable terminal stamps,
 // or stored groups, and there is nothing to recover after a restart. Use it
 // when durability and crash recovery are not needed.
-func NewService(repository Repository, bus comms.Bus, opts ...ServiceOption) Service {
-	s := &service{
+func NewManager(repository Repository, bus comms.Bus, opts ...Option) Manager {
+	s := &manager{
 		repository:       repository,
 		workflowRegistry: make(map[string]workflows.Workflow),
-		taskRegistry:     make(map[string]*task),
+		taskRegistry:     make(map[string]*handle),
 		bus:              bus,
 	}
 	for _, opt := range opts {
@@ -133,23 +135,23 @@ func NewService(repository Repository, bus comms.Bus, opts ...ServiceOption) Ser
 	return s
 }
 
-func (s *service) RegisterWorkflow(id string, workflow workflows.Workflow) error {
-	s.workflowRegistryMu.Lock()
-	defer s.workflowRegistryMu.Unlock()
+func (m *manager) RegisterWorkflow(id string, workflow workflows.Workflow) error {
+	m.workflowRegistryMu.Lock()
+	defer m.workflowRegistryMu.Unlock()
 
-	if s.workflowRegistry[id] != nil {
+	if m.workflowRegistry[id] != nil {
 		return errors.New("workflow already registered")
 	}
 
-	s.workflowRegistry[id] = workflow
+	m.workflowRegistry[id] = workflow
 	return nil
 }
 
-func (s *service) getWorkflow(id string) (workflows.Workflow, error) {
-	s.workflowRegistryMu.RLock()
-	defer s.workflowRegistryMu.RUnlock()
+func (m *manager) getWorkflow(id string) (workflows.Workflow, error) {
+	m.workflowRegistryMu.RLock()
+	defer m.workflowRegistryMu.RUnlock()
 
-	workflow, ok := s.workflowRegistry[id]
+	workflow, ok := m.workflowRegistry[id]
 	if !ok {
 		return nil, errors.New("workflow does not exist")
 	}
@@ -159,11 +161,11 @@ func (s *service) getWorkflow(id string) (workflows.Workflow, error) {
 // getGroup resolves a task group. The global group (and, with no repository,
 // any group) resolves to an implicit empty record when unstored; a missing
 // non-global group is an error.
-func (s *service) getGroup(ctx context.Context, id string) (Group, error) {
-	if s.repository == nil {
+func (m *manager) getGroup(ctx context.Context, id string) (Group, error) {
+	if m.repository == nil {
 		return Group{ID: id}, nil
 	}
-	group, found, err := s.repository.GetGroup(ctx, id)
+	group, found, err := m.repository.GetGroup(ctx, id)
 	if err != nil {
 		return Group{}, fmt.Errorf("failed to get task group %s: %w", id, err)
 	}
@@ -176,11 +178,11 @@ func (s *service) getGroup(ctx context.Context, id string) (Group, error) {
 	return Group{}, fmt.Errorf("task group %s does not exist", id)
 }
 
-func (s *service) CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (Task, error) {
-	s.taskRegistryMu.Lock()
-	defer s.taskRegistryMu.Unlock()
+func (m *manager) CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (Handle, error) {
+	m.taskRegistryMu.Lock()
+	defer m.taskRegistryMu.Unlock()
 
-	workflow, err := s.getWorkflow(workflowID)
+	workflow, err := m.getWorkflow(workflowID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workflow: %w", err)
 	}
@@ -189,21 +191,21 @@ func (s *service) CreateTask(ctx context.Context, workflowID string, input any, 
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	group, err := s.getGroup(ctx, cfg.groupID)
+	group, err := m.getGroup(ctx, cfg.groupID)
 	if err != nil {
 		return nil, err
 	}
 
-	task, err := createTask(workflow, input, s.bus, s.repository, resolveAll(cfg.assignments, group))
+	task, err := createHandle(workflow, input, m.bus, m.repository, resolveAll(cfg.assignments, group))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create task: %w", err)
 	}
 
 	// A nil repository is purely in-memory: skip persistence and keep the task
 	// only in the registry.
-	if s.repository != nil {
+	if m.repository != nil {
 		now := time.Now().UTC()
-		record := Record{
+		record := Task{
 			ID:          task.ID(),
 			WorkflowID:  workflowID,
 			GroupID:     cfg.groupID,
@@ -211,70 +213,70 @@ func (s *service) CreateTask(ctx context.Context, workflowID string, input any, 
 			CreatedAt:   now,
 			UpdatedAt:   now,
 		}
-		if err := s.repository.CreateTask(ctx, record); err != nil {
+		if err := m.repository.CreateTask(ctx, record); err != nil {
 			return nil, fmt.Errorf("failed to create task in repository: %w", err)
 		}
 	}
 
-	s.taskRegistry[task.ID()] = task
+	m.taskRegistry[task.ID()] = task
 
 	return task, nil
 }
 
-func (s *service) IsRunning(id string) bool {
-	s.taskRegistryMu.RLock()
-	defer s.taskRegistryMu.RUnlock()
+func (m *manager) IsRunning(id string) bool {
+	m.taskRegistryMu.RLock()
+	defer m.taskRegistryMu.RUnlock()
 
-	t, ok := s.taskRegistry[id]
+	t, ok := m.taskRegistry[id]
 	return ok && t.IsRunning()
 }
 
-func (s *service) RecoverTask(ctx context.Context, id string) (Task, error) {
-	s.taskRegistryMu.Lock()
-	defer s.taskRegistryMu.Unlock()
+func (m *manager) RecoverTask(ctx context.Context, id string) (Handle, error) {
+	m.taskRegistryMu.Lock()
+	defer m.taskRegistryMu.Unlock()
 
-	if existing, ok := s.taskRegistry[id]; ok && existing.IsRunning() {
+	if existing, ok := m.taskRegistry[id]; ok && existing.IsRunning() {
 		return existing, nil
 	}
 
 	// A nil repository has nothing durable to rehydrate from; fail loudly rather
 	// than dereference it or hand back a zero task.
-	if s.repository == nil {
+	if m.repository == nil {
 		return nil, errors.New("cannot recover task: no repository configured")
 	}
 
-	record, err := s.repository.RecoverTask(ctx, id)
+	record, err := m.repository.RecoverTask(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to recover task: %w", err)
 	}
 
-	group, err := s.getGroup(ctx, groupOf(record))
+	group, err := m.getGroup(ctx, groupOf(record))
 	if err != nil {
 		return nil, err
 	}
-	task, err := s.rehydrate(record, group)
+	task, err := m.rehydrate(record, group)
 	if err != nil {
 		return nil, err
 	}
 
-	s.taskRegistry[id] = task
+	m.taskRegistry[id] = task
 	return task, nil
 }
 
-func (s *service) RecoverAll(ctx context.Context) ([]Task, error) {
+func (m *manager) RecoverAll(ctx context.Context) ([]Handle, error) {
 	// A nil repository persists nothing, so there is nothing to recover; a
 	// startup recovery sweep stays a safe no-op in in-memory mode.
-	if s.repository == nil {
+	if m.repository == nil {
 		return nil, nil
 	}
 
-	records, err := s.repository.RecoverAll(ctx)
+	records, err := m.repository.RecoverAll(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to recover tasks: %w", err)
 	}
 	// Load the groups once: resolving each record's own would be a query per
 	// task against a store that serializes them.
-	listed, err := s.repository.ListGroups(ctx)
+	listed, err := m.repository.ListGroups(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list task groups: %w", err)
 	}
@@ -286,12 +288,12 @@ func (s *service) RecoverAll(ctx context.Context) ([]Task, error) {
 		groups[GlobalGroup] = Group{ID: GlobalGroup}
 	}
 
-	s.taskRegistryMu.Lock()
-	defer s.taskRegistryMu.Unlock()
+	m.taskRegistryMu.Lock()
+	defer m.taskRegistryMu.Unlock()
 
-	tasks := make([]Task, 0, len(records))
+	tasks := make([]Handle, 0, len(records))
 	for _, record := range records {
-		if existing, ok := s.taskRegistry[record.ID]; ok && existing.IsRunning() {
+		if existing, ok := m.taskRegistry[record.ID]; ok && existing.IsRunning() {
 			tasks = append(tasks, existing)
 			continue
 		}
@@ -300,18 +302,18 @@ func (s *service) RecoverAll(ctx context.Context) ([]Task, error) {
 		if !ok {
 			return nil, fmt.Errorf("failed to rehydrate task %s: task group %s does not exist", record.ID, groupOf(record))
 		}
-		task, err := s.rehydrate(record, group)
+		task, err := m.rehydrate(record, group)
 		if err != nil {
 			return nil, fmt.Errorf("failed to rehydrate task %s: %w", record.ID, err)
 		}
-		s.taskRegistry[record.ID] = task
+		m.taskRegistry[record.ID] = task
 		tasks = append(tasks, task)
 	}
 	return tasks, nil
 }
 
 // groupOf names the record's task group, defaulting a blank one to global.
-func groupOf(record Record) string {
+func groupOf(record Task) string {
 	if record.GroupID == "" {
 		return GlobalGroup
 	}
@@ -320,12 +322,12 @@ func groupOf(record Record) string {
 
 // rehydrate rebuilds an unstarted task from a persisted record, resolving its
 // workflow from the registry and its effective placement per kind.
-func (s *service) rehydrate(record Record, group Group) (*task, error) {
-	workflow, err := s.getWorkflow(record.WorkflowID)
+func (m *manager) rehydrate(record Task, group Group) (*handle, error) {
+	workflow, err := m.getWorkflow(record.WorkflowID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workflow for recovery: %w", err)
 	}
-	return rehydrateTask(workflow, record.ID, record.Snapshot, workflows.State(record.State), workflows.Status(record.Status), s.bus, s.repository, resolveAll(record.Assignments, group)), nil
+	return rehydrateHandle(workflow, record.ID, record.Snapshot, workflows.State(record.State), workflows.Status(record.Status), m.bus, m.repository, resolveAll(record.Assignments, group)), nil
 }
 
 // resolve settles one kind's placement: the task's own assignment wherever it
@@ -366,75 +368,75 @@ func resolveAll(assignments map[string]Assignment, group Group) map[string]workf
 // It refuses nothing. Reassigning a live task is legitimate and takes effect at
 // its next recovery, since a run is wired with its placement at start and keeps
 // the lease it already holds.
-func (s *service) AssignResource(ctx context.Context, id string, kind string, assignment Assignment) error {
-	s.taskRegistryMu.Lock()
-	defer s.taskRegistryMu.Unlock()
+func (m *manager) AssignResource(ctx context.Context, id string, kind string, assignment Assignment) error {
+	m.taskRegistryMu.Lock()
+	defer m.taskRegistryMu.Unlock()
 
-	if s.repository == nil {
+	if m.repository == nil {
 		return errors.New("cannot assign a resource: no repository configured")
 	}
-	record, err := s.repository.RecoverTask(ctx, id)
+	record, err := m.repository.RecoverTask(ctx, id)
 	if err != nil {
 		return fmt.Errorf("failed to load task %s: %w", id, err)
 	}
-	group, err := s.getGroup(ctx, groupOf(record))
+	group, err := m.getGroup(ctx, groupOf(record))
 	if err != nil {
 		return err
 	}
 
-	if err := s.repository.SaveAssignment(ctx, id, kind, assignment); err != nil {
+	if err := m.repository.SaveAssignment(ctx, id, kind, assignment); err != nil {
 		return fmt.Errorf("failed to assign %s placement of task %s: %w", kind, id, err)
 	}
-	manager := s.managerFor(kind)
-	if manager == nil {
+	rm := m.managerFor(kind)
+	if rm == nil {
 		return nil
 	}
 
 	// The manager is told the placement as resolved, not as stored: a nil group
 	// inherits the task group's, which is what the task will actually lease from.
 	resolved := resolve(assignment, group, kind)
-	if err := manager.ReleaseStaleLock(ctx, leasing.Assignment{TaskID: id, GroupID: resolved.GroupID, ResourceID: resolved.ResourceID}); err != nil {
+	if err := rm.ReleaseStaleLock(ctx, leasing.Assignment{TaskID: id, GroupID: resolved.GroupID, ResourceID: resolved.ResourceID}); err != nil {
 		return fmt.Errorf("failed to release the stale %s lock of task %s: %w", kind, id, err)
 	}
 	return nil
 }
 
-func (s *service) DeleteTask(ctx context.Context, id string) error {
-	s.taskRegistryMu.Lock()
-	defer s.taskRegistryMu.Unlock()
-	return s.deleteTaskLocked(ctx, id)
+func (m *manager) DeleteTask(ctx context.Context, id string) error {
+	m.taskRegistryMu.Lock()
+	defer m.taskRegistryMu.Unlock()
+	return m.deleteTaskLocked(ctx, id)
 }
 
 // deleteTaskLocked seals the task closed, frees its external resources, then
 // removes it from the registry and the repository. A release failure abandons
 // the deletion and reopens the task. Callers hold taskRegistryMu.
-func (s *service) deleteTaskLocked(ctx context.Context, id string) error {
-	t, known := s.taskRegistry[id]
+func (m *manager) deleteTaskLocked(ctx context.Context, id string) error {
+	t, known := m.taskRegistry[id]
 	if known && !t.seal() {
 		return errors.New("cannot delete a running task")
 	}
 
-	if err := s.releaseTask(ctx, id); err != nil {
+	if err := m.releaseTask(ctx, id); err != nil {
 		if known {
 			t.unseal()
 		}
 		return err
 	}
 
-	delete(s.taskRegistry, id)
-	if s.repository == nil {
+	delete(m.taskRegistry, id)
+	if m.repository == nil {
 		return nil
 	}
-	return s.repository.DeleteTask(ctx, id)
+	return m.repository.DeleteTask(ctx, id)
 }
 
 // releaseTask frees every registered kind's durable lock on the task. All of
 // them run even when one fails — a lock left held is unleasable forever, so
 // one broken store must not strand the locks the other managers would have
 // freed.
-func (s *service) releaseTask(ctx context.Context, id string) error {
+func (m *manager) releaseTask(ctx context.Context, id string) error {
 	var errs []error
-	for _, r := range s.resources {
+	for _, r := range m.resources {
 		if err := r.manager.Unlock(ctx, id); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", r.kind, err))
 		}
@@ -447,8 +449,8 @@ func (s *service) releaseTask(ctx context.Context, id string) error {
 
 // managerFor returns the registered manager for the kind, or nil when no
 // manager of that kind is wired.
-func (s *service) managerFor(kind string) ResourceManager {
-	for _, r := range s.resources {
+func (m *manager) managerFor(kind string) ResourceManager {
+	for _, r := range m.resources {
 		if r.kind == kind {
 			return r.manager
 		}
@@ -456,18 +458,18 @@ func (s *service) managerFor(kind string) ResourceManager {
 	return nil
 }
 
-func (s *service) CreateGroup(ctx context.Context, group Group) error {
+func (m *manager) CreateGroup(ctx context.Context, group Group) error {
 	if group.ID == "" {
 		return errors.New("task group id is required")
 	}
 	if group.ID == GlobalGroup {
 		return fmt.Errorf("task group %s exists implicitly", GlobalGroup)
 	}
-	if s.repository == nil {
+	if m.repository == nil {
 		return errors.New("cannot create task group: no repository configured")
 	}
 
-	if _, found, err := s.repository.GetGroup(ctx, group.ID); err != nil {
+	if _, found, err := m.repository.GetGroup(ctx, group.ID); err != nil {
 		return fmt.Errorf("failed to get task group %s: %w", group.ID, err)
 	} else if found {
 		return fmt.Errorf("task group %s already exists", group.ID)
@@ -475,21 +477,21 @@ func (s *service) CreateGroup(ctx context.Context, group Group) error {
 
 	now := time.Now().UTC()
 	group.CreatedAt, group.UpdatedAt = now, now
-	if err := s.repository.SaveGroup(ctx, group); err != nil {
+	if err := m.repository.SaveGroup(ctx, group); err != nil {
 		return fmt.Errorf("failed to save task group %s: %w", group.ID, err)
 	}
 	return nil
 }
 
-func (s *service) DeleteGroup(ctx context.Context, id string) error {
+func (m *manager) DeleteGroup(ctx context.Context, id string) error {
 	if id == GlobalGroup {
 		return fmt.Errorf("task group %s cannot be deleted", GlobalGroup)
 	}
-	if s.repository == nil {
+	if m.repository == nil {
 		return errors.New("cannot delete task group: no repository configured")
 	}
 
-	if _, found, err := s.repository.GetGroup(ctx, id); err != nil {
+	if _, found, err := m.repository.GetGroup(ctx, id); err != nil {
 		return fmt.Errorf("failed to get task group %s: %w", id, err)
 	} else if !found {
 		return fmt.Errorf("task group %s does not exist", id)
@@ -497,20 +499,20 @@ func (s *service) DeleteGroup(ctx context.Context, id string) error {
 
 	// Membership is read under the registry lock so a task created into the
 	// group mid-cascade cannot slip past the sweep.
-	s.taskRegistryMu.Lock()
-	defer s.taskRegistryMu.Unlock()
+	m.taskRegistryMu.Lock()
+	defer m.taskRegistryMu.Unlock()
 
-	ids, err := s.repository.TasksInGroup(ctx, id)
+	ids, err := m.repository.TasksInGroup(ctx, id)
 	if err != nil {
 		return fmt.Errorf("failed to list tasks of group %s: %w", id, err)
 	}
 
 	// Seal every member before touching anything. Start never goes through the
-	// service, so a plain is-it-running check would leave a member free to
+	// manager, so a plain is-it-running check would leave a member free to
 	// begin between the check and its deletion.
-	sealed := make([]*task, 0, len(ids))
+	sealed := make([]*handle, 0, len(ids))
 	for _, taskID := range ids {
-		t, known := s.taskRegistry[taskID]
+		t, known := m.taskRegistry[taskID]
 		if !known {
 			continue // never loaded here; nothing live to seal
 		}
@@ -525,26 +527,26 @@ func (s *service) DeleteGroup(ctx context.Context, id string) error {
 	// release failure abandons the cascade with the group still whole rather
 	// than with some members already destroyed.
 	for _, taskID := range ids {
-		if err := s.releaseTask(ctx, taskID); err != nil {
+		if err := m.releaseTask(ctx, taskID); err != nil {
 			unsealAll(sealed)
 			return fmt.Errorf("failed to delete task group %s: %w", id, err)
 		}
 	}
 
 	for _, taskID := range ids {
-		delete(s.taskRegistry, taskID)
-		if err := s.repository.DeleteTask(ctx, taskID); err != nil {
+		delete(m.taskRegistry, taskID)
+		if err := m.repository.DeleteTask(ctx, taskID); err != nil {
 			return fmt.Errorf("failed to delete task %s of group %s: %w", taskID, id, err)
 		}
 	}
-	if err := s.repository.DeleteGroup(ctx, id); err != nil {
+	if err := m.repository.DeleteGroup(ctx, id); err != nil {
 		return fmt.Errorf("failed to delete task group %s: %w", id, err)
 	}
 	return nil
 }
 
 // unsealAll reopens tasks sealed for a cascade that was abandoned.
-func unsealAll(tasks []*task) {
+func unsealAll(tasks []*handle) {
 	for _, t := range tasks {
 		t.unseal()
 	}

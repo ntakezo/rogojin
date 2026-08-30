@@ -108,7 +108,7 @@ func (s *SQLite) List(ctx context.Context) ([]proxies.Proxy, error) {
 	for rows.Next() {
 		var p proxies.Proxy
 		var created, updated string
-		if err := rows.Scan(&p.ID, &p.Attrs.URL, &p.GroupID, &p.OwnerID, &p.MaxHolders, &p.Successes, &p.Failures, &created, &updated); err != nil {
+		if err := rows.Scan(&p.ID, &p.URL, &p.GroupID, &p.OwnerID, &p.MaxHolders, &p.Successes, &p.Failures, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list proxies: %w", err)
 		}
 		if p.CreatedAt, err = parseTime(created); err != nil {
@@ -136,7 +136,7 @@ func (s *SQLite) Save(ctx context.Context, p proxies.Proxy) error {
 		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
 		 successes = excluded.successes, failures = excluded.failures,
 		 updated_at = excluded.updated_at`,
-		p.ID, p.Attrs.URL, p.GroupID, p.OwnerID, p.MaxHolders, p.Successes, p.Failures,
+		p.ID, p.URL, p.GroupID, p.OwnerID, p.MaxHolders, p.Successes, p.Failures,
 		formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save proxy %s: %w", p.ID, err)

@@ -98,7 +98,7 @@ type profile struct {
 // into the workflow's own shape at the point of use.
 func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	raw := json.RawMessage(`{"email":"a@b.c","password":"hunter2"}`)
-	repo := newFakeRepo(Account{ID: "a1", Attrs: Attrs{Fields: raw}})
+	repo := newFakeRepo(Account{Resource: leasing.Resource{ID: "a1"}, Fields: raw})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)
@@ -116,11 +116,9 @@ func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	if got.Email != "a@b.c" || got.Password != "hunter2" {
 		t.Fatalf("bound = %+v, want the seeded fields", got)
 	}
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	if string(repo.records["a1"].Attrs.Fields) != string(raw) {
-		t.Fatalf("persisted fields = %s, want untouched", repo.records["a1"].Attrs.Fields)
+	lease.Release()
+	if string(repo.records["a1"].Fields) != string(raw) {
+		t.Fatalf("persisted fields = %s, want untouched", repo.records["a1"].Fields)
 	}
 }
 
@@ -128,7 +126,7 @@ func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 // binds to the zero value rather than erroring, and garbage reports the
 // account it belongs to.
 func TestBindToleratesAccountsWithoutFields(t *testing.T) {
-	got, err := Bind[profile](Account{ID: "bare"})
+	got, err := Bind[profile](Account{Resource: leasing.Resource{ID: "bare"}})
 	if err != nil {
 		t.Fatalf("Bind of empty fields: %v", err)
 	}
@@ -136,7 +134,7 @@ func TestBindToleratesAccountsWithoutFields(t *testing.T) {
 		t.Fatalf("bound = %+v, want the zero profile", got)
 	}
 
-	if _, err := Bind[profile](Account{ID: "a9", Attrs: Attrs{Fields: json.RawMessage(`{"email":`)}}); err == nil {
+	if _, err := Bind[profile](Account{Resource: leasing.Resource{ID: "a9"}, Fields: json.RawMessage(`{"email":`)}); err == nil {
 		t.Fatal("expected an error for malformed fields")
 	}
 }
@@ -145,7 +143,7 @@ func TestBindToleratesAccountsWithoutFields(t *testing.T) {
 // two tasks drawing from the pool get different accounts, with nothing
 // configured but the repository.
 func TestAccountsRotateWithNoConfiguration(t *testing.T) {
-	repo := newFakeRepo(Account{ID: "a1"}, Account{ID: "a2"})
+	repo := newFakeRepo(Account{Resource: leasing.Resource{ID: "a1"}}, Account{Resource: leasing.Resource{ID: "a2"}})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)
@@ -184,11 +182,11 @@ func TestManagerSatisfiesTasksContract(t *testing.T) {
 func TestForwardingEmailPrefersTheAccountOverItsGroup(t *testing.T) {
 	group := Group{ID: "pool", Refs: map[string]string{EmailRef: "inbox-group"}}
 
-	pinned := Account{ID: "a1", Attrs: Attrs{EmailID: "inbox-own"}}
+	pinned := Account{Resource: leasing.Resource{ID: "a1"}, EmailID: "inbox-own"}
 	if got := ForwardingEmail(pinned, group); got != "inbox-own" {
 		t.Fatalf("resolved %q, want the account's own inbox-own", got)
 	}
-	inheriting := Account{ID: "a2"}
+	inheriting := Account{Resource: leasing.Resource{ID: "a2"}}
 	if got := ForwardingEmail(inheriting, group); got != "inbox-group" {
 		t.Fatalf("resolved %q, want the group's inbox-group", got)
 	}
@@ -250,10 +248,10 @@ func TestWithEmailProtectsReferencedInboxes(t *testing.T) {
 	if err := m.CreateGroup(ctx, Group{ID: "pool", Refs: map[string]string{EmailRef: "inbox-1"}}); err != nil {
 		t.Fatalf("create group: %v", err)
 	}
-	if err := m.Add(ctx, Account{ID: "a-own", Attrs: Attrs{EmailID: "inbox-1"}}); err != nil {
+	if err := m.Add(ctx, Account{Resource: leasing.Resource{ID: "a-own"}, EmailID: "inbox-1"}); err != nil {
 		t.Fatalf("add a-own: %v", err)
 	}
-	if err := m.Add(ctx, Account{ID: "a-inherit", GroupID: "pool"}); err != nil {
+	if err := m.Add(ctx, Account{Resource: leasing.Resource{ID: "a-inherit", GroupID: "pool"}}); err != nil {
 		t.Fatalf("add a-inherit: %v", err)
 	}
 
@@ -271,8 +269,8 @@ func TestWithEmailProtectsReferencedInboxes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	idle.Release(true)
-	live.Release(true)
+	idle.Release()
+	live.Release()
 	stranded, err := emails.Delete(ctx, "inbox-1")
 	if err != nil {
 		t.Fatalf("delete with only idle locks: %v", err)

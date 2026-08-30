@@ -134,15 +134,15 @@ func (f *fakeStore) MarkTerminal(ctx context.Context, id, outcome string, output
 	return nil
 }
 
-func (f *fakeStore) CreateTask(ctx context.Context, record Record) error { return nil }
+func (f *fakeStore) CreateTask(ctx context.Context, record Task) error { return nil }
 func (f *fakeStore) SaveAssignment(ctx context.Context, id string, kind string, a Assignment) error {
 	return nil
 }
 
-func (f *fakeStore) RecoverTask(ctx context.Context, id string) (Record, error) {
-	return Record{}, nil
+func (f *fakeStore) RecoverTask(ctx context.Context, id string) (Task, error) {
+	return Task{}, nil
 }
-func (f *fakeStore) RecoverAll(ctx context.Context) ([]Record, error) { return nil, nil }
+func (f *fakeStore) RecoverAll(ctx context.Context) ([]Task, error)   { return nil, nil }
 func (f *fakeStore) DeleteTask(ctx context.Context, id string) error  { return nil }
 func (f *fakeStore) SaveGroup(ctx context.Context, group Group) error { return nil }
 func (f *fakeStore) GetGroup(ctx context.Context, id string) (Group, bool, error) {
@@ -446,7 +446,7 @@ func TestRecoveredSuspendedTaskStartsPaused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
 	}
-	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusSuspended, nil, store, nil)
+	task := rehydrateHandle(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusSuspended, nil, store, nil)
 
 	done := make(chan error, 1)
 	go func() { _, serr := task.Start(context.Background()); done <- serr }()
@@ -485,7 +485,7 @@ func TestRecoveredTerminalTaskRefusesStart(t *testing.T) {
 	}
 	for _, status := range []workflows.Status{workflows.StatusDone, workflows.StatusKilled} {
 		var log []workflows.State
-		task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s3, status, nil, &fakeStore{}, nil)
+		task := rehydrateHandle(&testWorkflow{log: &log}, "task-1", snapshot, s3, status, nil, &fakeStore{}, nil)
 
 		if _, err := task.Start(context.Background()); !errors.Is(err, ErrAlreadyTerminal) {
 			t.Fatalf("Start on recovered %q task: err = %v, want ErrAlreadyTerminal", status, err)
@@ -506,7 +506,7 @@ func TestRecoveredFailedTaskRetries(t *testing.T) {
 	}
 	var log []workflows.State
 	store := &fakeStore{}
-	task := rehydrateTask(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusFailed, nil, store, nil)
+	task := rehydrateHandle(&testWorkflow{log: &log}, "task-1", snapshot, s2, workflows.StatusFailed, nil, store, nil)
 
 	if _, err := task.Start(context.Background()); err != nil {
 		t.Fatalf("Start on recovered failed task: %v", err)
@@ -703,9 +703,9 @@ func TestTeardownRunsOnKill(t *testing.T) {
 // resolve to the kill, or the task runs right after being told to die.
 func TestKillBeforeStartLatches(t *testing.T) {
 	var log []workflows.State
-	task, err := createTask(&testWorkflow{log: &log}, nil, nil, &fakeStore{}, nil)
+	task, err := createHandle(&testWorkflow{log: &log}, nil, nil, &fakeStore{}, nil)
 	if err != nil {
-		t.Fatalf("createTask: %v", err)
+		t.Fatalf("createHandle: %v", err)
 	}
 
 	if err := task.Kill(); err != nil {
@@ -889,9 +889,9 @@ func TestOutputErrorAbortsRun(t *testing.T) {
 func TestTerminalStampFailureSurfaced(t *testing.T) {
 	want := []byte(`{"orderID":"order-1"}`)
 	store := &fakeStore{terminalErr: errors.New("store down")}
-	task, err := createTask(outputWorkflow{output: want}, nil, nil, store, nil)
+	task, err := createHandle(outputWorkflow{output: want}, nil, nil, store, nil)
 	if err != nil {
-		t.Fatalf("createTask: %v", err)
+		t.Fatalf("createHandle: %v", err)
 	}
 
 	got, err := task.Start(context.Background())
@@ -911,9 +911,9 @@ func TestTerminalStampFailureSurfaced(t *testing.T) {
 // at the task boundary the consumer actually calls.
 func TestStartReturnsWorkflowOutput(t *testing.T) {
 	want := []byte(`{"orderID":"order-1"}`)
-	task, err := createTask(outputWorkflow{output: want}, nil, nil, &fakeStore{}, nil)
+	task, err := createHandle(outputWorkflow{output: want}, nil, nil, &fakeStore{}, nil)
 	if err != nil {
-		t.Fatalf("createTask: %v", err)
+		t.Fatalf("createHandle: %v", err)
 	}
 
 	got, err := task.Start(context.Background())

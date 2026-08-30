@@ -1,12 +1,6 @@
 package tasks
 
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/ntakezo/rogojin/leasing"
-)
+import "time"
 
 // GlobalGroup is the task group tasks land in when created without one. It
 // exists implicitly — it needs no stored record, resolves to no resource group
@@ -81,19 +75,6 @@ func Without(kind string) CreateOption {
 	}
 }
 
-// ResourceManager is the lock surface this service drives per registered kind:
-// Unlock frees a deleted task's durable lock, and ReleaseStaleLock drops a
-// repointed task's when its new placement no longer fits. Every
-// *leasing.Manager[T] satisfies it.
-//
-// Both calls run while the service holds its task registry lock. That is safe
-// because a leasing manager never calls back into this package — it decides
-// everything from the leases and locks it owns.
-type ResourceManager interface {
-	Unlock(ctx context.Context, taskID string) error
-	ReleaseStaleLock(ctx context.Context, a leasing.Assignment) error
-}
-
 // An Assignment is a task's stored placement for one resource kind: the group
 // it leases from and the resource it is pinned to within that group. A nil
 // GroupID inherits the task group's assignment for the kind; an empty one
@@ -102,42 +83,4 @@ type ResourceManager interface {
 type Assignment struct {
 	GroupID    *string `json:"groupId"`
 	ResourceID *string `json:"resourceId"`
-}
-
-// A ServiceOption configures a Service at construction.
-type ServiceOption func(*service)
-
-// WithResource registers one resource kind's leasing manager, which is the
-// whole of that wiring:
-//
-//	tasks.WithResource("proxy", manager)
-//
-// Deleting a task then unlocks the kind, and repointing one drops only the
-// lock its new placement no longer fits. Register every kind whose locks
-// outlive the process. A kind left unregistered still places tasks, but
-// nothing ever frees its locks: deleting a task strands the resource it held,
-// and repointing one leaves it leasing what it was moved off, since a binding
-// outranks the group.
-//
-// It panics on a nil manager and on a kind registered twice, which could only
-// unlock it twice.
-func WithResource(kind string, manager ResourceManager) ServiceOption {
-	return func(s *service) {
-		if manager == nil {
-			panic(fmt.Sprintf("tasks: resource kind %q registered with a nil manager", kind))
-		}
-		for _, r := range s.resources {
-			if r.kind == kind {
-				panic(fmt.Sprintf("tasks: resource kind %q registered twice", kind))
-			}
-		}
-		s.resources = append(s.resources, resource{kind: kind, manager: manager})
-	}
-}
-
-// a resource is one registered kind's manager, kept in registration order so a
-// failure names its kinds the same way every run.
-type resource struct {
-	kind    string
-	manager ResourceManager
 }

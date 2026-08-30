@@ -24,8 +24,13 @@ type payload struct {
 	region string
 }
 
-// res is the resource under test, spelled short because it appears everywhere.
-type res = Resource[payload]
+// res is the model under test — the leasing core plus a payload, embedded the
+// way a real kind embeds Resource — spelled short because it appears
+// everywhere.
+type res struct {
+	Resource
+	payload
+}
 
 // fakeRepo is an in-memory Repository recording saves so tests can assert
 // persistence without sqlite.
@@ -139,13 +144,13 @@ func (firstSelection) Select(candidates []res) (res, error) {
 
 // withFirst registers the deterministic "first" strategy, so tests that need a
 // predictable pick have one alongside the always-installed round robin.
-func withFirst() Option[payload] {
-	return WithStrategy("first", func() Selection[payload] { return firstSelection{} })
+func withFirst() Option[res, *res] {
+	return WithStrategy("first", func() Selection[res] { return firstSelection{} })
 }
 
 // newTestManager seeds the global group with the deterministic "first"
 // strategy, then builds the manager.
-func newTestManager(t *testing.T, repo Repository[payload], opts ...Option[payload]) *Manager[payload] {
+func newTestManager(t *testing.T, repo Repository[res], opts ...Option[res, *res]) *Manager[res, *res] {
 	t.Helper()
 	if err := repo.SaveGroup(context.Background(), Group{ID: GlobalGroup, Strategy: "first"}); err != nil {
 		t.Fatalf("seed global group: %v", err)
@@ -155,9 +160,9 @@ func newTestManager(t *testing.T, repo Repository[payload], opts ...Option[paylo
 
 // rebuildManager builds a manager over a repository that already carries its
 // groups, standing in for a restart.
-func rebuildManager(t *testing.T, repo Repository[payload], opts ...Option[payload]) *Manager[payload] {
+func rebuildManager(t *testing.T, repo Repository[res], opts ...Option[res, *res]) *Manager[res, *res] {
 	t.Helper()
-	m, err := NewManager(context.Background(), repo, append([]Option[payload]{withFirst()}, opts...)...)
+	m, err := NewManager(context.Background(), repo, append([]Option[res, *res]{withFirst()}, opts...)...)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -165,12 +170,12 @@ func rebuildManager(t *testing.T, repo Repository[payload], opts ...Option[paylo
 }
 
 type acquireResult struct {
-	lease *Lease[payload]
+	lease *Lease[res, *res]
 	err   error
 }
 
 // acquireAsync runs Acquire in a goroutine so tests can observe blocking.
-func acquireAsync(ctx context.Context, m *Manager[payload], taskID, groupID string) chan acquireResult {
+func acquireAsync(ctx context.Context, m *Manager[res, *res], taskID, groupID string) chan acquireResult {
 	ch := make(chan acquireResult, 1)
 	go func() {
 		l, err := m.Acquire(ctx, Assignment{TaskID: taskID, GroupID: groupID})
@@ -212,7 +217,7 @@ func TestAcquireEmptyPool(t *testing.T) {
 // TestAcquireUnknownGroup verifies acquiring from a group the manager does not
 // know fails with ErrGroupNotFound instead of blocking or falling back.
 func TestAcquireUnknownGroup(t *testing.T) {
-	m := newTestManager(t, newFakeRepo(res{ID: "p1"}))
+	m := newTestManager(t, newFakeRepo(res{Resource: Resource{ID: "p1"}}))
 	if _, err := m.Acquire(context.Background(), Assignment{TaskID: "t1", GroupID: "missing"}); !errors.Is(err, ErrGroupNotFound) {
 		t.Fatalf("err = %v, want ErrGroupNotFound", err)
 	}
@@ -221,7 +226,7 @@ func TestAcquireUnknownGroup(t *testing.T) {
 // TestNewManagerRejectsInvalidHolderPolicy verifies a holder policy below
 // UnlimitedHolders fails loud at construction.
 func TestNewManagerRejectsInvalidHolderPolicy(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", MaxHolders: -2})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", MaxHolders: -2}})
 	if _, err := NewManager(context.Background(), repo); err == nil {
 		t.Fatal("expected error for resource MaxHolders -2")
 	}
@@ -241,7 +246,7 @@ func TestNewManagerRejectsUnknownStrategy(t *testing.T) {
 // TestNewManagerRejectsUnknownResourceGroup verifies a resource referencing a group
 // that does not exist fails at construction rather than rotating nowhere.
 func TestNewManagerRejectsUnknownResourceGroup(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", GroupID: "ghost"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", GroupID: "ghost"}})
 	if _, err := NewManager(context.Background(), repo); !errors.Is(err, ErrGroupNotFound) {
 		t.Fatalf("err = %v, want ErrGroupNotFound", err)
 	}
@@ -267,8 +272,8 @@ func TestNewManagerPersistsGlobalGroup(t *testing.T) {
 // resources is rejected, because the lock contract is at most one resource per task.
 func TestNewManagerRejectsDoubleBinding(t *testing.T) {
 	repo := newFakeRepo(
-		res{ID: "p1", OwnerID: "t1"},
-		res{ID: "p2", OwnerID: "t1"},
+		res{Resource: Resource{ID: "p1", OwnerID: "t1"}},
+		res{Resource: Resource{ID: "p2", OwnerID: "t1"}},
 	)
 	if _, err := NewManager(context.Background(), repo); err == nil {
 		t.Fatal("expected error for double binding")
@@ -278,7 +283,7 @@ func TestNewManagerRejectsDoubleBinding(t *testing.T) {
 // TestExclusiveBlocksUntilRelease verifies a second task cannot lease a held
 // resource until it is released, because the default holder policy is one at a time.
 func TestExclusiveBlocksUntilRelease(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", Attrs: payload{secret: "s1"}})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}, payload: payload{secret: "s1"}})
 	m := newTestManager(t, repo)
 
 	lease, err := m.Acquire(context.Background(), Assignment{TaskID: "t1"})
@@ -289,9 +294,7 @@ func TestExclusiveBlocksUntilRelease(t *testing.T) {
 	ch := acquireAsync(context.Background(), m, "t2", "")
 	mustBlock(t, ch)
 
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	lease.Release()
 	res := mustComplete(t, ch)
 	if res.err != nil {
 		t.Fatalf("second acquire: %v", res.err)
@@ -305,7 +308,7 @@ func TestExclusiveBlocksUntilRelease(t *testing.T) {
 // two concurrent leases and blocks the third, because the cap bounds concurrent
 // use per resource.
 func TestResourceCapAllowsConcurrentHolders(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", MaxHolders: 2})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", MaxHolders: 2}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -320,9 +323,7 @@ func TestResourceCapAllowsConcurrentHolders(t *testing.T) {
 	ch := acquireAsync(ctx, m, "t3", "")
 	mustBlock(t, ch)
 
-	if err := l1.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	l1.Release()
 	if res := mustComplete(t, ch); res.err != nil {
 		t.Fatalf("third acquire after release: %v", res.err)
 	}
@@ -331,7 +332,7 @@ func TestResourceCapAllowsConcurrentHolders(t *testing.T) {
 // TestUnlimitedHolders verifies UnlimitedHolders admits arbitrarily many
 // concurrent leases on one resource.
 func TestUnlimitedHolders(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", MaxHolders: UnlimitedHolders})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", MaxHolders: UnlimitedHolders}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -347,8 +348,8 @@ func TestUnlimitedHolders(t *testing.T) {
 // resources.
 func TestAcquireScopedToGroup(t *testing.T) {
 	repo := newFakeRepo(
-		res{ID: "a1", GroupID: "ga"},
-		res{ID: "b1", GroupID: "gb"},
+		res{Resource: Resource{ID: "a1", GroupID: "ga"}},
+		res{Resource: Resource{ID: "b1", GroupID: "gb"}},
 	)
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: "first"})
 	repo.SaveGroup(context.Background(), Group{ID: "gb", Strategy: "first"})
@@ -380,10 +381,10 @@ func TestAcquireScopedToGroup(t *testing.T) {
 // instance: one group's rotation must not advance another's cursor.
 func TestPerGroupStrategyState(t *testing.T) {
 	repo := newFakeRepo(
-		res{ID: "a1", GroupID: "ga", MaxHolders: UnlimitedHolders},
-		res{ID: "a2", GroupID: "ga", MaxHolders: UnlimitedHolders},
-		res{ID: "b1", GroupID: "gb", MaxHolders: UnlimitedHolders},
-		res{ID: "b2", GroupID: "gb", MaxHolders: UnlimitedHolders},
+		res{Resource: Resource{ID: "a1", GroupID: "ga", MaxHolders: UnlimitedHolders}},
+		res{Resource: Resource{ID: "a2", GroupID: "ga", MaxHolders: UnlimitedHolders}},
+		res{Resource: Resource{ID: "b1", GroupID: "gb", MaxHolders: UnlimitedHolders}},
+		res{Resource: Resource{ID: "b2", GroupID: "gb", MaxHolders: UnlimitedHolders}},
 	)
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: StrategyRoundRobin})
 	repo.SaveGroup(context.Background(), Group{ID: "gb", Strategy: StrategyRoundRobin})
@@ -410,7 +411,7 @@ func TestPerGroupStrategyState(t *testing.T) {
 // TestAcquireHonorsContextCancel verifies a blocked Acquire returns the
 // context's error on cancellation, because blocking must always be escapable.
 func TestAcquireHonorsContextCancel(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
 	m := newTestManager(t, repo)
 
 	if _, err := m.Acquire(context.Background(), Assignment{TaskID: "t1"}); err != nil {
@@ -428,42 +429,10 @@ func TestAcquireHonorsContextCancel(t *testing.T) {
 	}
 }
 
-// TestReleaseRecordsOutcomeAndPersists verifies Release(success) feeds the
-// stats bayesian selection learns from and writes them through to the repo so
-// learning survives restarts, refreshing UpdatedAt as it goes.
-func TestReleaseRecordsOutcomeAndPersists(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"})
-	m := newTestManager(t, repo)
-	ctx := context.Background()
-
-	l1, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if err := l1.Release(true); err != nil {
-		t.Fatalf("release success: %v", err)
-	}
-	l2, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if err := l2.Release(false); err != nil {
-		t.Fatalf("release failure: %v", err)
-	}
-
-	p := repo.get(t, "p1")
-	if p.Successes != 1 || p.Failures != 1 {
-		t.Fatalf("persisted stats = %d/%d, want 1/1", p.Successes, p.Failures)
-	}
-	if p.UpdatedAt.IsZero() {
-		t.Fatal("release did not refresh UpdatedAt")
-	}
-}
-
 // TestDoubleReleaseFreesOnce verifies a second Release does not free a slot it
 // no longer holds, or a later acquire could over-admit past the cap.
 func TestDoubleReleaseFreesOnce(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -471,12 +440,8 @@ func TestDoubleReleaseFreesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if err := l.Release(true); err != nil {
-		t.Fatalf("first release: %v", err)
-	}
-	if err := l.Release(true); err != nil {
-		t.Fatalf("second release should be a no-op, got %v", err)
-	}
+	l.Release()
+	l.Release()
 
 	if _, err := m.Acquire(ctx, Assignment{TaskID: "t2"}); err != nil {
 		t.Fatalf("acquire after release: %v", err)
@@ -489,16 +454,14 @@ func TestDoubleReleaseFreesOnce(t *testing.T) {
 // TestLockExcludesResourceFromRotation verifies a locked resource can never be leased
 // by another task even while idle, because the lock is owner-exclusive past runtime.
 func TestLockExcludesResourceFromRotation(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
 	m := newTestManager(t, repo)
 
 	l, err := m.Lock(context.Background(), Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	if err := l.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	l.Release()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := acquireAsync(ctx, m, "t2", "")
@@ -512,14 +475,14 @@ func TestLockExcludesResourceFromRotation(t *testing.T) {
 // TestLockPersistsBinding verifies the lock lands in the repo as OwnerID,
 // because the binding must be durable past the task's runtime.
 func TestLockPersistsBinding(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
 	m := newTestManager(t, repo)
 
 	l, err := m.Lock(context.Background(), Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	l.Release(true)
+	l.Release()
 
 	if owner := repo.get(t, "p1").OwnerID; owner != "t1" {
 		t.Fatalf("persisted OwnerID = %q, want t1", owner)
@@ -529,7 +492,7 @@ func TestLockPersistsBinding(t *testing.T) {
 // TestAcquireReturnsLockedResource verifies the owner's Acquire always returns its
 // locked resource rather than rotating, because reuse is the point of locking.
 func TestAcquireReturnsLockedResource(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"}, res{ID: "p2"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}}, res{Resource: Resource{ID: "p2"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -540,7 +503,7 @@ func TestAcquireReturnsLockedResource(t *testing.T) {
 	if l.Resource().ID != "p1" {
 		t.Fatalf("locked %s, want p1", l.Resource().ID)
 	}
-	l.Release(true)
+	l.Release()
 
 	got, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
@@ -554,7 +517,7 @@ func TestAcquireReturnsLockedResource(t *testing.T) {
 // TestLockIdempotent verifies a second Lock returns the existing binding
 // instead of binding a second resource.
 func TestLockIdempotent(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"}, res{ID: "p2"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}}, res{Resource: Resource{ID: "p2"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -562,7 +525,7 @@ func TestLockIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first lock: %v", err)
 	}
-	l1.Release(true)
+	l1.Release()
 
 	l2, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
@@ -580,7 +543,7 @@ func TestLockIdempotent(t *testing.T) {
 // the owner its locked resource back, because the binding's durability is the
 // requirement locking exists for.
 func TestReclaimAcrossRestart(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"}, res{ID: "p2"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}}, res{Resource: Resource{ID: "p2"}})
 	ctx := context.Background()
 
 	m1 := newTestManager(t, repo)
@@ -588,7 +551,7 @@ func TestReclaimAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	l.Release(true)
+	l.Release()
 
 	m2 := rebuildManager(t, repo)
 	got, err := m2.Acquire(ctx, Assignment{TaskID: "t1"})
@@ -603,7 +566,7 @@ func TestReclaimAcrossRestart(t *testing.T) {
 // TestUnlockReturnsResourceToPool verifies Unlock clears the durable binding so
 // other tasks can rotate onto the resource again.
 func TestUnlockReturnsResourceToPool(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -611,7 +574,7 @@ func TestUnlockReturnsResourceToPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	l.Release(true)
+	l.Release()
 
 	if err := m.Unlock(ctx, "t1"); err != nil {
 		t.Fatalf("unlock: %v", err)
@@ -632,7 +595,7 @@ func TestUnlockReturnsResourceToPool(t *testing.T) {
 // TestUnlockWithoutBinding verifies Unlock for an unbound task is a no-op, so
 // callers can unlock defensively.
 func TestUnlockWithoutBinding(t *testing.T) {
-	m := newTestManager(t, newFakeRepo(res{ID: "p1"}))
+	m := newTestManager(t, newFakeRepo(res{Resource: Resource{ID: "p1"}}))
 	if err := m.Unlock(context.Background(), "t1"); err != nil {
 		t.Fatalf("unlock without binding: %v", err)
 	}
@@ -641,7 +604,7 @@ func TestUnlockWithoutBinding(t *testing.T) {
 // TestDeleteUnlockedResource verifies deleting an unbound, unheld resource
 // removes it and reports nothing unbound, because no task's fate is in question.
 func TestDeleteUnlockedResource(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"}, res{ID: "p2"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}}, res{Resource: Resource{ID: "p2"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -669,7 +632,7 @@ func TestDeleteUnlockedResource(t *testing.T) {
 // do about that task is the caller's policy; the manager's whole duty is to
 // report the fact and return the task to rotation.
 func TestDeleteLockedResourceReportsUnboundOwner(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"}, res{ID: "p2"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}}, res{Resource: Resource{ID: "p2"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -677,7 +640,7 @@ func TestDeleteLockedResourceReportsUnboundOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	l.Release(true)
+	l.Release()
 
 	unbound, err := m.Delete(ctx, "p1")
 	if err != nil {
@@ -708,7 +671,7 @@ func TestDeleteLockedResourceReportsUnboundOwner(t *testing.T) {
 // and that the refusal names the holders. Releasing the lease is what frees
 // the resource, and the same delete then goes through.
 func TestDeleteRefusesWhileLeaseHeld(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"}, res{ID: "p2"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}}, res{Resource: Resource{ID: "p2"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -735,9 +698,7 @@ func TestDeleteRefusesWhileLeaseHeld(t *testing.T) {
 	}
 
 	// Releasing frees it, and the same delete then goes through.
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	lease.Release()
 	if _, err := m.Delete(ctx, "p1"); err != nil {
 		t.Fatalf("delete after release: %v", err)
 	}
@@ -747,7 +708,7 @@ func TestDeleteRefusesWhileLeaseHeld(t *testing.T) {
 // lease, not the lock: a locked resource whose owner is mid-lease refuses, and
 // the release — not any question about the task — is what lets it through.
 func TestDeleteRefusesWhileLockedOwnerHoldsLease(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -760,9 +721,7 @@ func TestDeleteRefusesWhileLockedOwnerHoldsLease(t *testing.T) {
 		t.Fatalf("err = %v, want ErrResourceInUse while the owner holds a lease", err)
 	}
 
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	lease.Release()
 	unbound, err := m.Delete(ctx, "p1")
 	if err != nil {
 		t.Fatalf("delete after release: %v", err)
@@ -775,7 +734,7 @@ func TestDeleteRefusesWhileLockedOwnerHoldsLease(t *testing.T) {
 // TestReleaseOfDeletedResource verifies a lease released after its resource was
 // deleted (deleted while parked, released later) is a clean no-op.
 func TestReleaseOfDeletedResource(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -785,15 +744,11 @@ func TestReleaseOfDeletedResource(t *testing.T) {
 	}
 	// The holder releases; the resource is deleted; the stale lease object's
 	// second release must not error or resurrect anything.
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	lease.Release()
 	if _, err := m.Delete(ctx, "p1"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("release after delete: %v", err)
-	}
+	lease.Release()
 	if repo.has("p1") {
 		t.Fatal("a stale release resurrected the deleted resource")
 	}
@@ -806,7 +761,7 @@ func TestAdd(t *testing.T) {
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
-	if err := m.Add(ctx, res{ID: "p1", Attrs: payload{secret: "s1"}}); err != nil {
+	if err := m.Add(ctx, res{Resource: Resource{ID: "p1"}, payload: payload{secret: "s1"}}); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	stored := repo.get(t, "p1")
@@ -816,8 +771,8 @@ func TestAdd(t *testing.T) {
 	if stored.CreatedAt.IsZero() || stored.UpdatedAt.IsZero() {
 		t.Fatal("timestamps not stamped")
 	}
-	if stored.Attrs != (payload{secret: "s1"}) {
-		t.Fatalf("Attrs = %+v, want the payload handed in verbatim", stored.Attrs)
+	if stored.payload != (payload{secret: "s1"}) {
+		t.Fatalf("payload = %+v, want the payload handed in verbatim", stored.payload)
 	}
 
 	got, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
@@ -832,13 +787,13 @@ func TestAdd(t *testing.T) {
 // TestAddRejectsUnknownGroupAndDuplicates verifies Add fails loud on
 // a group the manager does not know and on an id already pooled.
 func TestAddRejectsUnknownGroupAndDuplicates(t *testing.T) {
-	m := newTestManager(t, newFakeRepo(res{ID: "p1"}))
+	m := newTestManager(t, newFakeRepo(res{Resource: Resource{ID: "p1"}}))
 	ctx := context.Background()
 
-	if err := m.Add(ctx, res{ID: "p2", GroupID: "ghost"}); !errors.Is(err, ErrGroupNotFound) {
+	if err := m.Add(ctx, res{Resource: Resource{ID: "p2", GroupID: "ghost"}}); !errors.Is(err, ErrGroupNotFound) {
 		t.Fatalf("err = %v, want ErrGroupNotFound", err)
 	}
-	if err := m.Add(ctx, res{ID: "p1"}); err == nil {
+	if err := m.Add(ctx, res{Resource: Resource{ID: "p1"}}); err == nil {
 		t.Fatal("expected error for duplicate id")
 	}
 }
@@ -860,7 +815,7 @@ func TestCreateGroup(t *testing.T) {
 		t.Fatal("timestamps not stamped")
 	}
 
-	if err := m.Add(ctx, res{ID: "p1", GroupID: "g"}); err != nil {
+	if err := m.Add(ctx, res{Resource: Resource{ID: "p1", GroupID: "g"}}); err != nil {
 		t.Fatalf("add to new group: %v", err)
 	}
 	if _, err := m.Acquire(ctx, Assignment{TaskID: "t1", GroupID: "g"}); err != nil {
@@ -880,9 +835,9 @@ func TestCreateGroup(t *testing.T) {
 // sorted, deduplicated facts for the caller's policy to act on.
 func TestDeleteGroupCascades(t *testing.T) {
 	repo := newFakeRepo(
-		res{ID: "a1", GroupID: "ga"},
-		res{ID: "a2", GroupID: "ga"},
-		res{ID: "b1", GroupID: "gb"},
+		res{Resource: Resource{ID: "a1", GroupID: "ga"}},
+		res{Resource: Resource{ID: "a2", GroupID: "ga"}},
+		res{Resource: Resource{ID: "b1", GroupID: "gb"}},
 	)
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: "first"})
 	repo.SaveGroup(context.Background(), Group{ID: "gb", Strategy: "first"})
@@ -893,7 +848,7 @@ func TestDeleteGroupCascades(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	l.Release(true)
+	l.Release()
 
 	unbound, err := m.DeleteGroup(ctx, "ga")
 	if err != nil {
@@ -921,7 +876,7 @@ func TestDeleteGroupCascades(t *testing.T) {
 // TestDeleteGroupRefusals verifies the global group cannot be deleted and an
 // unknown group fails with ErrGroupNotFound.
 func TestDeleteGroupRefusals(t *testing.T) {
-	repo := newFakeRepo(res{ID: "a1", GroupID: "ga"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "a1", GroupID: "ga"}})
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: "first"})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
@@ -938,7 +893,7 @@ func TestDeleteGroupRefusals(t *testing.T) {
 // any member cannot be cascade-deleted, the refusal lands before anything is
 // mutated, and the lease's release is what lets the same delete through.
 func TestDeleteGroupRefusesWhileMemberHeld(t *testing.T) {
-	repo := newFakeRepo(res{ID: "a1", GroupID: "ga"}, res{ID: "a2", GroupID: "ga"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "a1", GroupID: "ga"}}, res{Resource: Resource{ID: "a2", GroupID: "ga"}})
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: "first"})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
@@ -957,9 +912,7 @@ func TestDeleteGroupRefusesWhileMemberHeld(t *testing.T) {
 		t.Fatal("refused cascade mutated state")
 	}
 
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	lease.Release()
 	if _, err := m.DeleteGroup(ctx, "ga"); err != nil {
 		t.Fatalf("delete after release: %v", err)
 	}
@@ -973,7 +926,7 @@ func TestDeleteGroupRefusesWhileMemberHeld(t *testing.T) {
 // waiting forever on resources that no longer exist. The group's one member is
 // locked but unleased, so nothing blocks the cascade.
 func TestBlockedAcquireFailsWhenGroupDeleted(t *testing.T) {
-	repo := newFakeRepo(res{ID: "a1", GroupID: "ga"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "a1", GroupID: "ga"}})
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: "first"})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
@@ -982,9 +935,7 @@ func TestBlockedAcquireFailsWhenGroupDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	if err := l.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	l.Release()
 
 	// a1 is locked to t1, so t2 sees a non-empty group with no candidate: it waits.
 	ch := acquireAsync(ctx, m, "t2", "ga")
@@ -1031,7 +982,7 @@ func (r *failingRepo) DeleteGroup(ctx context.Context, id string) error {
 // deleted meanwhile, that reload fails permanently, leaving a manager that
 // cannot be constructed at all.
 func TestFailedRemoveLeavesStoreAndMemoryAgreeing(t *testing.T) {
-	base := newFakeRepo(res{ID: "a1", GroupID: "ga"}, res{ID: "a2", GroupID: "ga"})
+	base := newFakeRepo(res{Resource: Resource{ID: "a1", GroupID: "ga"}}, res{Resource: Resource{ID: "a2", GroupID: "ga"}})
 	repo := &failingRepo{fakeRepo: base, failDelete: map[string]bool{"a2": true}}
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: "first"})
 	m := newTestManager(t, repo)
@@ -1049,7 +1000,7 @@ func TestFailedRemoveLeavesStoreAndMemoryAgreeing(t *testing.T) {
 	}
 
 	// The proof: a fresh manager over the same store still constructs.
-	if _, err := NewManager(ctx, Repository[payload](repo), withFirst()); err != nil {
+	if _, err := NewManager(ctx, Repository[res](repo), withFirst()); err != nil {
 		t.Fatalf("manager unstartable after failed cascade: %v", err)
 	}
 	// And the surviving member is still leasable.
@@ -1063,7 +1014,7 @@ func TestFailedRemoveLeavesStoreAndMemoryAgreeing(t *testing.T) {
 // OwnerID, so forgetting it here would let a restart resurrect a lock this
 // deletion was meant to clear.
 func TestFailedRemoveKeepsDurableLockVisible(t *testing.T) {
-	base := newFakeRepo(res{ID: "p1"})
+	base := newFakeRepo(res{Resource: Resource{ID: "p1"}})
 	repo := &failingRepo{fakeRepo: base, failDelete: map[string]bool{"p1": true}}
 	m := newTestManager(t, repo)
 	ctx := context.Background()
@@ -1072,7 +1023,7 @@ func TestFailedRemoveKeepsDurableLockVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	l.Release(true)
+	l.Release()
 
 	unbound, err := m.Delete(ctx, "p1")
 	if err == nil {
@@ -1099,7 +1050,7 @@ func TestFailedRemoveKeepsDurableLockVisible(t *testing.T) {
 // holds it; binding that one would both break the owner-exclusive contract and
 // park the new owner behind a stranger on its own resource.
 func TestLockNeverStealsAResourceInUse(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", MaxHolders: 2})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", MaxHolders: 2}})
 	m := newTestManager(t, repo)
 	ctx := context.Background()
 
@@ -1124,14 +1075,12 @@ func TestLockNeverStealsAResourceInUse(t *testing.T) {
 	}
 
 	// Once the holder leaves, the lock lands and the owner can use it at once.
-	holder.Release(true)
+	holder.Release()
 	res := mustComplete(t, locked)
 	if res.err != nil {
 		t.Fatalf("lock after release: %v", res.err)
 	}
-	if err := res.lease.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	res.lease.Release()
 	owned, err := m.Acquire(ctx, Assignment{TaskID: "t2"})
 	if err != nil {
 		t.Fatalf("owner blocked on its own locked resource: %v", err)
@@ -1154,12 +1103,12 @@ func (s strayCandidateSelection) Select(candidates []res) (res, error) {
 // a resource already at capacity, or let a lock overwrite another task's binding.
 func TestSelectionMustReturnACandidate(t *testing.T) {
 	repo := newFakeRepo(
-		res{ID: "free", GroupID: "ga"},
-		res{ID: "taken", GroupID: "ga", OwnerID: "someone"},
+		res{Resource: Resource{ID: "free", GroupID: "ga"}},
+		res{Resource: Resource{ID: "taken", GroupID: "ga", OwnerID: "someone"}},
 	)
 	repo.SaveGroup(context.Background(), Group{ID: "ga", Strategy: "stray"})
-	m, err := NewManager(context.Background(), Repository[payload](repo),
-		WithStrategy("stray", func() Selection[payload] { return strayCandidateSelection{res{ID: "taken"}} }))
+	m, err := NewManager(context.Background(), Repository[res](repo),
+		WithStrategy("stray", func() Selection[res] { return strayCandidateSelection{res{Resource: Resource{ID: "taken"}}} }))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1189,69 +1138,11 @@ func (r *gateRepo) Save(ctx context.Context, p res) error {
 	return r.fakeRepo.Save(ctx, p)
 }
 
-// TestReleaseCannotResurrectStaleLock verifies Release persists atomically with
-// its in-memory update. A Release whose save raced ahead of a concurrent
-// Unlock's could land last with the stale owner still set, so a restart would
-// load a durable lock no live task holds — the resource would be leased to a
-// ghost forever.
-func TestReleaseCannotResurrectStaleLock(t *testing.T) {
-	repo := &gateRepo{
-		fakeRepo: newFakeRepo(res{ID: "p1", Attrs: payload{secret: "s1"}}),
-		entered:  make(chan struct{}),
-		gate:     make(chan struct{}),
-	}
-	m := newTestManager(t, repo)
-	ctx := context.Background()
-
-	lease, err := m.Lock(ctx, Assignment{TaskID: "t1"})
-	if err != nil {
-		t.Fatalf("Lock: %v", err)
-	}
-
-	// Arm the gate so Release's save parks mid-flight, then race an Unlock.
-	repo.arm.Store(true)
-	releaseDone := make(chan error, 1)
-	go func() { releaseDone <- lease.Release(true) }()
-	<-repo.entered
-
-	unlockDone := make(chan error, 1)
-	go func() { unlockDone <- m.Unlock(ctx, "t1") }()
-
-	// Give a racy Unlock time to finish before the parked save lands; a correct
-	// Release holds the manager lock across its save, so Unlock cannot pass it.
-	var unlockErr error
-	unlockFinished := false
-	select {
-	case unlockErr = <-unlockDone:
-		unlockFinished = true
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(repo.gate)
-
-	if err := <-releaseDone; err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	if !unlockFinished {
-		unlockErr = <-unlockDone
-	}
-	if unlockErr != nil {
-		t.Fatalf("Unlock: %v", unlockErr)
-	}
-
-	stored := repo.get(t, "p1")
-	if stored.OwnerID != "" {
-		t.Fatalf("stored owner = %q, want unlocked: a stale Release save must not resurrect the lock", stored.OwnerID)
-	}
-	if stored.Successes != 1 {
-		t.Fatalf("stored successes = %d, want 1: the release outcome must survive the unlock", stored.Successes)
-	}
-}
-
 // TestPinnedAssignmentLeasesOnlyItsResource verifies a pin is a group assignment
 // minus the rotation: every lease is the pinned resource, however many members the
 // group has.
 func TestPinnedAssignmentLeasesOnlyItsResource(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", GroupID: "ga"}, res{ID: "p2", GroupID: "ga"}, res{ID: "p3", GroupID: "ga"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", GroupID: "ga"}}, res{Resource: Resource{ID: "p2", GroupID: "ga"}}, res{Resource: Resource{ID: "p3", GroupID: "ga"}})
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: StrategyRoundRobin})
 	m := rebuildManager(t, repo)
@@ -1265,9 +1156,7 @@ func TestPinnedAssignmentLeasesOnlyItsResource(t *testing.T) {
 		if lease.Resource().ID != "p2" {
 			t.Fatalf("lease %d = %s, want p2 every time: a pin does not rotate", i, lease.Resource().ID)
 		}
-		if err := lease.Release(true); err != nil {
-			t.Fatalf("Release %d: %v", i, err)
-		}
+		lease.Release()
 	}
 }
 
@@ -1276,7 +1165,7 @@ func TestPinnedAssignmentLeasesOnlyItsResource(t *testing.T) {
 // a shared round-robin cursor for a choice nobody made would skew what the
 // group's other tasks get next.
 func TestPinnedAssignmentLeavesRotationUntouched(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", GroupID: "ga"}, res{ID: "p2", GroupID: "ga"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", GroupID: "ga"}}, res{Resource: Resource{ID: "p2", GroupID: "ga"}})
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: StrategyRoundRobin})
 	m := rebuildManager(t, repo)
@@ -1285,7 +1174,7 @@ func TestPinnedAssignmentLeavesRotationUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pinned Acquire: %v", err)
 	}
-	pin.Release(true)
+	pin.Release()
 
 	rotating, err := m.Acquire(ctx, Assignment{TaskID: "t2", GroupID: "ga"})
 	if err != nil {
@@ -1301,7 +1190,7 @@ func TestPinnedAssignmentLeavesRotationUntouched(t *testing.T) {
 // resource is exactly what a pinned task did not ask for. The distinct errors are
 // what a recovered task's fallback policy branches on.
 func TestPinRefusesUnresolvableResource(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", GroupID: "ga"}, res{ID: "q1", GroupID: "gb"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", GroupID: "ga"}}, res{Resource: Resource{ID: "q1", GroupID: "gb"}})
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
 	repo.SaveGroup(ctx, Group{ID: "gb", Strategy: "first"})
@@ -1325,7 +1214,7 @@ func TestPinRefusesUnresolvableResource(t *testing.T) {
 // so acquire reports it and ReleaseStaleLock — the reassignment path — is what
 // clears it.
 func TestPinConflictWithDurableLock(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", GroupID: "ga"}, res{ID: "p2", GroupID: "ga"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", GroupID: "ga"}}, res{Resource: Resource{ID: "p2", GroupID: "ga"}})
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
 	m := rebuildManager(t, repo)
@@ -1337,7 +1226,7 @@ func TestPinConflictWithDurableLock(t *testing.T) {
 	if lease.Resource().ID != "p1" {
 		t.Fatalf("locked %s, want p1", lease.Resource().ID)
 	}
-	lease.Release(true)
+	lease.Release()
 
 	repinned := Assignment{TaskID: "t1", GroupID: "ga", ResourceID: "p2"}
 	_, err = m.Acquire(ctx, repinned)
@@ -1370,7 +1259,7 @@ func TestPinConflictWithDurableLock(t *testing.T) {
 // resource to the pool for another task to take between the release and the
 // task's next lock.
 func TestReleaseStaleLockKeepsLocksThatStillFit(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", GroupID: "ga"}, res{ID: "q1", GroupID: "gb"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", GroupID: "ga"}}, res{Resource: Resource{ID: "q1", GroupID: "gb"}})
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
 	repo.SaveGroup(ctx, Group{ID: "gb", Strategy: "first"})
@@ -1379,7 +1268,7 @@ func TestReleaseStaleLockKeepsLocksThatStillFit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lock: %v", err)
 	}
-	lease.Release(true)
+	lease.Release()
 
 	kept := []struct {
 		name string
@@ -1411,14 +1300,14 @@ func TestReleaseStaleLockKeepsLocksThatStillFit(t *testing.T) {
 // rather than the global one — a task assigned nothing must not keep a resource
 // bound.
 func TestReleaseStaleLockOnEmptyPlacementReleases(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", GroupID: GlobalGroup})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", GroupID: GlobalGroup}})
 	ctx := context.Background()
 	m := newTestManager(t, repo)
 	lease, err := m.Lock(ctx, Assignment{TaskID: "t1"})
 	if err != nil {
 		t.Fatalf("Lock: %v", err)
 	}
-	lease.Release(true)
+	lease.Release()
 
 	if err := m.ReleaseStaleLock(ctx, Assignment{TaskID: "t1"}); err != nil {
 		t.Fatalf("ReleaseStaleLock: %v", err)
@@ -1433,7 +1322,7 @@ func TestReleaseStaleLockOnEmptyPlacementReleases(t *testing.T) {
 // because a lease ends on its own; a durable lock does not, so waiting on one
 // is waiting on a condition that never arrives.
 func TestPinRefusesResourceLockedToAnotherTask(t *testing.T) {
-	repo := newFakeRepo(res{ID: "p1", GroupID: "ga", OwnerID: "t2"}, res{ID: "p2", GroupID: "ga"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1", GroupID: "ga", OwnerID: "t2"}}, res{Resource: Resource{ID: "p2", GroupID: "ga"}})
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
 	m := rebuildManager(t, repo)
@@ -1493,9 +1382,9 @@ func TestEmptyGroupFailsRatherThanWaiting(t *testing.T) {
 // the lease disagree.
 func TestCheckAssignmentReportsEveryWayAPlacementCanFail(t *testing.T) {
 	repo := newFakeRepo(
-		res{ID: "p1", GroupID: "ga"},
-		res{ID: "p2", GroupID: "ga", OwnerID: "t9"},
-		res{ID: "q1", GroupID: "gb"},
+		res{Resource: Resource{ID: "p1", GroupID: "ga"}},
+		res{Resource: Resource{ID: "p2", GroupID: "ga", OwnerID: "t9"}},
+		res{Resource: Resource{ID: "q1", GroupID: "gb"}},
 	)
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: "ga", Strategy: "first"})
@@ -1522,5 +1411,112 @@ func TestCheckAssignmentReportsEveryWayAPlacementCanFail(t *testing.T) {
 		if tc.want != nil && !errors.Is(err, tc.want) {
 			t.Fatalf("%s: CheckAssignment = %v, want %v", tc.name, err, tc.want)
 		}
+	}
+}
+
+// TestUpdatePersistsAModelsOwnFields verifies Update is the one door for a
+// change to a record's own fields: the edit lands in the store and in the
+// pool the next lease is cut from, UpdatedAt moves, and the leasing fields
+// are not fn's to touch — an edit to them is undone before the save.
+func TestUpdatePersistsAModelsOwnFields(t *testing.T) {
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}, payload: payload{secret: "old"}})
+	m := newTestManager(t, repo)
+	ctx := context.Background()
+
+	l, err := m.Lock(ctx, Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	l.Release()
+
+	if err := m.Update(ctx, "p1", func(r *res) {
+		r.secret = "new"
+		r.OwnerID = "intruder"
+		r.GroupID = "elsewhere"
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	stored := repo.get(t, "p1")
+	if stored.secret != "new" {
+		t.Fatalf("stored secret = %q, want the update persisted", stored.secret)
+	}
+	if stored.OwnerID != "t1" || stored.GroupID != GlobalGroup {
+		t.Fatalf("stored core = owner %q group %q, want the leasing fields untouched", stored.OwnerID, stored.GroupID)
+	}
+	if stored.UpdatedAt.IsZero() {
+		t.Fatal("update did not refresh UpdatedAt")
+	}
+
+	again, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer again.Release()
+	if again.Resource().secret != "new" {
+		t.Fatalf("leased secret = %q, want the pool updated too", again.Resource().secret)
+	}
+
+	if err := m.Update(ctx, "ghost", func(r *res) {}); err == nil {
+		t.Fatal("expected an update to an unknown resource to fail")
+	}
+}
+
+// TestUpdateCannotResurrectStaleLock verifies Update persists atomically with
+// its in-memory change. An Update whose save raced ahead of a concurrent
+// Unlock's could land last with the stale owner still set, so a restart would
+// load a durable lock no live task holds — the resource would be leased to a
+// ghost forever.
+func TestUpdateCannotResurrectStaleLock(t *testing.T) {
+	repo := &gateRepo{
+		fakeRepo: newFakeRepo(res{Resource: Resource{ID: "p1"}}),
+		entered:  make(chan struct{}),
+		gate:     make(chan struct{}),
+	}
+	m := newTestManager(t, repo)
+	ctx := context.Background()
+
+	lease, err := m.Lock(ctx, Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	lease.Release()
+
+	// Arm the gate so Update's save parks mid-flight, then race an Unlock.
+	repo.arm.Store(true)
+	updateDone := make(chan error, 1)
+	go func() { updateDone <- m.Update(ctx, "p1", func(r *res) { r.secret = "edited" }) }()
+	<-repo.entered
+
+	unlockDone := make(chan error, 1)
+	go func() { unlockDone <- m.Unlock(ctx, "t1") }()
+
+	// Give a racy Unlock time to finish before the parked save lands; a correct
+	// Update holds the manager lock across its save, so Unlock cannot pass it.
+	var unlockErr error
+	unlockFinished := false
+	select {
+	case unlockErr = <-unlockDone:
+		unlockFinished = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(repo.gate)
+
+	if err := <-updateDone; err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !unlockFinished {
+		unlockErr = <-unlockDone
+	}
+	if unlockErr != nil {
+		t.Fatalf("Unlock: %v", unlockErr)
+	}
+
+	stored := repo.get(t, "p1")
+	if stored.OwnerID != "" {
+		t.Fatalf("stored owner = %q, want unlocked: a stale Update save must not resurrect the lock", stored.OwnerID)
+	}
+	if stored.secret != "edited" {
+		t.Fatalf("stored secret = %q, want the update to survive the unlock", stored.secret)
 	}
 }

@@ -104,7 +104,7 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		// task naked instead.
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}
-	proxyURL, err := url.Parse(lease.Resource().Attrs.URL)
+	proxyURL, err := url.Parse(lease.Resource().URL)
 	if err != nil {
 		lease.Release(false)
 		return nil, fmt.Errorf("parse proxy url: %w", err)

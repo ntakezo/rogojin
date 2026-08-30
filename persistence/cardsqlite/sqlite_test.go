@@ -3,6 +3,7 @@ package cardsqlite
 import (
 	"context"
 	"encoding/json"
+	"github.com/ntakezo/rogojin/leasing"
 	"path/filepath"
 	"testing"
 	"time"
@@ -36,7 +37,7 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 	return raw
 }
 
-// TestSaveListRoundTrip verifies every field — the lock owner, the stats, and
+// TestSaveListRoundTrip verifies every field — the lock owner and
 // the workflow's own JSON — survives storage, because lock reclamation and
 // payment both read them back verbatim.
 func TestSaveListRoundTrip(t *testing.T) {
@@ -44,18 +45,14 @@ func TestSaveListRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	locked := cards.Card{
-		ID:      "c1",
-		GroupID: "bin",
-		OwnerID: "t1",
-		Attrs: mustJSON(t, map[string]string{
+		Resource: leasing.Resource{ID: "c1", GroupID: "bin", OwnerID: "t1"},
+		Fields: mustJSON(t, map[string]string{
 			"number": "4111111111111111",
 			"expiry": "12/29",
 			"cvv":    "737",
 		}),
-		Successes: 3,
-		Failures:  2,
 	}
-	free := cards.Card{ID: "c2", GroupID: "bin", MaxHolders: 2}
+	free := cards.Card{Resource: leasing.Resource{ID: "c2", GroupID: "bin", MaxHolders: 2}}
 	if err := repo.Save(ctx, locked); err != nil {
 		t.Fatalf("save locked: %v", err)
 	}
@@ -73,17 +70,17 @@ func TestSaveListRoundTrip(t *testing.T) {
 	if listed[0].ID != "c1" || listed[1].ID != "c2" {
 		t.Fatalf("order = %s, %s; want c1, c2", listed[0].ID, listed[1].ID)
 	}
-	if got := listed[0]; got.OwnerID != "t1" || got.Successes != 3 || got.Failures != 2 || got.GroupID != "bin" {
+	if got := listed[0]; got.OwnerID != "t1" || got.GroupID != "bin" {
 		t.Fatalf("c1 round-trip: got %+v", got)
 	}
-	if string(listed[0].Attrs) != string(locked.Attrs) {
-		t.Fatalf("fields = %s, want %s", listed[0].Attrs, locked.Attrs)
+	if string(listed[0].Fields) != string(locked.Fields) {
+		t.Fatalf("fields = %s, want %s", listed[0].Fields, locked.Fields)
 	}
 	if listed[1].MaxHolders != 2 {
 		t.Fatalf("c2 max holders = %d, want 2", listed[1].MaxHolders)
 	}
-	if listed[1].Attrs != nil {
-		t.Fatalf("c2 fields = %s, want none", listed[1].Attrs)
+	if listed[1].Fields != nil {
+		t.Fatalf("c2 fields = %s, want none", listed[1].Fields)
 	}
 }
 
@@ -112,10 +109,10 @@ func TestFieldsAreOpaqueToTheSchema(t *testing.T) {
 		Billing: map[string]string{"zip": "10001", "country": "US"},
 	}
 
-	if err := repo.Save(ctx, cards.Card{ID: "c1", Attrs: mustJSON(t, wantRaw)}); err != nil {
+	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, wantRaw)}); err != nil {
 		t.Fatalf("save raw card: %v", err)
 	}
-	if err := repo.Save(ctx, cards.Card{ID: "c2", Attrs: mustJSON(t, wantTokenized)}); err != nil {
+	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c2"}, Fields: mustJSON(t, wantTokenized)}); err != nil {
 		t.Fatalf("save tokenized card: %v", err)
 	}
 
@@ -146,7 +143,7 @@ func TestSaveRejectsFieldsThatAreNotJSON(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, cards.Card{ID: "c1", Attrs: json.RawMessage("not json")}); err == nil {
+	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}, Fields: json.RawMessage("not json")}); err == nil {
 		t.Fatal("expected invalid JSON fields to be refused")
 	}
 	listed, err := repo.List(ctx)
@@ -165,12 +162,12 @@ func TestSavePreservesCreatedAt(t *testing.T) {
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
-	if err := repo.Save(ctx, cards.Card{ID: "c1", CreatedAt: created, UpdatedAt: created}); err != nil {
+	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1", CreatedAt: created, UpdatedAt: created}}); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 
 	updated := time.Now().UTC().Truncate(time.Millisecond)
-	if err := repo.Save(ctx, cards.Card{ID: "c1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}); err != nil {
+	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1", OwnerID: "t1", CreatedAt: updated, UpdatedAt: updated}}); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
 
@@ -192,7 +189,7 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, cards.Card{ID: "c1"}); err != nil {
+	if err := repo.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := repo.Delete(ctx, "c1"); err != nil {
@@ -260,10 +257,10 @@ func TestCardsAndAccountsShareOneFile(t *testing.T) {
 	}
 	defer cardStore.Close()
 
-	if err := accountStore.Save(ctx, accounts.Account{ID: "a1", GroupID: "site"}); err != nil {
+	if err := accountStore.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", GroupID: "site"}}); err != nil {
 		t.Fatalf("save account: %v", err)
 	}
-	if err := cardStore.Save(ctx, cards.Card{ID: "c1", GroupID: "bin"}); err != nil {
+	if err := cardStore.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1", GroupID: "bin"}}); err != nil {
 		t.Fatalf("save card: %v", err)
 	}
 
@@ -293,7 +290,7 @@ func TestSchemaReopensCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := first.Save(ctx, cards.Card{ID: "c1", Attrs: mustJSON(t, map[string]string{"number": "4111111111111111"})}); err != nil {
+	if err := first.Save(ctx, cards.Card{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, map[string]string{"number": "4111111111111111"})}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := first.Close(); err != nil {

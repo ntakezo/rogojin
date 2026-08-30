@@ -22,14 +22,14 @@ const (
 	accountKind = "account"
 )
 
-// TestNilRepositoryRunsInMemoryLifecycle verifies a Service built with a nil
+// TestNilRepositoryRunsInMemoryLifecycle verifies a Manager built with a nil
 // repository supports the full in-memory lifecycle — create, start to completion,
 // and delete — without ever dereferencing a store. This is the purely in-memory
 // use case: no durability is wanted, so a nil repository must be a valid choice
 // rather than a panic.
 func TestNilRepositoryRunsInMemoryLifecycle(t *testing.T) {
 	var log []workflows.State
-	svc := NewService(nil, comms.NewBus())
+	svc := NewManager(nil, comms.NewBus())
 	wf := &testWorkflow{log: &log}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -56,7 +56,7 @@ func TestNilRepositoryRunsInMemoryLifecycle(t *testing.T) {
 // durable store: there are no persisted tasks to rehydrate, so a startup recovery
 // loop stays safe in in-memory mode rather than crashing on a nil store.
 func TestNilRepositoryRecoverAllIsEmpty(t *testing.T) {
-	svc := NewService(nil, comms.NewBus())
+	svc := NewManager(nil, comms.NewBus())
 
 	recovered, err := svc.RecoverAll(context.Background())
 	if err != nil {
@@ -71,7 +71,7 @@ func TestNilRepositoryRecoverAllIsEmpty(t *testing.T) {
 // loudly with a nil repository: there is nothing durable to rehydrate from, and
 // silently returning a zero task would hide that.
 func TestNilRepositoryRecoverTaskErrors(t *testing.T) {
-	svc := NewService(nil, comms.NewBus())
+	svc := NewManager(nil, comms.NewBus())
 
 	if _, err := svc.RecoverTask(context.Background(), "missing"); err == nil {
 		t.Fatal("RecoverTask with nil repository: want error, got nil")
@@ -82,10 +82,10 @@ func TestNilRepositoryRecoverTaskErrors(t *testing.T) {
 // repository holding one persisted task.
 type recordStore struct {
 	fakeStore
-	record Record
+	record Task
 }
 
-func (r *recordStore) RecoverTask(ctx context.Context, id string) (Record, error) {
+func (r *recordStore) RecoverTask(ctx context.Context, id string) (Task, error) {
 	return r.record, nil
 }
 
@@ -96,8 +96,8 @@ func (r *recordStore) RecoverTask(ctx context.Context, id string) (Record, error
 // what recovery can do. Durability begins at the first checkpoint.
 func TestRecoverNeverCheckpointedTaskFailsLoud(t *testing.T) {
 	var log []workflows.State
-	store := &recordStore{record: Record{ID: "t1", WorkflowID: "test"}}
-	svc := NewService(store, comms.NewBus())
+	store := &recordStore{record: Task{ID: "t1", WorkflowID: "test"}}
+	svc := NewManager(store, comms.NewBus())
 	wf := &testWorkflow{log: &log}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -120,16 +120,16 @@ func TestRecoverNeverCheckpointedTaskFailsLoud(t *testing.T) {
 // group placement and cascade deletion can be asserted without sqlite.
 type memStore struct {
 	mu      sync.Mutex
-	records map[string]Record
+	records map[string]Task
 	groups  map[string]Group
 	deleted []string
 }
 
 func newMemStore() *memStore {
-	return &memStore{records: map[string]Record{}, groups: map[string]Group{}}
+	return &memStore{records: map[string]Task{}, groups: map[string]Group{}}
 }
 
-func (m *memStore) CreateTask(ctx context.Context, rec Record) error {
+func (m *memStore) CreateTask(ctx context.Context, rec Task) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.records[rec.ID] = rec
@@ -163,20 +163,20 @@ func (m *memStore) SaveAssignment(ctx context.Context, id string, kind string, a
 	return nil
 }
 
-func (m *memStore) RecoverTask(ctx context.Context, id string) (Record, error) {
+func (m *memStore) RecoverTask(ctx context.Context, id string) (Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rec, ok := m.records[id]
 	if !ok {
-		return Record{}, errors.New("not found")
+		return Task{}, errors.New("not found")
 	}
 	return rec, nil
 }
 
-func (m *memStore) RecoverAll(ctx context.Context) ([]Record, error) {
+func (m *memStore) RecoverAll(ctx context.Context) ([]Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]Record, 0, len(m.records))
+	out := make([]Task, 0, len(m.records))
 	for _, rec := range m.records {
 		out = append(out, rec)
 	}
@@ -235,7 +235,7 @@ func (m *memStore) TasksInGroup(ctx context.Context, groupID string) ([]string, 
 	return ids, nil
 }
 
-func (m *memStore) record(t *testing.T, id string) Record {
+func (m *memStore) record(t *testing.T, id string) Task {
 	t.Helper()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -287,13 +287,13 @@ func (w *depsWorkflow) wiredWith(t *testing.T, taskID, kind string) workflows.As
 	return workflows.Assignment{}
 }
 
-// newDepsService returns a service with a deps-capturing workflow registered,
+// newDepsManager returns a manager with a deps-capturing workflow registered,
 // alongside the store backing it.
-func newDepsService(t *testing.T, opts ...ServiceOption) (Service, *memStore, *depsWorkflow) {
+func newDepsManager(t *testing.T, opts ...Option) (Manager, *memStore, *depsWorkflow) {
 	t.Helper()
 	store := newMemStore()
 	wf := &depsWorkflow{}
-	svc := NewService(store, comms.NewBus(), opts...)
+	svc := NewManager(store, comms.NewBus(), opts...)
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
 	}
@@ -301,8 +301,8 @@ func newDepsService(t *testing.T, opts ...ServiceOption) (Service, *memStore, *d
 }
 
 // startAndCapture starts the task so its instance is built, exposing the Deps
-// the service resolved for it.
-func startAndCapture(t *testing.T, task Task) {
+// the manager resolved for it.
+func startAndCapture(t *testing.T, task Handle) {
 	t.Helper()
 	if _, err := task.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -313,7 +313,7 @@ func startAndCapture(t *testing.T, task Task) {
 // no options is placed in the global group and, because nothing assigns it a
 // resource group of any kind, leases none — the documented default.
 func TestUngroupedTaskLandsInGlobalAndLeasesNothing(t *testing.T) {
-	svc, store, wf := newDepsService(t)
+	svc, store, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)
@@ -341,7 +341,7 @@ func TestUngroupedTaskLandsInGlobalAndLeasesNothing(t *testing.T) {
 // every kind that group assigns, which is the point of assigning them to a
 // group: one placement decision covers every member and every kind at once.
 func TestTaskInheritsGroupResourceGroups(t *testing.T) {
-	svc, _, wf := newDepsService(t)
+	svc, _, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{
@@ -369,7 +369,7 @@ func TestTaskInheritsGroupResourceGroups(t *testing.T) {
 // inheriting. Placement per kind is the whole reason this is a map rather than
 // a pair of fields.
 func TestAssignmentOverridesGroupOneKindAtATime(t *testing.T) {
-	svc, store, wf := newDepsService(t)
+	svc, store, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{
@@ -415,7 +415,7 @@ func TestAssignmentOverridesGroupOneKindAtATime(t *testing.T) {
 // and "residential" accounts are unrelated pools — and a task assigned one must
 // never come out wired to the other.
 func TestKindsDoNotCollide(t *testing.T) {
-	svc, _, wf := newDepsService(t)
+	svc, _, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil, WithResourceGroup(accountKind, "residential"))
@@ -437,7 +437,7 @@ func TestKindsDoNotCollide(t *testing.T) {
 // assignment is a reference, not ownership: nothing about naming a resource
 // group may make it exclusive to the first task group that claimed it.
 func TestResourceGroupSharedAcrossManyOwners(t *testing.T) {
-	svc, _, wf := newDepsService(t)
+	svc, _, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	for _, id := range []string{"checkout", "restock"} {
@@ -446,7 +446,7 @@ func TestResourceGroupSharedAcrossManyOwners(t *testing.T) {
 		}
 	}
 
-	created := map[string]Task{}
+	created := map[string]Handle{}
 	for name, opts := range map[string][]CreateOption{
 		"viaCheckout":   {InGroup("checkout")},
 		"viaRestock":    {InGroup("restock")},
@@ -472,7 +472,7 @@ func TestResourceGroupSharedAcrossManyOwners(t *testing.T) {
 // does not exist fails instead of silently creating one, so a typo cannot
 // scatter tasks into a namespace nobody manages.
 func TestCreateTaskRejectsUnknownGroup(t *testing.T) {
-	svc, _, wf := newDepsService(t)
+	svc, _, wf := newDepsManager(t)
 
 	if _, err := svc.CreateTask(context.Background(), wf.ID(), nil, InGroup("ghost")); err == nil {
 		t.Fatal("expected error for unknown task group")
@@ -483,7 +483,7 @@ func TestCreateTaskRejectsUnknownGroup(t *testing.T) {
 // re-resolves every inherited kind from the task's group, so a group reassigned
 // while the task was offline takes effect on the next run.
 func TestRecoveredTaskResolvesInheritedResourceGroups(t *testing.T) {
-	svc, store, wf := newDepsService(t)
+	svc, store, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{
@@ -589,7 +589,7 @@ func (f *fakeManager) setUnlockErr(err error) {
 // longer exists — unleasable forever.
 func TestDeleteTaskReleasesResources(t *testing.T) {
 	manager := &fakeManager{}
-	svc, store, wf := newDepsService(t, WithResource(proxyKind, manager))
+	svc, store, wf := newDepsManager(t, WithResource(proxyKind, manager))
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)
@@ -613,7 +613,7 @@ func TestDeleteTaskReleasesResources(t *testing.T) {
 // anyway would lose the only handle on the resource still held.
 func TestDeleteTaskAbortsOnReleaseFailure(t *testing.T) {
 	manager := &fakeManager{unlockErr: errors.New("proxy store down")}
-	svc, store, wf := newDepsService(t, WithResource(proxyKind, manager))
+	svc, store, wf := newDepsManager(t, WithResource(proxyKind, manager))
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)
@@ -639,7 +639,7 @@ func TestDeleteTaskAbortsOnReleaseFailure(t *testing.T) {
 // tasks — releasing each one's resources — and leaves other groups alone.
 func TestDeleteGroupCascades(t *testing.T) {
 	manager := &fakeManager{}
-	svc, store, wf := newDepsService(t, WithResource(proxyKind, manager))
+	svc, store, wf := newDepsManager(t, WithResource(proxyKind, manager))
 	ctx := context.Background()
 
 	for _, id := range []string{"ga", "gb"} {
@@ -655,7 +655,7 @@ func TestDeleteGroupCascades(t *testing.T) {
 		t.Fatalf("DeleteGroup: %v", err)
 	}
 
-	for _, task := range []Task{a1, a2} {
+	for _, task := range []Handle{a1, a2} {
 		if _, err := store.RecoverTask(ctx, task.ID()); err == nil {
 			t.Fatalf("member %s survived cascade", task.ID())
 		}
@@ -676,14 +676,14 @@ func TestDeleteGroupCascades(t *testing.T) {
 
 // TestDeleteGroupSealsMembersAgainstMidSweepStart verifies a member cannot
 // begin running once a cascade has started. Start never goes through the
-// service, so without a latch a member could start between the is-it-running
+// manager, so without a latch a member could start between the is-it-running
 // check and its own deletion — aborting the sweep with earlier members already
 // destroyed and the group still standing.
 func TestDeleteGroupSealsMembersAgainstMidSweepStart(t *testing.T) {
 	store := newMemStore()
 	wf := newBlockingWorkflow()
 
-	var first, second Task
+	var first, second Handle
 	var once sync.Once
 	var startErr error
 	manager := &fakeManager{}
@@ -707,7 +707,7 @@ func TestDeleteGroupSealsMembersAgainstMidSweepStart(t *testing.T) {
 		})
 	}
 
-	svc := NewService(store, comms.NewBus(), WithResource(proxyKind, manager))
+	svc := NewManager(store, comms.NewBus(), WithResource(proxyKind, manager))
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
 	}
@@ -725,7 +725,7 @@ func TestDeleteGroupSealsMembersAgainstMidSweepStart(t *testing.T) {
 	if !errors.Is(startErr, ErrTaskDeleted) {
 		t.Fatalf("mid-sweep Start err = %v, want ErrTaskDeleted", startErr)
 	}
-	for _, task := range []Task{first, second} {
+	for _, task := range []Handle{first, second} {
 		if _, err := store.RecoverTask(ctx, task.ID()); err == nil {
 			t.Fatalf("member %s survived the cascade", task.ID())
 		}
@@ -752,7 +752,7 @@ func TestDeleteGroupReleaseFailureLeavesGroupWhole(t *testing.T) {
 		}
 	}
 
-	svc := NewService(store, comms.NewBus(), WithResource(proxyKind, manager))
+	svc := NewManager(store, comms.NewBus(), WithResource(proxyKind, manager))
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
 	}
@@ -766,7 +766,7 @@ func TestDeleteGroupReleaseFailureLeavesGroupWhole(t *testing.T) {
 	if err := svc.DeleteGroup(ctx, "ga"); err == nil {
 		t.Fatal("expected the release failure to surface")
 	}
-	for _, task := range []Task{first, second} {
+	for _, task := range []Handle{first, second} {
 		if _, err := store.RecoverTask(ctx, task.ID()); err != nil {
 			t.Fatalf("member %s destroyed by a failed cascade: %v", task.ID(), err)
 		}
@@ -784,7 +784,7 @@ func TestDeleteGroupReleaseFailureLeavesGroupWhole(t *testing.T) {
 // record is gone, so a run would checkpoint into nothing and its terminal
 // stamp would fail.
 func TestStartAfterDeleteRefuses(t *testing.T) {
-	svc, _, wf := newDepsService(t)
+	svc, _, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)
@@ -803,7 +803,7 @@ func TestStartAfterDeleteRefuses(t *testing.T) {
 // an error rather than a silent success, so a typo cannot read as a completed
 // cleanup.
 func TestDeleteUnknownGroupFails(t *testing.T) {
-	svc, _, _ := newDepsService(t)
+	svc, _, _ := newDepsManager(t)
 	if err := svc.DeleteGroup(context.Background(), "ghost"); err == nil {
 		t.Fatal("expected an error deleting an unknown task group")
 	}
@@ -812,7 +812,7 @@ func TestDeleteUnknownGroupFails(t *testing.T) {
 // TestRecoverAllResolvesGroupAssignments verifies the bulk recovery path wires
 // each task to its group's resource groups, the same as single recovery.
 func TestRecoverAllResolvesGroupAssignments(t *testing.T) {
-	svc, store, wf := newDepsService(t)
+	svc, store, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	if err := svc.CreateGroup(ctx, Group{ID: "checkout", ResourceGroups: map[string]string{proxyKind: "residential"}}); err != nil {
@@ -823,7 +823,7 @@ func TestRecoverAllResolvesGroupAssignments(t *testing.T) {
 	global, _ := svc.CreateTask(ctx, wf.ID(), nil)
 
 	// Give every record a checkpoint so the recovered tasks are startable.
-	for _, task := range []Task{inherits, overrides, global} {
+	for _, task := range []Handle{inherits, overrides, global} {
 		rec := store.record(t, task.ID())
 		rec.Status, rec.State, rec.Snapshot = string(workflows.StatusRunning), string(s3), []byte(`{"visited":2}`)
 		store.CreateTask(ctx, rec)
@@ -855,7 +855,7 @@ func TestRecoverAllResolvesGroupAssignments(t *testing.T) {
 // half-deleted.
 func TestDeleteGroupRefusesRunningMember(t *testing.T) {
 	store := newMemStore()
-	svc := NewService(store, comms.NewBus())
+	svc := NewManager(store, comms.NewBus())
 	wf := newBlockingWorkflow()
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -933,7 +933,7 @@ func waitUntil(t *testing.T, cond func() bool) {
 // deleted (it exists implicitly), duplicates are refused, and group operations
 // fail loud with no repository rather than pretending to persist.
 func TestGroupCreationRefusals(t *testing.T) {
-	svc, _, _ := newDepsService(t)
+	svc, _, _ := newDepsManager(t)
 	ctx := context.Background()
 
 	if err := svc.CreateGroup(ctx, Group{ID: GlobalGroup}); err == nil {
@@ -952,7 +952,7 @@ func TestGroupCreationRefusals(t *testing.T) {
 		t.Fatal("expected refusal for a duplicate group")
 	}
 
-	memory := NewService(nil, comms.NewBus())
+	memory := NewManager(nil, comms.NewBus())
 	if err := memory.CreateGroup(ctx, Group{ID: "g"}); err == nil {
 		t.Fatal("expected refusal creating a group with no repository")
 	}
@@ -962,11 +962,11 @@ func TestGroupCreationRefusals(t *testing.T) {
 }
 
 // TestIsRunningReadsSuspendedAsLive verifies a suspended task still counts as
-// running for the service: it is parked, not finished, and a deletion must
+// running for the manager: it is parked, not finished, and a deletion must
 // still refuse it.
 func TestIsRunningReadsSuspendedAsLive(t *testing.T) {
 	store := newMemStore()
-	svc := NewService(store, comms.NewBus())
+	svc := NewManager(store, comms.NewBus())
 	var log []workflows.State
 	wf := &gatedWorkflow{log: &log, entered: make(chan struct{}), release: make(chan struct{})}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
@@ -1007,7 +1007,7 @@ func TestIsRunningReadsSuspendedAsLive(t *testing.T) {
 // pinned at once, since each is stored under its own key.
 func TestPinIsDurablePlacementThroughRecovery(t *testing.T) {
 	store := newMemStore()
-	svc := NewService(store, comms.NewBus())
+	svc := NewManager(store, comms.NewBus())
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1048,7 +1048,7 @@ func TestPinIsDurablePlacementThroughRecovery(t *testing.T) {
 
 // assertPlacement fails the test unless the task resolves the kind to exactly
 // this group and pin.
-func assertPlacement(t *testing.T, task Task, kind, wantGroup, wantResource string) {
+func assertPlacement(t *testing.T, task Handle, kind, wantGroup, wantResource string) {
 	t.Helper()
 	groupID, resourceID := task.Assignment(kind)
 	if groupID != wantGroup || resourceID != wantResource {
@@ -1061,7 +1061,7 @@ func assertPlacement(t *testing.T, task Task, kind, wantGroup, wantResource stri
 // that kind.
 func TestWithoutClearsThePin(t *testing.T) {
 	store := newMemStore()
-	svc := NewService(store, comms.NewBus())
+	svc := NewManager(store, comms.NewBus())
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1085,7 +1085,7 @@ func TestWithoutClearsThePin(t *testing.T) {
 func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 	store := newMemStore()
 	proxyMgr, accountMgr := &fakeManager{}, &fakeManager{}
-	svc := NewService(store, comms.NewBus(),
+	svc := NewManager(store, comms.NewBus(),
 		WithResource(proxyKind, proxyMgr),
 		WithResource(accountKind, accountMgr))
 	wf := &depsWorkflow{}
@@ -1138,7 +1138,7 @@ func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 	store := newMemStore()
 	proxyMgr, accountMgr := &fakeManager{}, &fakeManager{}
-	svc := NewService(store, comms.NewBus(),
+	svc := NewManager(store, comms.NewBus(),
 		WithResource(proxyKind, proxyMgr),
 		WithResource(accountKind, accountMgr))
 	wf := &depsWorkflow{}
@@ -1186,7 +1186,7 @@ func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 func TestAssignResourceInheritsGroupForTheReleaser(t *testing.T) {
 	store := newMemStore()
 	proxyMgr := &fakeManager{}
-	svc := NewService(store, comms.NewBus(), WithResource(proxyKind, proxyMgr))
+	svc := NewManager(store, comms.NewBus(), WithResource(proxyKind, proxyMgr))
 	wf := &depsWorkflow{}
 	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
@@ -1215,7 +1215,7 @@ func TestAssignResourceInheritsGroupForTheReleaser(t *testing.T) {
 // forever, so a task holding a proxy and an account must give back both.
 func TestDeleteUnlocksEveryRegisteredKind(t *testing.T) {
 	proxyMgr, accountMgr := &fakeManager{}, &fakeManager{}
-	svc, _, wf := newDepsService(t,
+	svc, _, wf := newDepsManager(t,
 		WithResource(proxyKind, proxyMgr),
 		WithResource(accountKind, accountMgr))
 	ctx := context.Background()
@@ -1242,7 +1242,7 @@ func TestDeleteUnlocksEveryRegisteredKind(t *testing.T) {
 func TestReleaseAttemptsEveryKindDespiteAFailure(t *testing.T) {
 	proxyMgr := &fakeManager{unlockErr: errors.New("store down")}
 	accountMgr := &fakeManager{}
-	svc, store, wf := newDepsService(t,
+	svc, store, wf := newDepsManager(t,
 		WithResource(proxyKind, proxyMgr),
 		WithResource(accountKind, accountMgr))
 	ctx := context.Background()
@@ -1275,7 +1275,7 @@ func TestRegisteringAKindTwicePanics(t *testing.T) {
 			t.Fatal("no panic: a kind registered twice would be unlocked twice")
 		}
 	}()
-	NewService(newMemStore(), comms.NewBus(),
+	NewManager(newMemStore(), comms.NewBus(),
 		WithResource(proxyKind, &fakeManager{}),
 		WithResource(proxyKind, &fakeManager{}))
 }
@@ -1288,14 +1288,15 @@ func TestRegisteringANilManagerPanics(t *testing.T) {
 			t.Fatal("no panic: a nil manager can never unlock anything")
 		}
 	}()
-	NewService(newMemStore(), comms.NewBus(), WithResource(proxyKind, nil))
+	NewManager(newMemStore(), comms.NewBus(), WithResource(proxyKind, nil))
 }
 
 // TestAssignResourceWithoutARegisteredKind verifies placement still lands for a
-// kind no manager is wired for. The record is the service's to write; releasing
-// a lock is the manager's, and there is no manager here to hold one.
+// kind no manager is wired for. The record is this package's to write;
+// releasing a lock is a leasing manager's, and there is no manager here to
+// hold one.
 func TestAssignResourceWithoutARegisteredKind(t *testing.T) {
-	svc, store, wf := newDepsService(t)
+	svc, store, wf := newDepsManager(t)
 	ctx := context.Background()
 
 	task, err := svc.CreateTask(ctx, wf.ID(), nil)

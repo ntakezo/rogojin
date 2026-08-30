@@ -38,7 +38,7 @@ const (
 func seedTask(t *testing.T, repo *SQLite, id, workflowID string) {
 	t.Helper()
 	now := time.Now().UTC()
-	rec := tasks.Record{ID: id, WorkflowID: workflowID, GroupID: tasks.GlobalGroup, CreatedAt: now, UpdatedAt: now}
+	rec := tasks.Task{ID: id, WorkflowID: workflowID, GroupID: tasks.GlobalGroup, CreatedAt: now, UpdatedAt: now}
 	if err := repo.CreateTask(context.Background(), rec); err != nil {
 		t.Fatalf("CreateTask %s: %v", id, err)
 	}
@@ -183,7 +183,7 @@ func TestRecoverAll(t *testing.T) {
 	if len(recs) != 2 {
 		t.Fatalf("got %d records, want 2", len(recs))
 	}
-	byID := map[string]tasks.Record{}
+	byID := map[string]tasks.Task{}
 	for _, r := range recs {
 		byID[r.ID] = r
 	}
@@ -329,7 +329,7 @@ func TestAssignmentTriStateRoundTrips(t *testing.T) {
 		{"opted-out", &none},
 		{"named", &named},
 	} {
-		rec := tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: "g1",
+		rec := tasks.Task{ID: tc.id, WorkflowID: "wf1", GroupID: "g1",
 			Assignments: map[string]tasks.Assignment{proxyKind: {GroupID: tc.assigned}}}
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask %s: %v", tc.id, err)
@@ -361,7 +361,7 @@ func TestAssignmentsAreIndependentPerKind(t *testing.T) {
 	ctx := context.Background()
 
 	proxyGroup, none, accountPin := "residential", "", "buyer-1"
-	rec := tasks.Record{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[string]tasks.Assignment{
+	rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[string]tasks.Assignment{
 		proxyKind:   {GroupID: &proxyGroup, ResourceID: &none},
 		accountKind: {ResourceID: &accountPin},
 	}}
@@ -396,7 +396,7 @@ func TestTimestampsRoundTripAndRefresh(t *testing.T) {
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
-	rec := tasks.Record{ID: "t1", WorkflowID: "wf1", GroupID: tasks.GlobalGroup, CreatedAt: created, UpdatedAt: created}
+	rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: tasks.GlobalGroup, CreatedAt: created, UpdatedAt: created}
 	if err := repo.CreateTask(ctx, rec); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestTasksInGroup(t *testing.T) {
 	for _, tc := range []struct{ id, group string }{
 		{"a1", "ga"}, {"a2", "ga"}, {"b1", "gb"},
 	} {
-		if err := repo.CreateTask(ctx, tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: tc.group}); err != nil {
+		if err := repo.CreateTask(ctx, tasks.Task{ID: tc.id, WorkflowID: "wf1", GroupID: tc.group}); err != nil {
 			t.Fatalf("CreateTask %s: %v", tc.id, err)
 		}
 	}
@@ -573,7 +573,7 @@ func TestPinRoundTrips(t *testing.T) {
 		{"cleared", &none},
 		{"pinned", &named},
 	} {
-		rec := tasks.Record{ID: tc.id, WorkflowID: "wf1", GroupID: "g1",
+		rec := tasks.Task{ID: tc.id, WorkflowID: "wf1", GroupID: "g1",
 			Assignments: map[string]tasks.Assignment{proxyKind: {GroupID: &group, ResourceID: tc.pinned}}}
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask %s: %v", tc.id, err)
@@ -604,7 +604,7 @@ func TestSaveAssignmentRepointsOneKind(t *testing.T) {
 	ctx := context.Background()
 
 	group, pin, accountPin := "residential", "p1", "buyer-1"
-	rec := tasks.Record{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[string]tasks.Assignment{
+	rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Assignments: map[string]tasks.Assignment{
 		proxyKind:   {GroupID: &group, ResourceID: &pin},
 		accountKind: {ResourceID: &accountPin},
 	}}

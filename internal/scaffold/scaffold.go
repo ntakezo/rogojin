@@ -4,7 +4,7 @@
 // main, so a generated tree always compiles and never carries code it cannot use.
 //
 // The templates reproduce framework surface (the workflows interfaces, the opt-in
-// capabilities, the service and manager constructors), so they drift when that
+// capabilities, the manager constructors), so they drift when that
 // surface changes. TestGeneratedCodeCompiles renders every flag combination and
 // vets it against the real packages to catch compile-level drift; see the
 // scaffolder section of CONTRIBUTING.md for the maintenance contract.

@@ -85,7 +85,7 @@ func (r *fakeRepo) DeleteGroup(ctx context.Context, id string) error {
 // TestURLTravelsThroughThePool verifies the payload this package exists for:
 // a proxy's URL survives the trip through the manager, a lock, and a release.
 func TestURLTravelsThroughThePool(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1", Attrs: Attrs{URL: "http://10.0.0.1:8080"}})
+	repo := newFakeRepo(Proxy{Resource: leasing.Resource{ID: "p1"}, URL: "http://10.0.0.1:8080"})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)
@@ -96,7 +96,7 @@ func TestURLTravelsThroughThePool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lock: %v", err)
 	}
-	if got := lease.Resource().Attrs.URL; got != "http://10.0.0.1:8080" {
+	if got := lease.Resource().URL; got != "http://10.0.0.1:8080" {
 		t.Fatalf("URL = %q, want the seeded one", got)
 	}
 	if err := lease.Release(true); err != nil {
@@ -104,7 +104,7 @@ func TestURLTravelsThroughThePool(t *testing.T) {
 	}
 
 	r := repo.records["p1"]
-	if r.Attrs.URL != "http://10.0.0.1:8080" || r.Successes != 1 || r.OwnerID != "t1" {
+	if r.URL != "http://10.0.0.1:8080" || r.Successes != 1 || r.OwnerID != "t1" {
 		t.Fatalf("persisted = %+v, want URL, stats, and lock intact", r)
 	}
 }
@@ -112,7 +112,7 @@ func TestURLTravelsThroughThePool(t *testing.T) {
 // TestBuiltInStrategiesAreRegistered verifies a group may name either built-in
 // with no extra wiring, and that an unknown name still fails loud.
 func TestBuiltInStrategiesAreRegistered(t *testing.T) {
-	repo := newFakeRepo(Proxy{ID: "p1", GroupID: "learned"})
+	repo := newFakeRepo(Proxy{Resource: leasing.Resource{ID: "p1", GroupID: "learned"}})
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: "learned", Strategy: StrategyBayesian})
 	repo.SaveGroup(ctx, Group{ID: "even", Strategy: StrategyRoundRobin})
@@ -139,8 +139,8 @@ func TestBuiltInStrategiesAreRegistered(t *testing.T) {
 // the pass-through option and see proxy-shaped candidates.
 func TestWithStrategyRegistersCustom(t *testing.T) {
 	repo := newFakeRepo(
-		Proxy{ID: "p1", Attrs: Attrs{URL: "http://a"}},
-		Proxy{ID: "p2", Attrs: Attrs{URL: "http://b"}},
+		Proxy{Resource: leasing.Resource{ID: "p1"}, URL: "http://a"},
+		Proxy{Resource: leasing.Resource{ID: "p2"}, URL: "http://b"},
 	)
 	ctx := context.Background()
 	repo.SaveGroup(ctx, Group{ID: GlobalGroup, Strategy: "by-url"})
@@ -166,7 +166,7 @@ type urlSelection struct{ want string }
 
 func (s urlSelection) Select(candidates []Proxy) (Proxy, error) {
 	for _, p := range candidates {
-		if p.Attrs.URL == s.want {
+		if p.URL == s.want {
 			return p, nil
 		}
 	}

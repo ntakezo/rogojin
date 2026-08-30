@@ -95,10 +95,11 @@ func (s *SQLite) Close() error {
 }
 
 // List returns every stored card in stable id order, so the manager's pool order
-// is deterministic.
+// is deterministic. The successes and failures columns are legacy — cards keep
+// no lease outcomes — and are left unread.
 func (s *SQLite) List(ctx context.Context) ([]cards.Card, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, group_id, owner_id, max_holders, successes, failures, fields, created_at, updated_at
+		`SELECT id, group_id, owner_id, max_holders, fields, created_at, updated_at
 		 FROM cards ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list cards: %w", err)
@@ -109,10 +110,10 @@ func (s *SQLite) List(ctx context.Context) ([]cards.Card, error) {
 	for rows.Next() {
 		var c cards.Card
 		var fields, created, updated string
-		if err := rows.Scan(&c.ID, &c.GroupID, &c.OwnerID, &c.MaxHolders, &c.Successes, &c.Failures, &fields, &created, &updated); err != nil {
+		if err := rows.Scan(&c.ID, &c.GroupID, &c.OwnerID, &c.MaxHolders, &fields, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list cards: %w", err)
 		}
-		c.Attrs = parseFields(fields)
+		c.Fields = parseFields(fields)
 		if c.CreatedAt, err = parseTime(created); err != nil {
 			return nil, fmt.Errorf("list cards: %w", err)
 		}
@@ -127,22 +128,21 @@ func (s *SQLite) List(ctx context.Context) ([]cards.Card, error) {
 	return listed, nil
 }
 
-// Save upserts the card's record: group, holder policy, lock owner, fields,
-// stats, and updated_at. created_at is written on insert and never overwritten,
-// so a lock or a stat update cannot revise it.
+// Save upserts the card's record: group, holder policy, lock owner, fields, and
+// updated_at. created_at is written on insert and never overwritten, so a later
+// lock cannot revise it.
 func (s *SQLite) Save(ctx context.Context, c cards.Card) error {
-	fields, err := formatFields(c.Attrs)
+	fields, err := formatFields(c.Fields)
 	if err != nil {
 		return fmt.Errorf("save card %s: %w", c.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO cards (id, group_id, owner_id, max_holders, successes, failures, fields, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO cards (id, group_id, owner_id, max_holders, fields, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET group_id = excluded.group_id,
 		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
-		 successes = excluded.successes, failures = excluded.failures,
 		 fields = excluded.fields, updated_at = excluded.updated_at`,
-		c.ID, c.GroupID, c.OwnerID, c.MaxHolders, c.Successes, c.Failures, fields,
+		c.ID, c.GroupID, c.OwnerID, c.MaxHolders, fields,
 		formatTime(c.CreatedAt), formatTime(c.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save card %s: %w", c.ID, err)

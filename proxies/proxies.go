@@ -1,16 +1,17 @@
 // Package proxies allocates proxies to tasks. It is the leasing package
-// specialized to one resource kind: the payload is a proxy's URL, and a
-// Thompson-sampling selection strategy is installed alongside the default
-// round robin, learning from the success/failure outcomes leases record.
+// specialized to one model: a Proxy embeds leasing.Resource — the pool,
+// group, and lock fields every leasable kind shares — and adds its
+// URL and the success/failure counts it alone keeps. A Thompson-sampling
+// selection strategy is installed alongside the default round robin,
+// learning from those counts — which is why a proxy lease, unlike any
+// other, is released with an outcome.
 //
-// The types here are aliases, not wrappers: a Proxy is a leasing.Resource, the
-// Manager is a leasing.Manager, and every behavior — groups, holder caps,
-// durable locks, pins, lease-guarded deletes — is documented there.
+// Every leasing behavior — groups, holder caps, durable locks, pins,
+// lease-guarded deletes — is documented in the leasing package; the Manager
+// here is that manager over this model, plus the outcome-taking Lease.
 package proxies
 
 import (
-	"context"
-
 	"github.com/ntakezo/rogojin/leasing"
 )
 
@@ -21,58 +22,23 @@ const GlobalGroup = leasing.GlobalGroup
 // leases is tolerated.
 const UnlimitedHolders = leasing.UnlimitedHolders
 
-// Built-in selection strategy names a Group may reference.
-const (
-	StrategyRoundRobin = leasing.StrategyRoundRobin
-	StrategyBayesian   = "bayesian"
-)
-
-// Attrs is the proxy payload the leasing core carries opaquely.
-type Attrs struct {
-	URL string `json:"url"`
+// A Proxy is the durable record of one proxy: the leasing core, its URL, and
+// the lease outcomes it has seen. Successes and Failures are what the
+// bayesian strategy ranks by; a Lease's Release tallies them, so every
+// release is a data point and the counts survive restarts with the row.
+type Proxy struct {
+	leasing.Resource
+	URL       string `json:"url"`
+	Successes uint64 `json:"successes"`
+	Failures  uint64 `json:"failures"`
 }
-
-// A Proxy is the durable record of one proxy; its URL lives in Attrs.
-type Proxy = leasing.Resource[Attrs]
 
 // A Group is a durable named subset of the pool that leases rotate within.
 type Group = leasing.Group
 
 // Repository is the persistence port: a dumb durable store of proxies and
 // their groups.
-type Repository = leasing.Repository[Attrs]
+type Repository = leasing.Repository[Proxy]
 
 // An Assignment is the placement a task leases under; the pin names a proxy.
 type Assignment = leasing.Assignment
-
-// A Manager allocates proxies to tasks. See leasing.Manager.
-type Manager = leasing.Manager[Attrs]
-
-// A Lease is a live hold on one proxy. Release it exactly once when done.
-type Lease = leasing.Lease[Attrs]
-
-// Selection is the strategy port: pick one proxy from the currently-acquirable
-// candidates.
-type Selection = leasing.Selection[Attrs]
-
-// A StrategyFactory builds one Selection instance per group.
-type StrategyFactory = leasing.StrategyFactory[Attrs]
-
-// An Option configures the Manager at construction; see leasing.WithStrategy.
-type Option = leasing.Option[Attrs]
-
-// WithStrategy registers a custom selection strategy under name.
-func WithStrategy(name string, factory StrategyFactory) Option {
-	return leasing.WithStrategy(name, factory)
-}
-
-// NewManager loads the groups and pool from the repository, persisting the
-// global group if absent. The bayesian strategy is installed alongside the
-// built-in round robin before opts apply, so a WithStrategy under its name
-// overrides it.
-func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {
-	installed := append([]Option{
-		WithStrategy(StrategyBayesian, func() Selection { return NewBayesian() }),
-	}, opts...)
-	return leasing.NewManager(ctx, repo, installed...)
-}

@@ -165,12 +165,12 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}
-	client, err := common.NewClient(lease.Resource().Attrs.URL)
+	client, err := common.NewClient(lease.Resource().URL)
 	if err != nil {
 		lease.Release(false)
 		return nil, err
 	}
-	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.assignment.TaskID, lease.Resource().ID, lease.Resource().Attrs.URL)
+	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.assignment.TaskID, lease.Resource().ID, lease.Resource().URL)
 
 	c.running.lease = lease
 	c.running.client = client
@@ -178,9 +178,10 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 }
 
 // Teardown closes the inbox subscription and releases both of the task's
-// leases, reporting success on the absence of a run error. The account's
-// durable lock survives on purpose: it is the task's identity, and only
-// deleting the task gives it back.
+// leases; the proxy's takes the outcome its selection learns from, success
+// being the absence of a run error. The account's durable lock survives on
+// purpose: it is the task's identity, and only deleting the task gives it
+// back.
 func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
 	var released []error
 	if c.running.inbox != nil {
@@ -190,7 +191,7 @@ func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr 
 		released = append(released, c.running.lease.Release(runErr == nil))
 	}
 	if c.running.accountLease != nil {
-		released = append(released, c.running.accountLease.Release(runErr == nil))
+		c.running.accountLease.Release()
 	}
 	return errors.Join(released...)
 }

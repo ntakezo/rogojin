@@ -102,7 +102,7 @@ func (s *SQLite) Close() error {
 
 // CreateTask inserts a fresh task row from its record: workflow, placement,
 // and timestamps, with no checkpoint yet.
-func (s *SQLite) CreateTask(ctx context.Context, rec tasks.Record) error {
+func (s *SQLite) CreateTask(ctx context.Context, rec tasks.Task) error {
 	assignments, err := encodeAssignments(rec.Assignments)
 	if err != nil {
 		return fmt.Errorf("create task %s: %w", rec.ID, err)
@@ -187,22 +187,22 @@ func errRowMissing(op, id string, res sql.Result) error {
 }
 
 // RecoverTask returns the record for id, or ErrNotFound if none exists.
-func (s *SQLite) RecoverTask(ctx context.Context, id string) (tasks.Record, error) {
+func (s *SQLite) RecoverTask(ctx context.Context, id string) (tasks.Task, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
 		 FROM tasks WHERE id = ?`, id)
 	rec, err := scanRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return tasks.Record{}, fmt.Errorf("recover task %s: %w", id, ErrNotFound)
+		return tasks.Task{}, fmt.Errorf("recover task %s: %w", id, ErrNotFound)
 	}
 	if err != nil {
-		return tasks.Record{}, fmt.Errorf("recover task %s: %w", id, err)
+		return tasks.Task{}, fmt.Errorf("recover task %s: %w", id, err)
 	}
 	return rec, nil
 }
 
 // RecoverAll returns every persisted record, terminal ones included.
-func (s *SQLite) RecoverAll(ctx context.Context) ([]tasks.Record, error) {
+func (s *SQLite) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
 		 FROM tasks`)
@@ -211,7 +211,7 @@ func (s *SQLite) RecoverAll(ctx context.Context) ([]tasks.Record, error) {
 	}
 	defer rows.Close()
 
-	records := make([]tasks.Record, 0)
+	records := make([]tasks.Task, 0)
 	for rows.Next() {
 		rec, err := scanRecord(rows)
 		if err != nil {
@@ -328,22 +328,22 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-// scanRecord reads one row into a tasks.Record.
-func scanRecord(row scanner) (tasks.Record, error) {
-	var rec tasks.Record
+// scanRecord reads one row into a tasks.Task.
+func scanRecord(row scanner) (tasks.Task, error) {
+	var rec tasks.Task
 	var assignments, created, updated string
 	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &assignments, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated); err != nil {
-		return tasks.Record{}, err
+		return tasks.Task{}, err
 	}
 	var err error
 	if rec.Assignments, err = decodeAssignments(assignments); err != nil {
-		return tasks.Record{}, err
+		return tasks.Task{}, err
 	}
 	if rec.CreatedAt, err = parseTime(created); err != nil {
-		return tasks.Record{}, err
+		return tasks.Task{}, err
 	}
 	if rec.UpdatedAt, err = parseTime(updated); err != nil {
-		return tasks.Record{}, err
+		return tasks.Task{}, err
 	}
 	return rec, nil
 }

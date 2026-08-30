@@ -95,7 +95,7 @@ type instrument struct {
 // into the workflow's own shape at the point of use.
 func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	raw := json.RawMessage(`{"number":"4111111111111111","cvv":"123"}`)
-	repo := newFakeRepo(Card{ID: "c1", Attrs: raw})
+	repo := newFakeRepo(Card{Resource: leasing.Resource{ID: "c1"}, Fields: raw})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)
@@ -113,11 +113,9 @@ func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 	if got.Number != "4111111111111111" || got.CVV != "123" {
 		t.Fatalf("bound = %+v, want the seeded fields", got)
 	}
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	if string(repo.records["c1"].Attrs) != string(raw) {
-		t.Fatalf("persisted fields = %s, want untouched", repo.records["c1"].Attrs)
+	lease.Release()
+	if string(repo.records["c1"].Fields) != string(raw) {
+		t.Fatalf("persisted fields = %s, want untouched", repo.records["c1"].Fields)
 	}
 }
 
@@ -125,7 +123,7 @@ func TestFieldsTravelOpaquelyAndBindDecodes(t *testing.T) {
 // the zero value rather than erroring, and garbage reports the card it
 // belongs to.
 func TestBindToleratesCardsWithoutFields(t *testing.T) {
-	got, err := Bind[instrument](Card{ID: "bare"})
+	got, err := Bind[instrument](Card{Resource: leasing.Resource{ID: "bare"}})
 	if err != nil {
 		t.Fatalf("Bind of empty fields: %v", err)
 	}
@@ -133,7 +131,7 @@ func TestBindToleratesCardsWithoutFields(t *testing.T) {
 		t.Fatalf("bound = %+v, want the zero instrument", got)
 	}
 
-	if _, err := Bind[instrument](Card{ID: "c9", Attrs: json.RawMessage(`{"number":`)}); err == nil {
+	if _, err := Bind[instrument](Card{Resource: leasing.Resource{ID: "c9"}, Fields: json.RawMessage(`{"number":`)}); err == nil {
 		t.Fatal("expected an error for malformed fields")
 	}
 }
@@ -142,7 +140,7 @@ func TestBindToleratesCardsWithoutFields(t *testing.T) {
 // tasks drawing from the pool get different cards, with nothing configured but
 // the repository.
 func TestCardsRotateWithNoConfiguration(t *testing.T) {
-	repo := newFakeRepo(Card{ID: "c1"}, Card{ID: "c2"})
+	repo := newFakeRepo(Card{Resource: leasing.Resource{ID: "c1"}}, Card{Resource: leasing.Resource{ID: "c2"}})
 	ctx := context.Background()
 
 	m, err := NewManager(ctx, repo)

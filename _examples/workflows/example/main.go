@@ -1,6 +1,6 @@
 // Command example runs the checkout workflow end-to-end as a real task: it spins
 // a canned test site and a local forward proxy, registers the workflow on a task
-// service backed by an in-memory repository, leases a proxy from a round-robin
+// manager backed by an in-memory repository, leases a proxy from a round-robin
 // proxy manager and locks a site account from an account manager, then creates
 // and starts one task, printing each state it checkpoints through and each
 // request the proxy forwards.
@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/ntakezo/rogojin/leasing"
 	"io"
 	"log"
 	"net/http"
@@ -41,8 +42,8 @@ func main() {
 	defer forward.Close()
 
 	// Each manager stands alone: it guards its own pool from the leases and
-	// locks it owns and asks nothing of the task service.
-	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{ID: "local-1", GroupID: proxies.GlobalGroup, Attrs: proxies.Attrs{URL: forward.URL}}))
+	// locks it owns and asks nothing of the task manager.
+	manager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{Resource: leasing.Resource{ID: "local-1", GroupID: proxies.GlobalGroup}, URL: forward.URL}))
 	if err != nil {
 		log.Fatalf("proxy manager: %v", err)
 	}
@@ -68,12 +69,9 @@ func main() {
 	// closes the referential loop: an inbox a held or locked account forwards
 	// to refuses deletion, exactly like a leased resource would.
 	accountManager, err := accounts.NewManager(ctx, newMemAccountRepo(accounts.Account{
-		ID:      "buyer-1",
-		GroupID: accounts.GlobalGroup,
-		Attrs: accounts.Attrs{
-			EmailID: "inbox-1",
-			Fields:  profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
-		},
+		Resource: leasing.Resource{ID: "buyer-1", GroupID: accounts.GlobalGroup},
+		EmailID:  "inbox-1",
+		Fields:   profileFields(states.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
 	}), accounts.WithEmail(emailManager))
 	if err != nil {
 		log.Fatalf("account manager: %v", err)
@@ -83,7 +81,7 @@ func main() {
 	// its kind: deleting a task unlocks both, while repointing one drops only
 	// the lock that moved — a task sent to other proxies must keep the account
 	// it is halfway through a checkout as.
-	svc := tasks.NewService(newMemRepo(), comms.NewBus(),
+	svc := tasks.NewManager(newMemRepo(), comms.NewBus(),
 		tasks.WithResource(states.ProxyKind, manager),
 		tasks.WithResource(states.AccountKind, accountManager))
 	if err := svc.RegisterWorkflow(example_checkout.Name, example_checkout.New(manager, accountManager, emailManager)); err != nil {
@@ -458,15 +456,15 @@ func (r *memAccountRepo) DeleteGroup(ctx context.Context, id string) error {
 // task's last checkpoint and prints the states it advances through.
 type memRepo struct {
 	mu      sync.Mutex
-	records map[string]tasks.Record
+	records map[string]tasks.Task
 	groups  map[string]tasks.Group
 }
 
 func newMemRepo() *memRepo {
-	return &memRepo{records: make(map[string]tasks.Record), groups: make(map[string]tasks.Group)}
+	return &memRepo{records: make(map[string]tasks.Task), groups: make(map[string]tasks.Group)}
 }
 
-func (r *memRepo) CreateTask(ctx context.Context, rec tasks.Record) error {
+func (r *memRepo) CreateTask(ctx context.Context, rec tasks.Task) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.records[rec.ID] = rec
@@ -492,20 +490,20 @@ func (r *memRepo) MarkTerminal(ctx context.Context, id, outcome string, output [
 	return nil
 }
 
-func (r *memRepo) RecoverTask(ctx context.Context, id string) (tasks.Record, error) {
+func (r *memRepo) RecoverTask(ctx context.Context, id string) (tasks.Task, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rec, ok := r.records[id]
 	if !ok {
-		return tasks.Record{}, fmt.Errorf("task %s not found", id)
+		return tasks.Task{}, fmt.Errorf("task %s not found", id)
 	}
 	return rec, nil
 }
 
-func (r *memRepo) RecoverAll(ctx context.Context) ([]tasks.Record, error) {
+func (r *memRepo) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]tasks.Record, 0, len(r.records))
+	out := make([]tasks.Task, 0, len(r.records))
 	for _, rec := range r.records {
 		out = append(out, rec)
 	}
@@ -581,10 +579,10 @@ func (r *memRepo) SaveAssignment(ctx context.Context, id string, kind string, a 
 	return nil
 }
 
-func (r *memRepo) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]tasks.Record, error) {
+func (r *memRepo) TasksPinnedTo(ctx context.Context, kind, resourceID string) ([]tasks.Task, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	pinned := make([]tasks.Record, 0)
+	pinned := make([]tasks.Task, 0)
 	for _, rec := range r.records {
 		if pin := rec.Assignments[kind].ResourceID; pin != nil && *pin == resourceID {
 			pinned = append(pinned, rec)

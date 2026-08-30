@@ -15,12 +15,12 @@ import (
 // how accounts is built, and how a third kind would be.
 func TestAResourceKindNeedsNoConfiguration(t *testing.T) {
 	repo := newFakeRepo(
-		res{ID: "k1", Attrs: payload{secret: "s1", region: "eu"}},
-		res{ID: "k2", Attrs: payload{secret: "s2", region: "us"}},
+		res{Resource: Resource{ID: "k1"}, payload: payload{secret: "s1", region: "eu"}},
+		res{Resource: Resource{ID: "k2"}, payload: payload{secret: "s2", region: "us"}},
 	)
 	ctx := context.Background()
 
-	m, err := NewManager(ctx, Repository[payload](repo))
+	m, err := NewManager(ctx, Repository[res](repo))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -44,10 +44,10 @@ func TestAResourceKindNeedsNoConfiguration(t *testing.T) {
 // an account's credentials live.
 func TestPayloadSurvivesALockAndARestart(t *testing.T) {
 	want := payload{secret: "s1", region: "eu"}
-	repo := newFakeRepo(res{ID: "k1", Attrs: want})
+	repo := newFakeRepo(res{Resource: Resource{ID: "k1"}, payload: want})
 	ctx := context.Background()
 
-	m, err := NewManager(ctx, Repository[payload](repo))
+	m, err := NewManager(ctx, Repository[res](repo))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -55,11 +55,9 @@ func TestPayloadSurvivesALockAndARestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	lease.Release()
 
-	restarted, err := NewManager(ctx, Repository[payload](repo))
+	restarted, err := NewManager(ctx, Repository[res](repo))
 	if err != nil {
 		t.Fatalf("NewManager after restart: %v", err)
 	}
@@ -70,18 +68,15 @@ func TestPayloadSurvivesALockAndARestart(t *testing.T) {
 	if regained.Resource().ID != "k1" {
 		t.Fatalf("reclaimed %s, want k1", regained.Resource().ID)
 	}
-	if regained.Resource().Attrs != want {
-		t.Fatalf("payload = %+v, want %+v", regained.Resource().Attrs, want)
-	}
-	if regained.Resource().Successes != 1 {
-		t.Fatalf("successes = %d, want the release recorded", regained.Resource().Successes)
+	if regained.Resource().payload != want {
+		t.Fatalf("payload = %+v, want %+v", regained.Resource().payload, want)
 	}
 }
 
 // TestNewManagerRequiresARepository verifies the one hard requirement is
 // reported rather than deferred to a nil dereference mid-lease.
 func TestNewManagerRequiresARepository(t *testing.T) {
-	if _, err := NewManager[payload](context.Background(), nil); err == nil {
+	if _, err := NewManager[res, *res](context.Background(), nil); err == nil {
 		t.Fatal("expected a repository to be required")
 	}
 }
@@ -90,11 +85,11 @@ func TestNewManagerRequiresARepository(t *testing.T) {
 // under the round-robin name replaces the built-in, which is the documented way
 // to override the default.
 func TestWithStrategyOverridesRoundRobin(t *testing.T) {
-	repo := newFakeRepo(res{ID: "k1"}, res{ID: "k2"})
+	repo := newFakeRepo(res{Resource: Resource{ID: "k1"}}, res{Resource: Resource{ID: "k2"}})
 	ctx := context.Background()
 
-	m, err := NewManager(ctx, Repository[payload](repo),
-		WithStrategy(StrategyRoundRobin, func() Selection[payload] { return firstSelection{} }))
+	m, err := NewManager(ctx, Repository[res](repo),
+		WithStrategy(StrategyRoundRobin, func() Selection[res] { return firstSelection{} }))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -107,8 +102,6 @@ func TestWithStrategyOverridesRoundRobin(t *testing.T) {
 		if lease.Resource().ID != "k1" {
 			t.Fatalf("acquire %d = %s, want k1 every time under the override", i, lease.Resource().ID)
 		}
-		if err := lease.Release(true); err != nil {
-			t.Fatalf("release %d: %v", i, err)
-		}
+		lease.Release()
 	}
 }

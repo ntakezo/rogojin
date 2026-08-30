@@ -94,10 +94,11 @@ func (s *SQLite) Close() error {
 }
 
 // List returns every stored account in stable id order, so the manager's pool
-// order is deterministic.
+// order is deterministic. The successes and failures columns are legacy —
+// accounts keep no lease outcomes — and are left unread.
 func (s *SQLite) List(ctx context.Context) ([]accounts.Account, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, group_id, owner_id, max_holders, successes, failures, email_id, fields, created_at, updated_at
+		`SELECT id, group_id, owner_id, max_holders, email_id, fields, created_at, updated_at
 		 FROM accounts ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
@@ -108,10 +109,10 @@ func (s *SQLite) List(ctx context.Context) ([]accounts.Account, error) {
 	for rows.Next() {
 		var a accounts.Account
 		var fields, created, updated string
-		if err := rows.Scan(&a.ID, &a.GroupID, &a.OwnerID, &a.MaxHolders, &a.Successes, &a.Failures, &a.Attrs.EmailID, &fields, &created, &updated); err != nil {
+		if err := rows.Scan(&a.ID, &a.GroupID, &a.OwnerID, &a.MaxHolders, &a.EmailID, &fields, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list accounts: %w", err)
 		}
-		a.Attrs.Fields = parseFields(fields)
+		a.Fields = parseFields(fields)
 		if a.CreatedAt, err = parseTime(created); err != nil {
 			return nil, fmt.Errorf("list accounts: %w", err)
 		}
@@ -127,23 +128,22 @@ func (s *SQLite) List(ctx context.Context) ([]accounts.Account, error) {
 }
 
 // Save upserts the account's record: group, holder policy, lock owner, the
-// forwarding email, fields, stats, and updated_at. created_at is written on
-// insert and never overwritten, so a lock or a stat update cannot revise it.
+// forwarding email, fields, and updated_at. created_at is written on
+// insert and never overwritten, so a later lock cannot revise it.
 func (s *SQLite) Save(ctx context.Context, a accounts.Account) error {
-	fields, err := formatFields(a.Attrs.Fields)
+	fields, err := formatFields(a.Fields)
 	if err != nil {
 		return fmt.Errorf("save account %s: %w", a.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO accounts (id, group_id, owner_id, max_holders, successes, failures, email_id, fields, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO accounts (id, group_id, owner_id, max_holders, email_id, fields, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET group_id = excluded.group_id,
 		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
-		 successes = excluded.successes, failures = excluded.failures,
 		 email_id = excluded.email_id, fields = excluded.fields,
 		 updated_at = excluded.updated_at`,
-		a.ID, a.GroupID, a.OwnerID, a.MaxHolders, a.Successes, a.Failures,
-		a.Attrs.EmailID, fields, formatTime(a.CreatedAt), formatTime(a.UpdatedAt))
+		a.ID, a.GroupID, a.OwnerID, a.MaxHolders,
+		a.EmailID, fields, formatTime(a.CreatedAt), formatTime(a.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save account %s: %w", a.ID, err)
 	}

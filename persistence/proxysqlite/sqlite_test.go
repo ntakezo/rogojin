@@ -3,6 +3,7 @@ package proxysqlite
 import (
 	"context"
 	"database/sql"
+	"github.com/ntakezo/rogojin/leasing"
 	"path/filepath"
 	"testing"
 	"time"
@@ -32,8 +33,8 @@ func TestSaveListRoundTrip(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	locked := proxies.Proxy{ID: "p1", Attrs: proxies.Attrs{URL: "http://u:p@h1:80"}, OwnerID: "t1", Successes: 3, Failures: 2}
-	free := proxies.Proxy{ID: "p2", Attrs: proxies.Attrs{URL: "http://h2:80"}}
+	locked := proxies.Proxy{Resource: leasing.Resource{ID: "p1", OwnerID: "t1"}, Successes: 3, Failures: 2, URL: "http://u:p@h1:80"}
+	free := proxies.Proxy{Resource: leasing.Resource{ID: "p2"}, URL: "http://h2:80"}
 	if err := repo.Save(ctx, locked); err != nil {
 		t.Fatalf("save locked: %v", err)
 	}
@@ -66,10 +67,10 @@ func TestSaveUpserts(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", Attrs: proxies.Attrs{URL: "http://h:80"}}); err != nil {
+	if err := repo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "p1"}, URL: "http://h:80"}); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
-	updated := proxies.Proxy{ID: "p1", Attrs: proxies.Attrs{URL: "http://h:80"}, OwnerID: "t1", Successes: 5, Failures: 1}
+	updated := proxies.Proxy{Resource: leasing.Resource{ID: "p1", OwnerID: "t1"}, Successes: 5, Failures: 1, URL: "http://h:80"}
 	if err := repo.Save(ctx, updated); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestDelete(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
 
-	if err := repo.Save(ctx, proxies.Proxy{ID: "p1"}); err != nil {
+	if err := repo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "p1"}}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := repo.Delete(ctx, "p1"); err != nil {
@@ -128,9 +129,9 @@ func TestGroupAndHolderPolicyRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	for _, p := range []proxies.Proxy{
-		{ID: "inherit", GroupID: "residential"},
-		{ID: "capped", GroupID: "residential", MaxHolders: 4},
-		{ID: "unlimited", GroupID: "datacenter", MaxHolders: proxies.UnlimitedHolders},
+		{Resource: leasing.Resource{ID: "inherit", GroupID: "residential"}},
+		{Resource: leasing.Resource{ID: "capped", GroupID: "residential", MaxHolders: 4}},
+		{Resource: leasing.Resource{ID: "unlimited", GroupID: "datacenter", MaxHolders: proxies.UnlimitedHolders}},
 	} {
 		if err := repo.Save(ctx, p); err != nil {
 			t.Fatalf("save %s: %v", p.ID, err)
@@ -164,7 +165,7 @@ func TestProxyTimestampsRoundTrip(t *testing.T) {
 
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
 	updated := time.Now().UTC().Truncate(time.Millisecond)
-	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", CreatedAt: created, UpdatedAt: updated}); err != nil {
+	if err := repo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "p1", CreatedAt: created, UpdatedAt: updated}}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -185,11 +186,11 @@ func TestCreatedAtSurvivesUpserts(t *testing.T) {
 	ctx := context.Background()
 
 	created := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Millisecond)
-	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", CreatedAt: created, UpdatedAt: created}); err != nil {
+	if err := repo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "p1", CreatedAt: created, UpdatedAt: created}}); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 	later := time.Now().UTC().Truncate(time.Millisecond)
-	if err := repo.Save(ctx, proxies.Proxy{ID: "p1", Successes: 1, CreatedAt: later, UpdatedAt: later}); err != nil {
+	if err := repo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "p1", CreatedAt: later, UpdatedAt: later}, Successes: 1}); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
 
@@ -304,7 +305,7 @@ func TestLegacyProxiesLandInGlobalGroup(t *testing.T) {
 	if got.GroupID != proxies.GlobalGroup {
 		t.Fatalf("GroupID = %q, want %q", got.GroupID, proxies.GlobalGroup)
 	}
-	if got.OwnerID != "t1" || got.Successes != 7 || got.Failures != 3 || got.Attrs.URL != "http://h:80" {
+	if got.OwnerID != "t1" || got.Successes != 7 || got.Failures != 3 || got.URL != "http://h:80" {
 		t.Fatalf("legacy row not preserved: %+v", got)
 	}
 	if got.MaxHolders != 0 {
@@ -323,7 +324,7 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSQLite: %v", err)
 	}
-	saved := proxies.Proxy{ID: "p1", Attrs: proxies.Attrs{URL: "http://h:80"}, OwnerID: "t1", Successes: 7, Failures: 3}
+	saved := proxies.Proxy{Resource: leasing.Resource{ID: "p1", OwnerID: "t1"}, Successes: 7, Failures: 3, URL: "http://h:80"}
 	if err := repo.Save(ctx, saved); err != nil {
 		t.Fatalf("save: %v", err)
 	}
