@@ -164,6 +164,16 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	}
 	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.assignment.TaskID, lease.Resource().ID, lease.Resource().URL)
 
+	// The jar is a side effect, rebuilt empty on recovery — a restored queue
+	// cookie only survives the restart if it is re-installed here.
+	if c.running.queueCookie != "" {
+		if err := common.SetCookies(client, c.static.ProductURL,
+			&http.Cookie{Name: "queue", Value: c.running.queueCookie}); err != nil {
+			lease.ReleaseOutcome(ctx, false)
+			return nil, err
+		}
+	}
+
 	c.running.lease = lease
 	c.running.client = client
 	return client, nil

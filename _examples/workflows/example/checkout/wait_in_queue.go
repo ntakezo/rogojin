@@ -5,7 +5,9 @@ import (
 	"math/rand"
 	"time"
 
+	http "github.com/bogdanfinn/fhttp"
 	"github.com/google/uuid"
+	"github.com/ntakezo/rogojin/_examples/workflows/example/common"
 	"github.com/ntakezo/rogojin/comms"
 	"github.com/ntakezo/rogojin/workflows"
 )
@@ -42,6 +44,17 @@ func (c *Context) WaitInQueue(ctx context.Context) (*workflows.State, error) {
 		if err := topic.Emit(ctx, c.running.queueCookie); err != nil {
 			return nil, err
 		}
+	}
+
+	// The cookie must ride on the wire, not just in the snapshot: install it
+	// into the client's jar so every later request presents it.
+	client, err := c.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := common.SetCookies(client, c.static.ProductURL,
+		&http.Cookie{Name: "queue", Value: c.running.queueCookie}); err != nil {
+		return nil, err
 	}
 
 	return workflows.Next(login), nil
