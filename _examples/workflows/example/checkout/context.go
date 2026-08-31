@@ -61,7 +61,10 @@ type RunningContext struct {
 	csrfToken   string
 	cartID      string
 	verifyURL   string
-	order       requests.SubmitCheckoutResponse
+	// submitted guards the checkout submit through workflows.Once: once the
+	// order confirms, no re-entry of the state may place it again.
+	submitted bool
+	order     requests.SubmitCheckoutResponse
 }
 
 // Context is the receiver shared across every state. static holds user input by
@@ -222,10 +225,11 @@ type snapshot struct {
 	CSRFToken   string        `json:"csrfToken"`
 	CartID      string        `json:"cartID"`
 	VerifyURL   string        `json:"verifyURL"`
-	// Order is the placed order — the side-effect guard SubmitCheckout
-	// persists mid-state, so a recovered task never resubmits a checkout
-	// that already went through.
-	Order requests.SubmitCheckoutResponse `json:"order"`
+	// Submitted and Order are the checkout submit's workflows.Once guard and
+	// its result, persisted mid-state the moment the order confirms — so a
+	// recovered task never resubmits a checkout that already went through.
+	Submitted bool                            `json:"submitted"`
+	Order     requests.SubmitCheckoutResponse `json:"order"`
 }
 
 // Output returns the placed order as JSON, the task's final result. It is set by
@@ -245,6 +249,7 @@ func (c *Context) Snapshot() ([]byte, error) {
 		CSRFToken:   c.running.csrfToken,
 		CartID:      c.running.cartID,
 		VerifyURL:   c.running.verifyURL,
+		Submitted:   c.running.submitted,
 		Order:       c.running.order,
 	})
 }
@@ -262,6 +267,7 @@ func RestoreContext(deps workflows.Deps, blob []byte, manager *proxies.Manager, 
 	c.running.csrfToken = s.CSRFToken
 	c.running.cartID = s.CartID
 	c.running.verifyURL = s.VerifyURL
+	c.running.submitted = s.Submitted
 	c.running.order = s.Order
 	return c, nil
 }

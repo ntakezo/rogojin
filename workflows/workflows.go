@@ -31,6 +31,32 @@ func Next(s State) *State {
 	return &s
 }
 
+// Once runs effect unless *done already records a success, then sets *done
+// and persists it through checkpoint — the guard pattern for an external side
+// effect a re-run must not repeat, in one call:
+//
+//	err := workflows.Once(ctx, &c.running.submitted, c.running.checkpoint,
+//		func(ctx context.Context) error { return c.submitOrder(ctx) })
+//
+// done must be a field the instance's Snapshot persists, so a recovered state
+// sees it; checkpoint is Deps.Checkpoint (nil is tolerated and skips the
+// persist, for Deps built by hand). A failed effect leaves *done unset, so a
+// retry re-runs it; a failed checkpoint leaves the success recorded in memory
+// but not durably, so only a crash before the next checkpoint repeats it.
+func Once(ctx context.Context, done *bool, checkpoint func(context.Context) error, effect func(context.Context) error) error {
+	if *done {
+		return nil
+	}
+	if err := effect(ctx); err != nil {
+		return err
+	}
+	*done = true
+	if checkpoint == nil {
+		return nil
+	}
+	return checkpoint(ctx)
+}
+
 // States maps each state in a graph to its handler.
 type States map[State]StateHandler
 

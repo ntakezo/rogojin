@@ -248,12 +248,12 @@ type effectCtx struct {
 func (c *effectCtx) Graph() workflows.Graph {
 	return workflows.NewGraph(s1, workflows.States{
 		s1: func(ctx context.Context) (*workflows.State, error) {
-			if !c.emitted {
+			err := workflows.Once(ctx, &c.emitted, c.deps.Checkpoint, func(ctx context.Context) error {
 				c.w.effects++ // the external side effect
-				c.emitted = true
-				if err := c.deps.Checkpoint(ctx); err != nil {
-					return nil, err
-				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
 			}
 			if c.w.failAfterEffect {
 				c.w.failAfterEffect = false
