@@ -39,6 +39,12 @@ var ErrTaskDeleted = errors.New("task deleted")
 // retried from its last checkpoint.
 var ErrAlreadyTerminal = errors.New("task already reached a terminal outcome")
 
+// ErrDetached is returned by Start when the run was ended by Detach: the
+// task's durable suspended checkpoint stands, so the task is recoverable —
+// the run is over but the task is not. The handle is spent; recover a fresh
+// one through the Manager to start it again.
+var ErrDetached = errors.New("task detached from its suspended run")
+
 // A Task is one task, whole: the durable record of its workflow, its
 // placement (task group, plus a per-kind resource assignment), its
 // last-checkpointed status and resume state with the snapshot taken there —
@@ -209,10 +215,25 @@ func (t *Task) Start(ctx context.Context) ([]byte, error) {
 }
 
 // IsRunning reports whether the task is started and not yet terminal. A
-// suspended task counts: it is parked, not finished. It reads the live run,
-// so it is safe from any goroutine.
+// suspended task counts: it is parked, not finished — use LiveStatus to
+// distinguish. It reads the live run, so it is safe from any goroutine.
 func (t *Task) IsRunning() bool {
 	return t.engine != nil && t.engine.IsRunning()
+}
+
+// LiveStatus reports the task's current lifecycle status. Once the run has
+// started it reads the live engine — running, suspended, killed, failed,
+// done — and is safe from any goroutine. Before the run starts, or on a task
+// with no runtime, it reports the durable Status mirror (the status as of the
+// last checkpoint or terminal stamp), so a recovered-but-unstarted task still
+// answers with the status it will start under.
+func (t *Task) LiveStatus() workflows.Status {
+	if t.engine != nil {
+		if s := t.engine.Status(); s != workflows.StatusNotStarted {
+			return s
+		}
+	}
+	return workflows.Status(t.Status)
 }
 
 // Suspend signals the task to park before processing the next state. It is a
@@ -231,6 +252,20 @@ func (t *Task) Resume() error {
 		return errors.New("task has no runtime")
 	}
 	return t.engine.Resume()
+}
+
+// Detach ends a suspended run, leaving its durable suspended checkpoint
+// intact so the task can be recovered and resumed later — in this or another
+// process. It refuses unless the task is suspended. The blocked Start returns
+// ErrDetached after Teardown runs (releasing the run's leases); afterwards
+// the task is no longer live: IsRunning reports false, it may be deleted, and
+// Manager.RecoverTask returns a fresh handle rehydrated from the checkpoint.
+// This handle is spent — a further Start on it is a no-op.
+func (t *Task) Detach() error {
+	if t.engine == nil {
+		return errors.New("task has no runtime")
+	}
+	return t.engine.Detach()
 }
 
 // Kill stops the task as soon as possible, cancelling the in-flight state. A

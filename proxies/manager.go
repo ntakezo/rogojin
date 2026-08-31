@@ -14,8 +14,8 @@ const (
 )
 
 // A Manager allocates proxies to tasks. It is the leasing manager over Proxy
-// with one addition: the leases it hands out take an outcome on release, the
-// data point the bayesian strategy learns from. Everything else — groups,
+// with one addition: the leases it hands out can take an outcome on release,
+// the data point the bayesian strategy learns from. Everything else — groups,
 // holder caps, durable locks, pins, lease-guarded deletes — promotes from
 // leasing.Manager and is documented there.
 type Manager struct {
@@ -38,7 +38,8 @@ func WithStrategy(name string, factory StrategyFactory) Option {
 }
 
 // NewManager loads the groups and pool from the repository, persisting the
-// global group if absent. The bayesian strategy is installed alongside the
+// global group if absent. Seed groups before resources — see
+// leasing.NewManager. The bayesian strategy is installed alongside the
 // built-in round robin before opts apply, so a WithStrategy under its name
 // overrides it.
 func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {
@@ -71,23 +72,25 @@ func (m *Manager) Lock(ctx context.Context, a Assignment) (*Lease, error) {
 	return &Lease{Lease: l, manager: m}, nil
 }
 
-// A Lease is a live hold on one proxy. Release it exactly once when done,
-// saying how it went.
+// A Lease is a live hold on one proxy. Release it exactly once when done —
+// through ReleaseOutcome where how it went is known, or the plain Release
+// every lease kind shares.
 type Lease struct {
 	*leasing.Lease[Proxy, *Proxy]
 	manager *Manager
 	once    sync.Once
 }
 
-// Release tallies the outcome on the proxy — persisted, so the bayesian
-// strategy's history survives a restart — and then frees it. The tally goes
-// first, while the lease still guards the proxy from deletion; the hold is
-// freed even if the tally fails to persist, since a lease must never leak
-// over a store error. Only the first call acts; later calls return nil.
-func (l *Lease) Release(success bool) error {
+// ReleaseOutcome tallies the outcome on the proxy — persisted, so the
+// bayesian strategy's history survives a restart — and then frees it. The
+// tally goes first, while the lease still guards the proxy from deletion; the
+// hold is freed even if the tally fails to persist, since a lease must never
+// leak over a store error. Only the first of ReleaseOutcome and Release acts;
+// later calls return nil.
+func (l *Lease) ReleaseOutcome(ctx context.Context, success bool) error {
 	var err error
 	l.once.Do(func() {
-		err = l.manager.Update(context.Background(), l.Resource().ID, func(p *Proxy) {
+		err = l.manager.Update(ctx, l.Resource().ID, func(p *Proxy) {
 			if success {
 				p.Successes++
 			} else {
@@ -97,4 +100,12 @@ func (l *Lease) Release(success bool) error {
 		l.Lease.Release()
 	})
 	return err
+}
+
+// Release frees the proxy without recording an outcome — the uniform release
+// every lease kind shares, for teardown paths where how it went is unknown.
+// Prefer ReleaseOutcome where there is an outcome: it is the data point the
+// bayesian strategy learns from. Only the first of the two acts.
+func (l *Lease) Release() {
+	l.once.Do(func() { l.Lease.Release() })
 }

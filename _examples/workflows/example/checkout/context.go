@@ -159,10 +159,20 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	}
 	client, err := common.NewClient(lease.Resource().URL)
 	if err != nil {
-		lease.Release(false)
+		lease.ReleaseOutcome(ctx, false)
 		return nil, err
 	}
 	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.assignment.TaskID, lease.Resource().ID, lease.Resource().URL)
+
+	// The jar is a side effect, rebuilt empty on recovery — a restored queue
+	// cookie only survives the restart if it is re-installed here.
+	if c.running.queueCookie != "" {
+		if err := common.SetCookies(client, c.static.ProductURL,
+			&http.Cookie{Name: "queue", Value: c.running.queueCookie}); err != nil {
+			lease.ReleaseOutcome(ctx, false)
+			return nil, err
+		}
+	}
 
 	c.running.lease = lease
 	c.running.client = client
@@ -180,7 +190,7 @@ func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr 
 		released = append(released, c.running.inbox.Close())
 	}
 	if c.running.lease != nil {
-		released = append(released, c.running.lease.Release(runErr == nil))
+		released = append(released, c.running.lease.ReleaseOutcome(ctx, runErr == nil))
 	}
 	if c.running.accountLease != nil {
 		c.running.accountLease.Release()

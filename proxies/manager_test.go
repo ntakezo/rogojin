@@ -99,13 +99,79 @@ func TestURLTravelsThroughThePool(t *testing.T) {
 	if got := lease.Resource().URL; got != "http://10.0.0.1:8080" {
 		t.Fatalf("URL = %q, want the seeded one", got)
 	}
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("Release: %v", err)
+	if err := lease.ReleaseOutcome(ctx, true); err != nil {
+		t.Fatalf("ReleaseOutcome: %v", err)
 	}
 
 	r := repo.records["p1"]
 	if r.URL != "http://10.0.0.1:8080" || r.Successes != 1 || r.OwnerID != "t1" {
 		t.Fatalf("persisted = %+v, want URL, stats, and lock intact", r)
+	}
+}
+
+// TestReleaseWithoutOutcomeCountsNeither verifies the plain Release frees the
+// proxy without tallying anything — an outcome-free release must not poison
+// the sampler with phantom data.
+func TestReleaseWithoutOutcomeCountsNeither(t *testing.T) {
+	repo := newFakeRepo(Proxy{Resource: leasing.Resource{ID: "p1"}, URL: "http://10.0.0.1:8080"})
+	ctx := context.Background()
+
+	m, err := NewManager(ctx, repo)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	lease, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	lease.Release()
+
+	r := repo.records["p1"]
+	if r.Successes != 0 || r.Failures != 0 {
+		t.Fatalf("persisted counts = %d/%d, want 0/0 for an outcome-free release", r.Successes, r.Failures)
+	}
+	// The slot is free again: a second acquire under the default cap succeeds.
+	if _, err := m.Acquire(ctx, Assignment{TaskID: "t2"}); err != nil {
+		t.Fatalf("Acquire after Release: %v", err)
+	}
+}
+
+// TestOutcomeAndReleaseActOnce verifies the two release paths share one latch:
+// whichever runs first wins, so a uniform Teardown calling Release after an
+// earlier ReleaseOutcome tallies once and frees once.
+func TestOutcomeAndReleaseActOnce(t *testing.T) {
+	repo := newFakeRepo(Proxy{Resource: leasing.Resource{ID: "p1"}, URL: "http://10.0.0.1:8080"})
+	ctx := context.Background()
+
+	m, err := NewManager(ctx, repo)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	// ReleaseOutcome first: the later Release must not free a second time.
+	lease, err := m.Acquire(ctx, Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if err := lease.ReleaseOutcome(ctx, true); err != nil {
+		t.Fatalf("ReleaseOutcome: %v", err)
+	}
+	lease.Release()
+	if got := repo.records["p1"].Successes; got != 1 {
+		t.Fatalf("Successes = %d, want 1 after outcome-then-release", got)
+	}
+
+	// Release first: the later ReleaseOutcome must not tally.
+	lease, err = m.Acquire(ctx, Assignment{TaskID: "t2"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	lease.Release()
+	if err := lease.ReleaseOutcome(ctx, true); err != nil {
+		t.Fatalf("ReleaseOutcome after Release: %v", err)
+	}
+	if got := repo.records["p1"].Successes; got != 1 {
+		t.Fatalf("Successes = %d, want still 1 after release-then-outcome", got)
 	}
 }
 
@@ -125,8 +191,8 @@ func TestBuiltInStrategiesAreRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Acquire via bayesian: %v", err)
 	}
-	if err := lease.Release(true); err != nil {
-		t.Fatalf("Release: %v", err)
+	if err := lease.ReleaseOutcome(ctx, true); err != nil {
+		t.Fatalf("ReleaseOutcome: %v", err)
 	}
 
 	repo.SaveGroup(ctx, Group{ID: "typo", Strategy: "bayseian"})
