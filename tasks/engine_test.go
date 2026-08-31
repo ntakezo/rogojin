@@ -206,6 +206,177 @@ func waitFor(t *testing.T, cond func() bool) {
 	t.Fatal("condition not met within timeout")
 }
 
+// effectWorkflow builds instances whose s1 performs a guarded external effect:
+// the effect increments the shared counter, sets the Emitted guard, and
+// persists it through Deps.Checkpoint — the pattern the mid-state checkpoint
+// exists for. failAfterEffect makes s1 error once after the effect is
+// recorded, so a test can retry and prove the effect does not repeat. lastDeps
+// captures the injected Deps so tests can call Checkpoint from outside a run.
+type effectWorkflow struct {
+	effects         int
+	failAfterEffect bool
+	lastDeps        workflows.Deps
+}
+
+type effectSnapshot struct {
+	Emitted bool `json:"emitted"`
+}
+
+func (w *effectWorkflow) ID() string                    { return "effect" }
+func (w *effectWorkflow) ValidateInput(input any) error { return nil }
+
+func (w *effectWorkflow) NewInstance(input any, deps workflows.Deps) (workflows.Instance, error) {
+	w.lastDeps = deps
+	return &effectCtx{w: w, deps: deps}, nil
+}
+
+func (w *effectWorkflow) RestoreInstance(deps workflows.Deps, snapshot []byte) (workflows.Instance, error) {
+	var s effectSnapshot
+	if err := json.Unmarshal(snapshot, &s); err != nil {
+		return nil, err
+	}
+	w.lastDeps = deps
+	return &effectCtx{w: w, deps: deps, emitted: s.Emitted}, nil
+}
+
+type effectCtx struct {
+	w       *effectWorkflow
+	deps    workflows.Deps
+	emitted bool
+}
+
+func (c *effectCtx) Graph() workflows.Graph {
+	return workflows.NewGraph(s1, workflows.States{
+		s1: func(ctx context.Context) (*workflows.State, error) {
+			if !c.emitted {
+				c.w.effects++ // the external side effect
+				c.emitted = true
+				if err := c.deps.Checkpoint(ctx); err != nil {
+					return nil, err
+				}
+			}
+			if c.w.failAfterEffect {
+				c.w.failAfterEffect = false
+				return nil, errors.New("post-effect failure")
+			}
+			return workflows.Next(s2), nil
+		},
+		s2: func(ctx context.Context) (*workflows.State, error) { return nil, nil },
+	})
+}
+
+func (c *effectCtx) Snapshot() ([]byte, error) {
+	return json.Marshal(effectSnapshot{Emitted: c.emitted})
+}
+
+// TestMidStateCheckpointRecordsProgress verifies Deps.Checkpoint persists the
+// snapshot stamped running at the executing state: after s1's effect the store
+// holds a second s1 checkpoint whose snapshot carries the guard, so a crash
+// from that moment on recovers into a state that knows the effect happened.
+func TestMidStateCheckpointRecordsProgress(t *testing.T) {
+	store := &fakeStore{}
+	wf := &effectWorkflow{}
+	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
+
+	if err := engine.Execute(context.Background(), nil); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if wf.effects != 1 {
+		t.Fatalf("effects = %d, want 1", wf.effects)
+	}
+	// Saves: pre-state s1 (guard down), mid-state s1 (guard up), pre-state s2.
+	if got := store.states(); !reflect.DeepEqual(got, []workflows.State{s1, s1, s2}) {
+		t.Fatalf("checkpoint states = %v, want [s1 s1 s2]", got)
+	}
+	var first, mid effectSnapshot
+	if err := json.Unmarshal(store.saves[0].snapshot, &first); err != nil {
+		t.Fatalf("unmarshal pre-state snapshot: %v", err)
+	}
+	if err := json.Unmarshal(store.saves[1].snapshot, &mid); err != nil {
+		t.Fatalf("unmarshal mid-state snapshot: %v", err)
+	}
+	if first.Emitted || !mid.Emitted {
+		t.Fatalf("guards = pre:%v mid:%v, want pre:false mid:true", first.Emitted, mid.Emitted)
+	}
+	if store.saves[1].status != workflows.StatusRunning {
+		t.Fatalf("mid-state checkpoint status = %q, want running", store.saves[1].status)
+	}
+}
+
+// TestRetryAfterMidStateCheckpointSkipsEffect verifies the policy the
+// mid-state checkpoint implements: a state that errors after its recorded
+// effect retries from the top of the state — the at-least-once contract —
+// but the restored guard skips the effect, so the retry repeats only the
+// work that never succeeded.
+func TestRetryAfterMidStateCheckpointSkipsEffect(t *testing.T) {
+	store := &fakeStore{}
+	wf := &effectWorkflow{failAfterEffect: true}
+	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
+
+	err := engine.Execute(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "post-effect failure") {
+		t.Fatalf("Execute err = %v, want the post-effect failure", err)
+	}
+	if wf.effects != 1 {
+		t.Fatalf("effects = %d, want 1", wf.effects)
+	}
+	if store.terminal != workflows.StatusFailed {
+		t.Fatalf("terminal = %q, want failed (still recoverable)", store.terminal)
+	}
+
+	// Retry from the mid-state checkpoint, the way recovery would.
+	mid := store.saves[len(store.saves)-1]
+	if mid.state != s1 {
+		t.Fatalf("last checkpoint state = %v, want s1", mid.state)
+	}
+	retryStore := &fakeStore{}
+	retry := newEngine(wf, workflows.Deps{TaskID: "task-1"}, retryStore)
+	if err := retry.Rehydrate(context.Background(), mid.snapshot, s1, false); err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	if wf.effects != 1 {
+		t.Fatalf("effects = %d after retry, want still 1 (guard must skip the effect)", wf.effects)
+	}
+	if retryStore.terminal != workflows.StatusDone {
+		t.Fatalf("retry terminal = %q, want done", retryStore.terminal)
+	}
+}
+
+// TestMidStateCheckpointOutsideRunRefuses verifies a Checkpoint call with no
+// state executing is refused: after the run exits, a stray call would
+// overwrite the durable outcome with a stale running stamp.
+func TestMidStateCheckpointOutsideRunRefuses(t *testing.T) {
+	store := &fakeStore{}
+	wf := &effectWorkflow{}
+	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
+
+	if err := engine.Execute(context.Background(), nil); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	saved := len(store.saves)
+	if err := wf.lastDeps.Checkpoint(context.Background()); err == nil {
+		t.Fatal("Checkpoint after the run exited: want refusal, got nil")
+	}
+	if len(store.saves) != saved {
+		t.Fatalf("stray checkpoint persisted: %d saves, want %d", len(store.saves), saved)
+	}
+}
+
+// TestMidStateCheckpointNoRepoIsNoOp verifies the in-memory mode contract:
+// with no repository wired, Deps.Checkpoint succeeds as a no-op, so the same
+// workflow code runs unchanged without durability.
+func TestMidStateCheckpointNoRepoIsNoOp(t *testing.T) {
+	wf := &effectWorkflow{}
+	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, nil)
+
+	if err := engine.Execute(context.Background(), nil); err != nil {
+		t.Fatalf("Execute with no repository: %v", err)
+	}
+	if wf.effects != 1 {
+		t.Fatalf("effects = %d, want 1", wf.effects)
+	}
+}
+
 // TestCheckpointRecordsStateBeforeEach verifies the engine checkpoints before
 // entering each state, persisting that next unprocessed state and a snapshot
 // reflecting progress made before it — the data recovery relies on.

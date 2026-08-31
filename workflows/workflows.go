@@ -17,6 +17,13 @@ type State string
 
 // A StateHandler executes one state and returns the next state to enter, or
 // nil when the workflow is complete.
+//
+// Execution is at least once: recovery re-enters the state that was in flight
+// when the process died, so a handler may run again after its work partially
+// — or wholly — succeeded. A handler whose side effect must not repeat guards
+// it with a snapshot field and persists the success through Deps.Checkpoint
+// the moment it lands, so a re-entered state skips the effect instead of
+// duplicating it.
 type StateHandler func(ctx context.Context) (*State, error)
 
 // Next returns a pointer to s, for a StateHandler to return as its next state.
@@ -139,6 +146,17 @@ type Deps struct {
 	// kind the task has no placement for is absent, which reads as the zero
 	// Assignment — so a lookup needs no branching.
 	Assignments map[leasing.Kind]Assignment
+	// Checkpoint persists the instance's snapshot durably, stamped at the
+	// state currently executing, so progress made inside a handler survives a
+	// crash. Call it from within the handler, right after an external side
+	// effect succeeds and its guard field is set: recovery re-enters the state,
+	// reads the guard from the snapshot, and skips the effect instead of
+	// duplicating it. An error after the call retries the state without
+	// repeating the recorded effect. It is a no-op returning nil when the
+	// instance cannot snapshot or no repository is wired, and refuses when no
+	// state is executing. The framework fills it; a Deps built by hand
+	// carries nil.
+	Checkpoint func(ctx context.Context) error
 }
 
 // An Assignment is a task's resolved placement for one resource kind: the

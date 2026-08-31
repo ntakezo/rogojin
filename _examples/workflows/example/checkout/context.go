@@ -52,6 +52,9 @@ type RunningContext struct {
 	inbox        email.Subscription
 	client       *http.Client
 	bus          comms.Bus
+	// checkpoint is Deps.Checkpoint: persists the snapshot mid-state, so a
+	// state can record an external effect's success the moment it lands.
+	checkpoint func(ctx context.Context) error
 
 	queueCookie string
 	variantID   string
@@ -92,7 +95,8 @@ func NewContext(input StaticContext, deps workflows.Deps, manager *proxies.Manag
 				GroupID:    deps.Assignments[accounts.Kind].GroupID,
 				ResourceID: deps.Assignments[accounts.Kind].ResourceID,
 			},
-			bus: deps.Bus,
+			bus:        deps.Bus,
+			checkpoint: deps.Checkpoint,
 		},
 	}
 }
@@ -218,6 +222,10 @@ type snapshot struct {
 	CSRFToken   string        `json:"csrfToken"`
 	CartID      string        `json:"cartID"`
 	VerifyURL   string        `json:"verifyURL"`
+	// Order is the placed order — the side-effect guard SubmitCheckout
+	// persists mid-state, so a recovered task never resubmits a checkout
+	// that already went through.
+	Order requests.SubmitCheckoutResponse `json:"order"`
 }
 
 // Output returns the placed order as JSON, the task's final result. It is set by
@@ -237,6 +245,7 @@ func (c *Context) Snapshot() ([]byte, error) {
 		CSRFToken:   c.running.csrfToken,
 		CartID:      c.running.cartID,
 		VerifyURL:   c.running.verifyURL,
+		Order:       c.running.order,
 	})
 }
 
@@ -253,5 +262,6 @@ func RestoreContext(deps workflows.Deps, blob []byte, manager *proxies.Manager, 
 	c.running.csrfToken = s.CSRFToken
 	c.running.cartID = s.CartID
 	c.running.verifyURL = s.VerifyURL
+	c.running.order = s.Order
 	return c, nil
 }

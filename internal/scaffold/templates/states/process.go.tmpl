@@ -10,6 +10,12 @@ import (
 // Process handles the fetched body and completes the task by returning a nil
 // next state. Replace the body with your own terminal logic, or return
 // workflows.Next(someState) to advance to another state instead.
+//
+// Handlers run at least once: recovery re-enters the state that was in
+// flight. A state that publishes an external side effect should guard it with
+// a snapshot field and persist the success the moment it lands{{if .Durable}}
+// via c.r.checkpoint (Deps.Checkpoint){{end}}, so a retry skips the effect
+// instead of repeating it.
 func (c *Context) Process(ctx context.Context) (*workflows.State, error) {
 	fmt.Printf("fetched %d bytes from %s\n", len(c.r.body), c.input.URL)
 {{- if .Output}}
