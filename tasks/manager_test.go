@@ -3,6 +3,7 @@ package tasks
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -137,6 +138,16 @@ func (m *memStore) CreateTask(ctx context.Context, rec Task) error {
 }
 
 func (m *memStore) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.records[id]
+	if !ok {
+		return errors.New("not found")
+	}
+	rec.Status, rec.State = status, state
+	rec.Snapshot = append([]byte(nil), snapshot...)
+	rec.UpdatedAt = time.Now().UTC()
+	m.records[id] = rec
 	return nil
 }
 
@@ -1007,6 +1018,112 @@ func TestIsRunningReadsSuspendedAsLive(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 	waitUntil(t, func() bool { return !svc.IsRunning(task.ID) })
+}
+
+// TestDetachedTaskRecoversAndResumes verifies the full "park, then restart the
+// box" shape through the manager: a detached task is no longer live, and
+// RecoverTask hands back a fresh handle that resumes from the suspended
+// checkpoint without re-running completed states.
+func TestDetachedTaskRecoversAndResumes(t *testing.T) {
+	store := newMemStore()
+	svc := mustManager(t, store, comms.NewBus())
+	var log []workflows.State
+	wf := &gatedWorkflow{log: &log, entered: make(chan struct{}), release: make(chan struct{})}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(ctx); done <- serr }()
+	<-wf.entered
+
+	if err := task.Suspend(); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	close(wf.release)
+	// Wait for the suspended checkpoint to land durably before detaching.
+	waitUntil(t, func() bool {
+		rec, err := store.RecoverTask(ctx, task.ID)
+		return err == nil && rec.Status == string(workflows.StatusSuspended)
+	})
+	if err := task.Detach(); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	if err := <-done; !errors.Is(err, ErrDetached) {
+		t.Fatalf("Start err = %v, want ErrDetached", err)
+	}
+	if svc.IsRunning(task.ID) {
+		t.Fatal("manager still counts a detached task as running")
+	}
+
+	recovered, err := svc.RecoverTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if recovered == task {
+		t.Fatal("RecoverTask returned the spent handle, want a fresh rehydration")
+	}
+
+	// The recovered task starts parked at its suspend point; Resume finishes it.
+	go func() { _, serr := recovered.Start(ctx); done <- serr }()
+	waitUntil(t, func() bool { return recovered.LiveStatus() == workflows.StatusSuspended && recovered.IsRunning() })
+	if err := recovered.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("recovered Start: %v", err)
+	}
+	if !reflect.DeepEqual(log, []workflows.State{s1, s2, s3}) {
+		t.Fatalf("states = %v, want [s1 s2 s3] (s1 must not re-run)", log)
+	}
+	if got := recovered.LiveStatus(); got != workflows.StatusDone {
+		t.Fatalf("LiveStatus = %q, want done", got)
+	}
+}
+
+// TestDetachedTaskCanBeDeleted verifies detaching frees a parked task for
+// deletion — the contrast to a merely-suspended task, which deletion refuses.
+func TestDetachedTaskCanBeDeleted(t *testing.T) {
+	store := newMemStore()
+	svc := mustManager(t, store, comms.NewBus())
+	var log []workflows.State
+	wf := &gatedWorkflow{log: &log, entered: make(chan struct{}), release: make(chan struct{})}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(ctx); done <- serr }()
+	<-wf.entered
+
+	if err := task.Suspend(); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	close(wf.release)
+	waitUntil(t, func() bool { return task.LiveStatus() == workflows.StatusSuspended })
+	if err := svc.DeleteTask(ctx, task.ID); err == nil {
+		t.Fatal("expected a suspended task to refuse deletion")
+	}
+
+	if err := task.Detach(); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	if err := <-done; !errors.Is(err, ErrDetached) {
+		t.Fatalf("Start err = %v, want ErrDetached", err)
+	}
+	if err := svc.DeleteTask(ctx, task.ID); err != nil {
+		t.Fatalf("DeleteTask after detach: %v", err)
+	}
 }
 
 // TestPinIsDurablePlacementThroughRecovery verifies a pin is durable placement,

@@ -39,6 +39,12 @@ var ErrTaskDeleted = errors.New("task deleted")
 // retried from its last checkpoint.
 var ErrAlreadyTerminal = errors.New("task already reached a terminal outcome")
 
+// ErrDetached is returned by Start when the run was ended by Detach: the
+// task's durable suspended checkpoint stands, so the task is recoverable —
+// the run is over but the task is not. The handle is spent; recover a fresh
+// one through the Manager to start it again.
+var ErrDetached = errors.New("task detached from its suspended run")
+
 // A Task is one task, whole: the durable record of its workflow, its
 // placement (task group, plus a per-kind resource assignment), its
 // last-checkpointed status and resume state with the snapshot taken there —
@@ -246,6 +252,20 @@ func (t *Task) Resume() error {
 		return errors.New("task has no runtime")
 	}
 	return t.engine.Resume()
+}
+
+// Detach ends a suspended run, leaving its durable suspended checkpoint
+// intact so the task can be recovered and resumed later — in this or another
+// process. It refuses unless the task is suspended. The blocked Start returns
+// ErrDetached after Teardown runs (releasing the run's leases); afterwards
+// the task is no longer live: IsRunning reports false, it may be deleted, and
+// Manager.RecoverTask returns a fresh handle rehydrated from the checkpoint.
+// This handle is spent — a further Start on it is a no-op.
+func (t *Task) Detach() error {
+	if t.engine == nil {
+		return errors.New("task has no runtime")
+	}
+	return t.engine.Detach()
 }
 
 // Kill stops the task as soon as possible, cancelling the in-flight state. A

@@ -337,6 +337,14 @@ func (w *gatedWorkflow) NewInstance(input any, deps workflows.Deps) (workflows.I
 	return &gatedCtx{log: w.log, entered: w.entered, release: w.release}, nil
 }
 
+func (w *gatedWorkflow) RestoreInstance(deps workflows.Deps, snapshot []byte) (workflows.Instance, error) {
+	var s testSnapshot
+	if err := json.Unmarshal(snapshot, &s); err != nil {
+		return nil, err
+	}
+	return &gatedCtx{log: w.log, visited: s.Visited, entered: w.entered, release: w.release}, nil
+}
+
 type gatedCtx struct {
 	log     *[]workflows.State
 	visited int
@@ -433,6 +441,217 @@ func TestSuspendPersistsDurableCheckpoint(t *testing.T) {
 	}
 	if !store.terminalSet || store.terminal != workflows.StatusDone {
 		t.Fatalf("terminal = %q (set=%v), want done", store.terminal, store.terminalSet)
+	}
+}
+
+// TestDetachEndsSuspendedRunRecoverably verifies Detach ends a parked run
+// without a terminal stamp: Start returns ErrDetached, the suspended
+// checkpoint remains the durable truth, and the spent handle is no longer
+// live — the shape of "park, then restart the box".
+func TestDetachEndsSuspendedRunRecoverably(t *testing.T) {
+	var log []workflows.State
+	store := &fakeStore{}
+	wf := &gatedWorkflow{
+		log:     &log,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	task, err := createTask(wf, wf.ID(), nil, nil, store, "", nil, nil)
+	if err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(context.Background()); done <- serr }()
+
+	select {
+	case <-wf.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("s1 never entered")
+	}
+	if err := task.Suspend(); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	close(wf.release)
+	waitFor(t, func() bool { return store.lastSuspended() != nil })
+
+	if err := task.Detach(); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrDetached) {
+			t.Fatalf("Start err = %v, want ErrDetached", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached run did not exit")
+	}
+
+	if store.terminalSet {
+		t.Fatalf("detach stamped a terminal outcome %q: the record is no longer recoverable", store.terminal)
+	}
+	if sv := store.lastSuspended(); sv.state != s2 {
+		t.Fatalf("suspended checkpoint state = %v, want s2", sv.state)
+	}
+	if task.IsRunning() {
+		t.Fatal("IsRunning = true after detach: the handle must be dead")
+	}
+	if got := task.LiveStatus(); got != workflows.StatusSuspended {
+		t.Fatalf("LiveStatus = %q, want suspended (the durable truth)", got)
+	}
+	if workflows.Status(task.Status) != workflows.StatusSuspended {
+		t.Fatalf("Status = %q, want suspended", task.Status)
+	}
+
+	// The spent handle is inert: a second Detach is a no-op and Resume must
+	// not mark a dead run live again.
+	if err := task.Detach(); err != nil {
+		t.Fatalf("second Detach: %v", err)
+	}
+	if err := task.Resume(); err != nil {
+		t.Fatalf("Resume after detach: %v", err)
+	}
+	if task.IsRunning() {
+		t.Fatal("Resume revived a detached handle")
+	}
+}
+
+// TestDetachRefusesUnlessSuspended verifies Detach is a suspended-only exit:
+// an unstarted or running task refuses, so a detach can never race a run into
+// an unparked, uncheckpointed stop.
+func TestDetachRefusesUnlessSuspended(t *testing.T) {
+	var log []workflows.State
+	if unstarted, err := createTask(&testWorkflow{log: &log}, "wf", nil, nil, &fakeStore{}, "", nil, nil); err != nil {
+		t.Fatalf("createTask: %v", err)
+	} else if err := unstarted.Detach(); err == nil {
+		t.Fatal("Detach on an unstarted task: want refusal, got nil")
+	}
+
+	wf := &gatedWorkflow{
+		log:     &log,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	task, err := createTask(wf, wf.ID(), nil, nil, &fakeStore{}, "", nil, nil)
+	if err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(context.Background()); done <- serr }()
+	select {
+	case <-wf.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("s1 never entered")
+	}
+
+	if err := task.Detach(); err == nil {
+		t.Fatal("Detach on a running task: want refusal, got nil")
+	}
+
+	close(wf.release)
+	if err := <-done; err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+}
+
+// TestDetachRunsTeardown verifies a detached run still tears down — leases
+// must release when the process lets go of a parked task — observing the
+// suspended status and ErrDetached, not a terminal outcome.
+func TestDetachRunsTeardown(t *testing.T) {
+	rec := &teardownRecorder{}
+	wf := &teardownWorkflow{
+		rec:     rec,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, nil)
+
+	done := make(chan error, 1)
+	go func() { done <- engine.Execute(context.Background(), nil) }()
+
+	select {
+	case <-wf.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("s1 never entered")
+	}
+	// Suspend and detach back-to-back while s1 is still in flight.
+	if err := engine.Suspend(); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := engine.Detach(); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	close(wf.release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrDetached) {
+			t.Fatalf("Execute err = %v, want ErrDetached", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached run did not exit")
+	}
+
+	calls, status, runErr := rec.snapshot()
+	if calls != 1 {
+		t.Fatalf("teardown called %d times, want 1", calls)
+	}
+	if status != workflows.StatusSuspended {
+		t.Fatalf("teardown status = %q, want suspended", status)
+	}
+	if !errors.Is(runErr, ErrDetached) {
+		t.Fatalf("teardown runErr = %v, want ErrDetached", runErr)
+	}
+}
+
+// TestSuspendThenDetachStillCheckpoints verifies a Suspend/Detach pair issued
+// while the handler is still in flight exits only after the suspended
+// checkpoint is durably written — the boundary persists first, then observes
+// the detach, so the exit is always recoverable.
+func TestSuspendThenDetachStillCheckpoints(t *testing.T) {
+	var log []workflows.State
+	store := &fakeStore{}
+	wf := &gatedWorkflow{
+		log:     &log,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
+
+	done := make(chan error, 1)
+	go func() { done <- engine.Execute(context.Background(), nil) }()
+
+	select {
+	case <-wf.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("s1 never entered")
+	}
+	if err := engine.Suspend(); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := engine.Detach(); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	close(wf.release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrDetached) {
+			t.Fatalf("Execute err = %v, want ErrDetached", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached run did not exit")
+	}
+
+	sv := store.lastSuspended()
+	if sv == nil {
+		t.Fatal("no suspended checkpoint written before the detach exit")
+	}
+	if sv.state != s2 {
+		t.Fatalf("suspended checkpoint state = %v, want s2", sv.state)
+	}
+	if store.terminalSet {
+		t.Fatalf("detach stamped a terminal outcome %q", store.terminal)
 	}
 }
 

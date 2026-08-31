@@ -25,6 +25,13 @@ type engine struct {
 	// sealed latches the engine closed for deletion: Start refuses, so a task
 	// cannot begin running out from under the sweep that is removing it.
 	sealed bool
+	// detachWanted latches a Detach: the run exits at the suspend boundary
+	// instead of parking. detachDone marks that exit: the handle is dead, the
+	// durable record still suspended. Liveness keys off detachDone alone — a
+	// pending detach whose handler is still in flight must stay live, or a
+	// deletion sweep could remove a task that is still checkpointing.
+	detachWanted bool
+	detachDone   bool
 }
 
 func newEngine(workflow workflows.Workflow, deps workflows.Deps, repo Repository) *engine {
@@ -60,8 +67,9 @@ func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows
 
 // run drives the instance from start (or the graph's initial state when start
 // is nil) until completion, error, or kill, stamping the durable terminal
-// outcome on exit. With suspended set it begins parked at start, so a recovered
-// suspend resumes paused exactly where it left off.
+// outcome on exit — except a detached exit, which leaves the suspended
+// checkpoint as the durable truth. With suspended set it begins parked at
+// start, so a recovered suspend resumes paused exactly where it left off.
 func (e *engine) run(ctx context.Context, instance workflows.Instance, start *workflows.State, suspended bool) (err error) {
 	e.mu.Lock()
 	if e.sealed {
@@ -124,14 +132,22 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 				return serr
 			}
 			e.mu.Lock()
-			for e.state == workflows.StatusSuspended {
+			for e.state == workflows.StatusSuspended && !e.detachWanted {
 				e.cond.Wait()
 			}
 		}
 		dead := e.state == workflows.StatusKilled
+		detached := e.state == workflows.StatusSuspended && e.detachWanted
+		if detached {
+			e.detachDone = true
+		}
 		e.mu.Unlock()
 		if dead {
+			// a kill racing a pending detach wins: the operator asked to stop.
 			return context.Canceled
+		}
+		if detached {
+			return ErrDetached
 		}
 
 		if next == nil {
@@ -217,7 +233,7 @@ func (e *engine) Output() []byte {
 func (e *engine) seal() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.state == workflows.StatusRunning || e.state == workflows.StatusSuspended {
+	if (e.state == workflows.StatusRunning || e.state == workflows.StatusSuspended) && !e.detachDone {
 		return false
 	}
 	e.sealed = true
@@ -238,27 +254,39 @@ func (e *engine) Status() workflows.Status {
 	return e.state
 }
 
-// IsRunning reports whether the engine is started and not yet terminal.
+// IsRunning reports whether the engine is started and not yet terminal. A
+// detached engine is not live: its run has exited, even though its status
+// truthfully remains suspended.
 func (e *engine) IsRunning() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.state == workflows.StatusRunning || e.state == workflows.StatusSuspended
+	return (e.state == workflows.StatusRunning || e.state == workflows.StatusSuspended) && !e.detachDone
 }
 
-// Suspend signals the engine to park before the next state. No-op unless running.
+// Suspend signals the engine to park before the next state. No-op unless
+// running; a detached or detaching engine is inert.
 func (e *engine) Suspend() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.detachWanted || e.detachDone {
+		return nil
+	}
 	if e.state == workflows.StatusRunning {
 		e.state = workflows.StatusSuspended
 	}
 	return nil
 }
 
-// Resume continues a suspended engine at the next state. No-op unless suspended.
+// Resume continues a suspended engine at the next state. No-op unless
+// suspended; a detached or detaching engine is inert — resuming one would
+// mark a dead handle running forever, or unlatch a detach into some
+// unrelated future suspend.
 func (e *engine) Resume() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.detachWanted || e.detachDone {
+		return nil
+	}
 	if e.state == workflows.StatusSuspended {
 		e.state = workflows.StatusRunning
 		e.cond.Signal()
@@ -266,12 +294,35 @@ func (e *engine) Resume() error {
 	return nil
 }
 
+// Detach asks a suspended run to exit at its park point, keeping the durable
+// suspended checkpoint as the task's resume point. It refuses unless the
+// engine is suspended; calling it again after a detach is a no-op. A
+// Suspend/Detach pair issued while a handler is still in flight is honored in
+// order: the run reaches the boundary, persists the suspended checkpoint, and
+// only then observes the detach — so the exit is always recoverable.
+func (e *engine) Detach() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.detachWanted || e.detachDone {
+		return nil
+	}
+	if e.state != workflows.StatusSuspended {
+		return fmt.Errorf("cannot detach: task is %q, want suspended", e.state)
+	}
+	e.detachWanted = true
+	e.cond.Signal()
+	return nil
+}
+
 // Kill cancels the engine immediately, interrupting the in-flight state. A
 // kill before Start latches so a later Start refuses to run. No-op once
-// terminal.
+// terminal or detached.
 func (e *engine) Kill() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.detachDone {
+		return nil
+	}
 	switch e.state {
 	case workflows.StatusNotStarted:
 		e.state = workflows.StatusKilled
@@ -285,12 +336,18 @@ func (e *engine) Kill() error {
 
 // finish stamps the run's durable outcome: killed stays killed, an errored run
 // is stamped failed (still recoverable from its last checkpoint), a clean one
-// done. The record is never deleted here; removal is consumer-driven. The
-// stamp uses a background context so it lands even after a kill's cancellation;
-// a stamp failure is returned so the run surfaces it rather than silently
-// reporting a durable outcome that never landed.
+// done. A detached exit stamps nothing: the suspended checkpoint written at
+// the park boundary is the durable truth, and a terminal stamp would overwrite
+// it into an unrecoverable record. The record is never deleted here; removal
+// is consumer-driven. The stamp uses a background context so it lands even
+// after a kill's cancellation; a stamp failure is returned so the run surfaces
+// it rather than silently reporting a durable outcome that never landed.
 func (e *engine) finish(runErr error) error {
 	e.mu.Lock()
+	if e.detachDone {
+		e.mu.Unlock()
+		return nil
+	}
 	if e.state != workflows.StatusKilled {
 		if runErr != nil {
 			e.state = workflows.StatusFailed

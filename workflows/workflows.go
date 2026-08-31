@@ -72,9 +72,9 @@ type Snapshotter interface {
 
 // Teardowner is the opt-in cleanup capability for releasing resources acquired
 // during a run. The engine calls Teardown exactly once when a started run
-// exits, with the terminal status and the run's error (nil on clean
-// completion). It receives a background context so a kill's cancellation
-// cannot block cleanup.
+// exits, with the status at exit (suspended when the run was detached) and
+// the run's error (nil on clean completion). It receives a background context
+// so a kill's cancellation cannot block cleanup.
 type Teardowner interface {
 	Teardown(ctx context.Context, status Status, runErr error) error
 }
