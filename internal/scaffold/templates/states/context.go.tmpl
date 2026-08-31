@@ -106,7 +106,7 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 	}
 	proxyURL, err := url.Parse(lease.Resource().URL)
 	if err != nil {
-		lease.Release(false)
+		lease.ReleaseOutcome(ctx, false)
 		return nil, fmt.Errorf("parse proxy url: %w", err)
 	}
 	c.r.lease = lease
@@ -115,12 +115,13 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 }
 
 // Teardown releases the task's proxy lease exactly once when the run exits,
-// reporting success on the absence of a run error.
+// reporting the outcome its selection learns from — success being the absence
+// of a run error.
 func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
 	if c.r.lease == nil {
 		return nil
 	}
-	return c.r.lease.Release(runErr == nil)
+	return c.r.lease.ReleaseOutcome(ctx, runErr == nil)
 }
 {{end}}
 {{- if .Durable}}

@@ -4,7 +4,8 @@
 // URL and the success/failure counts it alone keeps. A Thompson-sampling
 // selection strategy is installed alongside the default round robin,
 // learning from those counts — which is why a proxy lease, unlike any
-// other, is released with an outcome.
+// other, may be released with an outcome (ReleaseOutcome), alongside the
+// plain Release every lease kind shares.
 //
 // Every leasing behavior — groups, holder caps, durable locks, pins,
 // lease-guarded deletes — is documented in the leasing package; the Manager
@@ -30,8 +31,8 @@ const UnlimitedHolders = leasing.UnlimitedHolders
 
 // A Proxy is the durable record of one proxy: the leasing core, its URL, and
 // the lease outcomes it has seen. Successes and Failures are what the
-// bayesian strategy ranks by; a Lease's Release tallies them, so every
-// release is a data point and the counts survive restarts with the row.
+// bayesian strategy ranks by; a Lease's ReleaseOutcome tallies them, so every
+// outcome release is a data point and the counts survive restarts with the row.
 type Proxy struct {
 	leasing.Resource
 	URL       string `json:"url"`
