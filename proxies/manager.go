@@ -38,7 +38,8 @@ func WithStrategy(name string, factory StrategyFactory) Option {
 }
 
 // NewManager loads the groups and pool from the repository, persisting the
-// global group if absent. The bayesian strategy is installed alongside the
+// global group if absent. Seed groups before resources — see
+// leasing.NewManager. The bayesian strategy is installed alongside the
 // built-in round robin before opts apply, so a WithStrategy under its name
 // overrides it.
 func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {

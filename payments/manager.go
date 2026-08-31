@@ -13,7 +13,8 @@ type Manager = leasing.Manager[Payment, *Payment]
 type Lease = leasing.Lease[Payment, *Payment]
 
 // NewManager loads the groups and pool from the repository, persisting the
-// global group if absent.
+// global group if absent. Seed groups before resources — see
+// leasing.NewManager.
 func NewManager(ctx context.Context, repo Repository) (*Manager, error) {
 	return leasing.NewManager[Payment](ctx, repo)
 }

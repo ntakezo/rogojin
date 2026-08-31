@@ -152,7 +152,9 @@ type manager struct {
 // through CreateGroup and DeleteGroup. A nil repository selects purely
 // in-memory operation: tasks run without checkpoints, durable terminal stamps,
 // or stored groups, and there is nothing to recover after a restart. Use it
-// when durability and crash recovery are not needed.
+// when durability and crash recovery are not needed. Unlike the leasing
+// managers, task records are not validated against groups here; a record
+// naming a missing group fails at recovery instead.
 func NewManager(ctx context.Context, repository Repository, bus comms.Bus, opts ...Option) (Manager, error) {
 	s := &manager{
 		repository:       repository,

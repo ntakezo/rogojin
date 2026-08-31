@@ -43,6 +43,11 @@ type Manager[R any, P Leasable[R]] struct {
 // global group if absent. Round robin is always installed and is always the
 // default: a group naming no strategy rotates round robin. Groups and pool
 // change afterwards only through CreateGroup, DeleteGroup, Add, and Delete.
+//
+// Seed groups before resources: a resource whose GroupID has no stored group
+// fails construction with ErrGroupNotFound, so a repository seeded directly
+// must SaveGroup before Save. Resources with no GroupID land in the global
+// group, which is created here if absent.
 func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], opts ...Option[R, P]) (*Manager[R, P], error) {
 	if repo == nil {
 		return nil, errors.New("repository is required")
@@ -100,7 +105,7 @@ func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], o
 			c.GroupID = GlobalGroup
 		}
 		if _, ok := m.groups[c.GroupID]; !ok {
-			return nil, fmt.Errorf("resource %s references group %s: %w", c.ID, c.GroupID, ErrGroupNotFound)
+			return nil, fmt.Errorf("resource %s references group %s (seed groups before resources: SaveGroup before Save): %w", c.ID, c.GroupID, ErrGroupNotFound)
 		}
 		if err := validateHolderPolicy(c.MaxHolders); err != nil {
 			return nil, fmt.Errorf("resource %s: %w", c.ID, err)
@@ -291,7 +296,8 @@ func (m *Manager[R, P]) members(groupID string) []string {
 }
 
 // Add persists and installs a new unlocked resource, defaulting an empty
-// GroupID to the global group. The group must exist.
+// GroupID to the global group. The group must exist — create it first with
+// CreateGroup, or ErrGroupNotFound.
 func (m *Manager[R, P]) Add(ctx context.Context, p R) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

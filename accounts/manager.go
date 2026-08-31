@@ -32,7 +32,8 @@ func WithEmail(m *email.Manager) Option {
 }
 
 // NewManager loads the groups and pool from the repository, persisting the
-// global group if absent. Given WithEmail, it also installs the account
+// global group if absent. Seed groups before resources — see
+// leasing.NewManager. Given WithEmail, it also installs the account
 // side of the email delete policy — see WithEmail.
 func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {
 	var cfg config
