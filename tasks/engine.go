@@ -32,10 +32,19 @@ type engine struct {
 	// deletion sweep could remove a task that is still checkpointing.
 	detachWanted bool
 	detachDone   bool
+	// current is the state whose handler is executing, and snap the run's
+	// snapshot capability — what Deps.Checkpoint reads to persist mid-state
+	// progress stamped at the right state.
+	current workflows.State
+	snap    snapshotState
 }
 
 func newEngine(workflow workflows.Workflow, deps workflows.Deps, repo Repository) *engine {
-	e := &engine{workflow: workflow, deps: deps, repo: repo}
+	e := &engine{workflow: workflow, repo: repo}
+	// The instance's mid-state checkpoint rides in on Deps, so a handler can
+	// make an effect's success durable the moment it lands.
+	deps.Checkpoint = e.midCheckpoint
+	e.deps = deps
 	e.cond = sync.NewCond(&e.mu)
 	return e
 }
@@ -120,10 +129,16 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 	}
 
 	snap := snapshotState{snapshotter, canSnapshot}
+	e.mu.Lock()
+	e.snap = snap
+	e.mu.Unlock()
 
 	for {
 		// boundary: honor suspend/kill after the previous state, before the next.
 		e.mu.Lock()
+		// no handler is executing between states, so a mid-state checkpoint
+		// arriving now must refuse rather than stamp a stale resume point.
+		e.current = ""
 		if next != nil && e.state == workflows.StatusSuspended {
 			// persist the suspend durably so recovery brings the task back
 			// paused at the next unprocessed state.
@@ -171,6 +186,9 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 			return serr
 		}
 
+		e.mu.Lock()
+		e.current = *next
+		e.mu.Unlock()
 		next, err = handler(ctx)
 		if err != nil {
 			return err
@@ -182,6 +200,26 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 type snapshotState struct {
 	snapshotter workflows.Snapshotter
 	canSnapshot bool
+}
+
+// midCheckpoint is the engine side of Deps.Checkpoint: it persists the
+// instance's snapshot stamped running at the state currently executing, so a
+// handler can make an effect's success durable before continuing — recovery
+// then re-enters the state with that progress restored instead of repeating
+// the effect. It refuses when no state is executing, since a stray call after
+// the run exits would overwrite the durable outcome with a stale running
+// stamp. Like every checkpoint, it is a no-op for instances that cannot
+// snapshot or when no repository is wired.
+func (e *engine) midCheckpoint(ctx context.Context) error {
+	e.mu.Lock()
+	live := (e.state == workflows.StatusRunning || e.state == workflows.StatusSuspended) && !e.detachDone
+	state := e.current
+	snap := e.snap
+	e.mu.Unlock()
+	if !live || state == "" {
+		return errors.New("checkpoint: no state is executing")
+	}
+	return e.checkpoint(ctx, workflows.StatusRunning, state, snap)
 }
 
 // checkpoint persists a snapshot stamped with status for the state about to be

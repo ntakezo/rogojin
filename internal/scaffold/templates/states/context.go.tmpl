@@ -1,7 +1,7 @@
 package states
 
 import (
-{{- if .Proxy}}
+{{- if or .Proxy .Durable}}
 	"context"
 {{- end}}
 {{- if or .Output .Durable}}
@@ -46,6 +46,12 @@ type running struct {
 	client     *http.Client
 {{- end}}
 	bus comms.Bus
+{{- if .Durable}}
+	// checkpoint is Deps.Checkpoint: it persists the snapshot mid-state, so a
+	// handler can record an external side effect's success the moment it
+	// lands and a retry of the state skips the effect instead of repeating it.
+	checkpoint func(ctx context.Context) error
+{{- end}}
 
 	body string
 {{- if .Output}}
@@ -77,6 +83,9 @@ func NewContext(input Input, deps workflows.Deps{{if .Proxy}}, manager *proxies.
 			},
 {{- end}}
 			bus: deps.Bus,
+{{- if .Durable}}
+			checkpoint: deps.Checkpoint,
+{{- end}}
 		},
 	}
 }

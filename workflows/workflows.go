@@ -17,11 +17,44 @@ type State string
 
 // A StateHandler executes one state and returns the next state to enter, or
 // nil when the workflow is complete.
+//
+// Execution is at least once: recovery re-enters the state that was in flight
+// when the process died, so a handler may run again after its work partially
+// — or wholly — succeeded. A handler whose side effect must not repeat guards
+// it with a snapshot field and persists the success through Deps.Checkpoint
+// the moment it lands, so a re-entered state skips the effect instead of
+// duplicating it.
 type StateHandler func(ctx context.Context) (*State, error)
 
 // Next returns a pointer to s, for a StateHandler to return as its next state.
 func Next(s State) *State {
 	return &s
+}
+
+// Once runs effect unless *done already records a success, then sets *done
+// and persists it through checkpoint — the guard pattern for an external side
+// effect a re-run must not repeat, in one call:
+//
+//	err := workflows.Once(ctx, &c.running.submitted, c.running.checkpoint,
+//		func(ctx context.Context) error { return c.submitOrder(ctx) })
+//
+// done must be a field the instance's Snapshot persists, so a recovered state
+// sees it; checkpoint is Deps.Checkpoint (nil is tolerated and skips the
+// persist, for Deps built by hand). A failed effect leaves *done unset, so a
+// retry re-runs it; a failed checkpoint leaves the success recorded in memory
+// but not durably, so only a crash before the next checkpoint repeats it.
+func Once(ctx context.Context, done *bool, checkpoint func(context.Context) error, effect func(context.Context) error) error {
+	if *done {
+		return nil
+	}
+	if err := effect(ctx); err != nil {
+		return err
+	}
+	*done = true
+	if checkpoint == nil {
+		return nil
+	}
+	return checkpoint(ctx)
 }
 
 // States maps each state in a graph to its handler.
@@ -139,6 +172,17 @@ type Deps struct {
 	// kind the task has no placement for is absent, which reads as the zero
 	// Assignment — so a lookup needs no branching.
 	Assignments map[leasing.Kind]Assignment
+	// Checkpoint persists the instance's snapshot durably, stamped at the
+	// state currently executing, so progress made inside a handler survives a
+	// crash. Call it from within the handler, right after an external side
+	// effect succeeds and its guard field is set: recovery re-enters the state,
+	// reads the guard from the snapshot, and skips the effect instead of
+	// duplicating it. An error after the call retries the state without
+	// repeating the recorded effect. It is a no-op returning nil when the
+	// instance cannot snapshot or no repository is wired, and refuses when no
+	// state is executing. The framework fills it; a Deps built by hand
+	// carries nil.
+	Checkpoint func(ctx context.Context) error
 }
 
 // An Assignment is a task's resolved placement for one resource kind: the
