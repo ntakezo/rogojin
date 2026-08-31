@@ -1,8 +1,12 @@
 // Package workflows defines the workflow programming model: the Workflow and
 // Instance ports a module implements, the State graph it runs, and the
 // durability hooks (Snapshotter, PersistableWorkflow) used to checkpoint and
-// recover a running workflow. The runtime that drives the model lives in the
-// tasks package; this package is types only.
+// recover a running workflow. Base and Module are the standard
+// implementations of those ports — an instance embeds Base for the effect log
+// (Do, Once) and the snapshot envelope, and a Module derives the whole
+// Workflow side from one typed build function. Cross-cutting per-state policy
+// (Retry, Timeout) is declared on the graph via On. The runtime that drives
+// the model lives in the tasks package.
 package workflows
 
 import (
@@ -20,9 +24,9 @@ type State string
 //
 // Execution is at least once: recovery re-enters the state that was in flight
 // when the process died, so a handler may run again after its work partially
-// — or wholly — succeeded. A handler whose side effect must not repeat guards
-// it with a snapshot field and persists the success through Deps.Checkpoint
-// the moment it lands, so a re-entered state skips the effect instead of
+// — or wholly — succeeded. A handler whose side effect must not repeat runs
+// it through Do or Base.Once, whose effect log persists the success the
+// moment it lands, so a re-entered state skips the effect instead of
 // duplicating it.
 type StateHandler func(ctx context.Context) (*State, error)
 
@@ -31,44 +35,36 @@ func Next(s State) *State {
 	return &s
 }
 
-// Once runs effect unless *done already records a success, then sets *done
-// and persists it through checkpoint — the guard pattern for an external side
-// effect a re-run must not repeat, in one call:
-//
-//	err := workflows.Once(ctx, &c.running.submitted, c.running.checkpoint,
-//		func(ctx context.Context) error { return c.submitOrder(ctx) })
-//
-// done must be a field the instance's Snapshot persists, so a recovered state
-// sees it; checkpoint is Deps.Checkpoint (nil is tolerated and skips the
-// persist, for Deps built by hand). A failed effect leaves *done unset, so a
-// retry re-runs it; a failed checkpoint leaves the success recorded in memory
-// but not durably, so only a crash before the next checkpoint repeats it.
-func Once(ctx context.Context, done *bool, checkpoint func(context.Context) error, effect func(context.Context) error) error {
-	if *done {
-		return nil
-	}
-	if err := effect(ctx); err != nil {
-		return err
-	}
-	*done = true
-	if checkpoint == nil {
-		return nil
-	}
-	return checkpoint(ctx)
+// A StateDef binds one state to its handler with any policy options applied;
+// build one with On.
+type StateDef struct {
+	name    State
+	handler StateHandler
 }
 
-// States maps each state in a graph to its handler.
-type States map[State]StateHandler
+// On binds name to handler, applying opts in order — each option wraps the
+// handler produced so far, so the last option listed is outermost.
+func On(name State, handler StateHandler, opts ...StateOption) StateDef {
+	for _, opt := range opts {
+		handler = opt(handler)
+	}
+	return StateDef{name: name, handler: handler}
+}
 
 // A Graph is a workflow's state machine: an initial state plus a handler for
 // each state.
 type Graph struct {
 	initialState State
-	states       States
+	states       map[State]StateHandler
 }
 
-// NewGraph builds a graph from its initial state and the handler for each state.
-func NewGraph(initial State, states States) Graph {
+// NewGraph builds a graph from its initial state and one On definition per
+// state.
+func NewGraph(initial State, defs ...StateDef) Graph {
+	states := make(map[State]StateHandler, len(defs))
+	for _, def := range defs {
+		states[def.name] = def.handler
+	}
 	return Graph{initialState: initial, states: states}
 }
 
@@ -174,14 +170,13 @@ type Deps struct {
 	Assignments map[leasing.Kind]Assignment
 	// Checkpoint persists the instance's snapshot durably, stamped at the
 	// state currently executing, so progress made inside a handler survives a
-	// crash. Call it from within the handler, right after an external side
-	// effect succeeds and its guard field is set: recovery re-enters the state,
-	// reads the guard from the snapshot, and skips the effect instead of
-	// duplicating it. An error after the call retries the state without
-	// repeating the recorded effect. It is a no-op returning nil when the
-	// instance cannot snapshot or no repository is wired, and refuses when no
-	// state is executing. The framework fills it; a Deps built by hand
-	// carries nil.
+	// crash. Do and Base.Once call it for you the moment an effect's success
+	// lands in the effect log: recovery re-enters the state, reads the log
+	// from the snapshot, and skips the effect instead of duplicating it. An
+	// error after the call retries the state without repeating the recorded
+	// effect. It is a no-op returning nil when the instance cannot snapshot
+	// or no repository is wired, and refuses when no state is executing. The
+	// framework fills it; a Deps built by hand carries nil.
 	Checkpoint func(ctx context.Context) error
 }
 

@@ -1,32 +1,32 @@
 package states
 
 import (
-{{- if or .Proxy .Durable}}
+{{- if .Proxy}}
 	"context"
 {{- end}}
-{{- if or .Output .Durable}}
+{{- if .Output}}
 	"encoding/json"
 {{- end}}
 {{- if .Proxy}}
 	"fmt"
 	"net/http"
 	"net/url"
-{{- end}}
 
-	"github.com/ntakezo/rogojin/comms"
-{{- if .Proxy}}
 	"github.com/ntakezo/rogojin/proxies"
 {{- end}}
 	"github.com/ntakezo/rogojin/workflows"
 )
 
 // Input is the immutable per-task input the caller supplies at CreateTask. Add
-// the fields your workflow needs; they are held by value and never mutated.
+// the fields your workflow needs; they must round-trip through JSON, since the
+// module records the input in the snapshot envelope and rebuilds recovered
+// contexts from it.
 type Input struct {
-	URL string
+	URL string `json:"url"`
 }
 
 {{- if .Output}}
+
 // Result is the workflow's output, set by the terminal state and marshaled by
 // Output on clean completion. Shape it to whatever your workflow produces.
 type Result struct {
@@ -34,79 +34,89 @@ type Result struct {
 	Bytes int    `json:"bytes"`
 }
 {{- end}}
-
-// running is the mutable state the workflow accumulates as it advances through
-// states, plus its side effects. It is a pointer on Context so handlers mutate
-// one shared copy.
-type running struct {
-{{- if .Proxy}}
-	proxies    *proxies.Manager
-	assignment proxies.Assignment
-	lease      *proxies.Lease
-	client     *http.Client
-{{- end}}
-	bus comms.Bus
 {{- if .Durable}}
-	// checkpoint is Deps.Checkpoint: it persists the snapshot mid-state, so a
-	// handler can record an external side effect's success the moment it
-	// lands and a retry of the state skips the effect instead of repeating it.
-	checkpoint func(ctx context.Context) error
+
+// Durable is the state the workflow accumulates as it advances, partitioned by
+// the state that writes each section — so a later state reading an earlier
+// one's output names the dependency. It is registered with Persist, so the
+// snapshot envelope carries it and recovery restores it.
+type Durable struct {
+	Fetch FetchState `json:"fetch"`
+}
+
+// FetchState is what Fetch stores for the states after it.
+type FetchState struct {
+	Body string `json:"body"`
+}
+{{- end}}
+{{- if .Proxy}}
+
+// resources holds the per-run side effects: the proxy lease and the client
+// built over it. They are acquired lazily on first use and rebuilt the same
+// way after recovery — never serialized.
+type resources struct {
+	lease  *proxies.Lease
+	client *http.Client
+}
 {{- end}}
 
+// Context is the receiver shared across every state: the framework machinery
+// (workflows.Base: deps, effect log, snapshot envelope), the immutable input,
+// and the workflow's own state — each in its own zone.
+type Context struct {
+	workflows.Base
+{{- if .Proxy}}
+
+	proxies *proxies.Manager
+{{- end}}
+
+	in Input
+{{- if .Durable}}
+	d  Durable
+{{- else}}
 	body string
+{{- end}}
+{{- if .Proxy}}
+	res resources
+{{- end}}
 {{- if .Output}}
+
 	result Result
 {{- end}}
 }
 
-// Context is the receiver shared across every state. input is immutable per
-// task; r carries the evolving state and side effects.
-type Context struct {
-	input Input
-	r     *running
-}
-
-// NewContext builds a fresh context for one task.
-func NewContext(input Input, deps workflows.Deps{{if .Proxy}}, manager *proxies.Manager{{end}}) *Context {
-	return &Context{
-		input: input,
-		r: &running{
-{{- if .Proxy}}
-			proxies: manager,
-			// Deps carries the task's placement per resource kind, under the
-			// kind's own key. The whole placement travels together: group, or
-			// pin within it.
-			assignment: proxies.Assignment{
-				TaskID:     deps.TaskID,
-				GroupID:    deps.Assignments[proxies.Kind].GroupID,
-				ResourceID: deps.Assignments[proxies.Kind].ResourceID,
-			},
-{{- end}}
-			bus: deps.Bus,
+// NewContext builds a context for one task; the module binds Base afterward.
 {{- if .Durable}}
-			checkpoint: deps.Checkpoint,
+// Persist registers the durable state with the snapshot envelope.
 {{- end}}
-		},
-	}
+func NewContext(in Input{{if .Proxy}}, manager *proxies.Manager{{end}}) *Context {
+	c := &Context{in: in{{if .Proxy}}, proxies: manager{{end}}}
+{{- if .Durable}}
+	c.Persist(&c.d)
+{{- end}}
+	return c
 }
 {{if .Output}}
 // Output marshals the workflow's result to JSON. The engine reads it only on
 // clean completion; a run that is killed or errors produces none.
 func (c *Context) Output() ([]byte, error) {
-	return json.Marshal(c.r.result)
+	return json.Marshal(c.result)
 }
 {{end}}
 {{- if .Proxy}}
 // client leases a proxy and builds the HTTP client on first use, so a recovered
 // task acquires its own lease wherever in the graph it resumes.
 func (c *Context) client(ctx context.Context) (*http.Client, error) {
-	if c.r.client != nil {
-		return c.r.client, nil
+	if c.res.client != nil {
+		return c.res.client, nil
 	}
-	if c.r.assignment.GroupID == "" {
-		return nil, fmt.Errorf("task %s has no proxy group assigned", c.r.assignment.TaskID)
+	placement := c.Assignment(proxies.Kind)
+	if placement.GroupID == "" {
+		return nil, fmt.Errorf("task %s has no proxy group assigned", c.TaskID())
 	}
-	lease, err := c.r.proxies.Acquire(ctx, c.r.assignment)
+	lease, err := c.proxies.Acquire(ctx, proxies.Assignment{
+		TaskID: c.TaskID(), GroupID: placement.GroupID, ResourceID: placement.ResourceID,
+	})
 	if err != nil {
 		// A pin that no longer resolves is the fallback decision point: this
 		// scaffold refuses, but returning an unproxied client here would run the
@@ -118,45 +128,18 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		lease.ReleaseOutcome(ctx, false)
 		return nil, fmt.Errorf("parse proxy url: %w", err)
 	}
-	c.r.lease = lease
-	c.r.client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
-	return c.r.client, nil
+	c.res.lease = lease
+	c.res.client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	return c.res.client, nil
 }
 
 // Teardown releases the task's proxy lease exactly once when the run exits,
 // reporting the outcome its selection learns from — success being the absence
 // of a run error.
 func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
-	if c.r.lease == nil {
+	if c.res.lease == nil {
 		return nil
 	}
-	return c.r.lease.ReleaseOutcome(ctx, runErr == nil)
+	return c.res.lease.ReleaseOutcome(ctx, runErr == nil)
 }
 {{end}}
-{{- if .Durable}}
-// snapshot is the JSON shape persisted for recovery: the immutable input plus
-// the durable running fields. Side effects (lease, client, bus) are rebuilt on
-// restore, never serialized.
-type snapshot struct {
-	Input Input  `json:"input"`
-	Body  string `json:"body"`
-}
-
-// Snapshot serializes the durable context. The engine calls it before entering
-// each state, so it must be valid as the entry of the state it is taken before.
-func (c *Context) Snapshot() ([]byte, error) {
-	return json.Marshal(snapshot{Input: c.input, Body: c.r.body})
-}
-
-// RestoreContext rebuilds a context from a JSON snapshot; the lease and client
-// are re-acquired lazily on first use.
-func RestoreContext(deps workflows.Deps, blob []byte{{if .Proxy}}, manager *proxies.Manager{{end}}) (*Context, error) {
-	var s snapshot
-	if err := json.Unmarshal(blob, &s); err != nil {
-		return nil, err
-	}
-	c := NewContext(s.Input, deps{{if .Proxy}}, manager{{end}})
-	c.r.body = s.Body
-	return c, nil
-}
-{{- end}}

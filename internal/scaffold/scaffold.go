@@ -33,7 +33,8 @@ type Options struct {
 	Name    string
 	Package string
 
-	// Durable emits Snapshot/RestoreContext/RestoreInstance for crash recovery.
+	// Durable emits the Durable state section, registered with the snapshot
+	// envelope via Persist, so crash recovery restores mid-run progress.
 	Durable bool
 	// Output emits the Outputter implementation: a Result type the terminal
 	// state fills and Output marshals on clean completion.

@@ -1,11 +1,10 @@
-// Package {{.Package}} is a generated rogojin workflow. The module here
-// validates input and builds per-task instances; the actual automation lives in
-// the states subpackage, where each state is a method you edit.
+// Package {{.Package}} is a generated rogojin workflow. The module here is
+// declarative — one build function derives validation, construction, and
+// snapshot recovery — and the actual automation lives in the states
+// subpackage, where each state is a method you edit.
 package {{.Package}}
 
 import (
-	"fmt"
-
 	"{{.ModulePath}}/{{.Package}}/states"
 {{- if .Proxy}}
 	"github.com/ntakezo/rogojin/leasing"
@@ -17,54 +16,26 @@ import (
 // Name is the ID the workflow registers under and tasks are created from.
 const Name = "{{.Name}}"
 
-// workflow is the registered module. It is built once and shared across tasks;
-// per-task state lives on the instance it builds in NewInstance.
-type workflow struct {
+// New builds the workflow module. Instances embed workflows.Base, so the
+// module binds each task's deps into them and restores snapshots without
+// hand-written plumbing.{{if .Output}} The module declares states.Result as its output, so
+// tasks.Create returns a handle typed to it.{{end}}{{if .Proxy}} The proxy manager arrives through
+// WithResources at registration — from the task manager's own registry, so
+// the manager a task leases through is the same instance the task manager
+// unlocks through; a missing or mistyped kind fails the registration at
+// boot.{{end}}
+func New() {{if .Output}}*workflows.OutModule[states.Input, states.Result]{{else}}workflows.Workflow{{end}} {
 {{- if .Proxy}}
-	proxies *proxies.Manager
+	var manager *proxies.Manager
 {{- end}}
+	return workflows.NewModule(Name,
+		func(in states.Input, deps workflows.Deps) (workflows.Instance, error) {
+			return states.NewContext(in{{if .Proxy}}, manager{{end}}), nil
+		}){{if .Proxy}}.
+		WithResources(func(managers map[leasing.Kind]any) error {
+			var err error
+			manager, err = workflows.Resource[*proxies.Manager](managers, proxies.Kind)
+			return err
+		}){{end}}{{if .Output}}.
+		Returns[states.Result](){{end}}
 }
-
-// New builds the workflow module.
-func New() workflows.Workflow {
-	return &workflow{}
-}
-
-func (w *workflow) ID() string { return Name }
-{{if .Proxy}}
-// UseResources receives the task manager's registered managers at
-// registration, so the manager this workflow leases through is the same
-// instance the task manager unlocks through. A missing or mistyped kind
-// fails the registration at boot.
-func (w *workflow) UseResources(managers map[leasing.Kind]any) error {
-	manager, ok := managers[proxies.Kind].(*proxies.Manager)
-	if !ok {
-		return fmt.Errorf("{{.Name}}: needs a *proxies.Manager registered under kind %q", proxies.Kind)
-	}
-	w.proxies = manager
-	return nil
-}
-{{end}}
-// ValidateInput ensures the caller passed a states.Input.
-func (w *workflow) ValidateInput(input any) error {
-	if _, ok := input.(states.Input); !ok {
-		return fmt.Errorf("{{.Name}}: expected states.Input, got %T", input)
-	}
-	return nil
-}
-
-// NewInstance builds a fresh, per-task instance bound to input and deps.
-func (w *workflow) NewInstance(input any, deps workflows.Deps) (workflows.Instance, error) {
-	in, ok := input.(states.Input)
-	if !ok {
-		return nil, fmt.Errorf("{{.Name}}: expected states.Input, got %T", input)
-	}
-	return states.NewContext(in, deps{{if .Proxy}}, w.proxies{{end}}), nil
-}
-{{if .Durable}}
-// RestoreInstance rebuilds an instance from a snapshot so a task can resume
-// after a crash, restart, or suspend.
-func (w *workflow) RestoreInstance(deps workflows.Deps, snapshot []byte) (workflows.Instance, error) {
-	return states.RestoreContext(deps, snapshot{{if .Proxy}}, w.proxies{{end}})
-}
-{{end}}

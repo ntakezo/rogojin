@@ -15,9 +15,8 @@
 ## Introduction
 
 Rogojin is a Go framework for building durable, resumable automation workflows against websites.
-You write a workflow as a graph of small states; Rogojin checkpoints progress before every state, so a crash, restart, or deliberate suspend never loses a session — the task resumes exactly where it left off.
 
-A state is just a method — no DSL, nothing generated at runtime. Return the next state to advance, `nil` to complete:
+A state is just a method:
 
 ```go
 func (r *run) fetch(ctx context.Context) (*workflows.State, error) {
@@ -28,9 +27,11 @@ func (r *run) fetch(ctx context.Context) (*workflows.State, error) {
 
 Built-in modules cover the unglamorous parts of site automation:
 
-- **Durability** — every transition checkpointed; suspend, resume, kill, and recover at state boundaries.
+- **Durability** — every transition checkpointed; suspend, resume, kill, and recover at state boundaries. An external side effect a re-run must not repeat rides in a durable effect log (`workflows.Do`), so a retried or recovered state replays a submitted order instead of resubmitting it.
+- **Policy** — retries with backoff and timeouts are declared per state on the graph (`workflows.On(state, handler, workflows.Retry(3, workflows.ExpBackoff(…)))`), never implemented inside handlers.
+- **Typed results** — a module declares its output once (`.Returns[Order]()`), and `tasks.Create` returns a handle whose `Start` and `Output` carry a decoded `Order` — input and output types both inferred, no type arguments at the call site.
 - **Proxies** — per-task leasing with round-robin or Thompson-sampling selection, per-proxy and per-group holder caps, and sticky locks that outlive the process.
-- **Accounts** — the same leasing, groups, holder caps, and sticky locks for site logins. What an account *is* belongs to the workflow: its fields travel as JSON, so a new workflow needs no schema change.
+- **Accounts** — the same leasing, groups, holder caps, and sticky locks for site logins. What an account _is_ belongs to the workflow: its fields travel as JSON, so a new workflow needs no schema change.
 - **Payments** — the same leasing again, for the payment instruments a checkout settles against: one holder at a time by default, so no two tasks charge the same instrument at once, and a sticky lock so a resumed checkout comes back to the instrument it started on. Payment data travels as JSON the library never reads; encrypting it at rest is the store's job.
 - **Groups** — named sets of proxies, of accounts, of payments, and of tasks. A task carries one assignment per resource kind and inherits its task group's for any kind it names none of, so a pool is assigned once and every member follows; each proxy group rotates through its own selection strategy. When seeding a repository directly, save groups before the resources that name them — a resource pointing at a group the store doesn't hold fails the manager's construction.
 - **Comms** — typed pub/sub bus for inter-task coordination.
@@ -40,7 +41,7 @@ Built-in modules cover the unglamorous parts of site automation:
 
 ### Install
 
-Requires Go 1.25+.
+Requires Go 1.27+ (typed task results use generic methods).
 
 ```sh
 go get github.com/ntakezo/rogojin

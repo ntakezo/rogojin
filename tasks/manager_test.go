@@ -926,13 +926,13 @@ func (w *blockingWorkflow) NewInstance(input any, deps workflows.Deps) (workflow
 type blockingInstance struct{ wf *blockingWorkflow }
 
 func (i *blockingInstance) Graph() workflows.Graph {
-	return workflows.NewGraph(s1, workflows.States{
-		s1: func(ctx context.Context) (*workflows.State, error) {
+	return workflows.NewGraph(s1,
+		workflows.On(s1, func(ctx context.Context) (*workflows.State, error) {
 			i.wf.once.Do(func() { close(i.wf.entered) })
 			<-i.wf.release
 			return nil, nil
-		},
-	})
+		}),
+	)
 }
 
 // waitUntil polls cond until it holds or the test times out.

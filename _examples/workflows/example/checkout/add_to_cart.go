@@ -13,7 +13,7 @@ const addToCart workflows.State = "add-to-cart"
 // AddToCart posts the captured variant and CSRF token to the cart endpoint and
 // records the resulting cart id for the checkout state.
 func (c *Context) AddToCart(ctx context.Context) (*workflows.State, error) {
-	base, err := origin(c.static.ProductURL)
+	base, err := origin(c.in.ProductURL)
 	if err != nil {
 		return nil, err
 	}
@@ -24,8 +24,8 @@ func (c *Context) AddToCart(ctx context.Context) (*workflows.State, error) {
 
 	res, err := requests.AddToCart(ctx, client, requests.AddToCartRequest{
 		URL:       base + "/cart",
-		VariantID: c.running.variantID,
-		CSRFToken: c.running.csrfToken,
+		VariantID: c.d.Homepage.VariantID,
+		CSRFToken: c.d.Homepage.CSRFToken,
 		Quantity:  1,
 	})
 	if err != nil {
@@ -37,7 +37,7 @@ func (c *Context) AddToCart(ctx context.Context) (*workflows.State, error) {
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		return nil, err
 	}
-	c.running.cartID = body.CartID
+	c.d.Cart.ID = body.CartID
 
 	return workflows.Next(submitCheckout), nil
 }

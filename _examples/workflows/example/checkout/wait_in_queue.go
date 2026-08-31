@@ -20,7 +20,7 @@ const queueCookieTopic = "queue-cookie"
 // first task to clear the queue mints the cookie and shares it on the bus; tasks
 // behind it reuse whatever was already published instead of minting their own.
 func (c *Context) WaitInQueue(ctx context.Context) (*workflows.State, error) {
-	topic := comms.NewTopic[string](c.running.bus, queueCookieTopic)
+	topic := comms.NewTopic[string](c.Bus(), queueCookieTopic)
 
 	sub, err := topic.On(ctx)
 	if err != nil {
@@ -38,10 +38,10 @@ func (c *Context) WaitInQueue(ctx context.Context) (*workflows.State, error) {
 	case cookie := <-sub.C(): // a task ahead of us already shared one
 		// the topic is only ever written through the typed Emit, so the
 		// payload always asserts back to string.
-		c.running.queueCookie = cookie.(string)
+		c.d.Queue.Cookie = cookie.(string)
 	default: // we are first through the queue: mint and share it
-		c.running.queueCookie = uuid.NewString()
-		if err := topic.Emit(ctx, c.running.queueCookie); err != nil {
+		c.d.Queue.Cookie = uuid.NewString()
+		if err := topic.Emit(ctx, c.d.Queue.Cookie); err != nil {
 			return nil, err
 		}
 	}
@@ -52,8 +52,8 @@ func (c *Context) WaitInQueue(ctx context.Context) (*workflows.State, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := common.SetCookies(client, c.static.ProductURL,
-		&http.Cookie{Name: "queue", Value: c.running.queueCookie}); err != nil {
+	if err := common.SetCookies(client, c.in.ProductURL,
+		&http.Cookie{Name: "queue", Value: c.d.Queue.Cookie}); err != nil {
 		return nil, err
 	}
 

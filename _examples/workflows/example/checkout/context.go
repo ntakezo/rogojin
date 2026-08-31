@@ -12,7 +12,6 @@ import (
 	"github.com/ntakezo/rogojin/_examples/workflows/example/checkout/requests"
 	"github.com/ntakezo/rogojin/_examples/workflows/example/common"
 	"github.com/ntakezo/rogojin/accounts"
-	"github.com/ntakezo/rogojin/comms"
 	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/proxies"
 	"github.com/ntakezo/rogojin/workflows"
@@ -22,12 +21,14 @@ import (
 // the workflow's choice of sender filter, not the framework's.
 const VerificationSender = "no-reply@site.example"
 
-// StaticContext is the immutable input the user supplies when creating the task.
-// Where the task leases its proxy and its site login from is placement, not
-// input: it lives on the task record and arrives through Deps.
-type StaticContext struct {
-	ProductURL string
-	Size       string
+// Input is the immutable input the user supplies when creating the
+// task. The module records it in the snapshot envelope and rebuilds a
+// recovered context from it. Where the task leases its proxy and its site
+// login from is placement, not input: it lives on the task record and arrives
+// through the embedded workflows.Base.
+type Input struct {
+	ProductURL string `json:"productURL"`
+	Size       string `json:"size"`
 }
 
 // Profile is this workflow's account shape. The accounts module stores it as
@@ -38,70 +39,81 @@ type Profile struct {
 	Address string `json:"address"`
 }
 
-// RunningContext is the mutable state a workflow accumulates as it advances
-// through states, plus its side effects (proxy lease, HTTP client) and the bus
-// it uses to coordinate with other tasks.
-type RunningContext struct {
-	proxies      *proxies.Manager
-	assignment   proxies.Assignment
+// Order is the workflow's output: the confirmed order SubmitCheckout placed,
+// declared as the module's output via Returns[Order] — so a task created
+// through tasks.Create hands it back decoded from Start and on Output.
+type Order = requests.SubmitCheckoutResponse
+
+// Durable is the state the workflow accumulates as it advances, partitioned by
+// the state that writes each section — so a later state reading an earlier
+// one's output names the dependency (d.Homepage.CSRFToken). It is registered
+// with Persist, so the snapshot envelope carries it and recovery restores it;
+// no mirror struct, no field copying.
+type Durable struct {
+	Homepage HomepageState `json:"homepage"`
+	Queue    QueueState    `json:"queue"`
+	Login    LoginState    `json:"login"`
+	Cart     CartState     `json:"cart"`
+}
+
+// HomepageState is what GetHomepage extracts from the product page.
+type HomepageState struct {
+	VariantID string `json:"variantID"`
+	CSRFToken string `json:"csrfToken"`
+}
+
+// QueueState is the shared queue cookie WaitInQueue minted or adopted.
+type QueueState struct {
+	Cookie string `json:"cookie"`
+}
+
+// LoginState is the verification link Login parsed from the site's mail.
+type LoginState struct {
+	VerifyURL string `json:"verifyURL"`
+}
+
+// CartState is the cart AddToCart created.
+type CartState struct {
+	ID string `json:"id"`
+}
+
+// resources holds the per-run side effects: leases, the HTTP client, and the
+// inbox subscription. They are acquired lazily on first use and rebuilt the
+// same way after recovery — never serialized.
+type resources struct {
 	lease        *proxies.Lease
-	accounts     *accounts.Manager
-	account      accounts.Assignment
 	accountLease *accounts.Lease
-	email        *email.Manager
-	inbox        email.Subscription
 	client       *http.Client
-	bus          comms.Bus
-	// checkpoint is Deps.Checkpoint: persists the snapshot mid-state, so a
-	// state can record an external effect's success the moment it lands.
-	checkpoint func(ctx context.Context) error
-
-	queueCookie string
-	variantID   string
-	csrfToken   string
-	cartID      string
-	verifyURL   string
-	// submitted guards the checkout submit through workflows.Once: once the
-	// order confirms, no re-entry of the state may place it again.
-	submitted bool
-	order     requests.SubmitCheckoutResponse
+	inbox        email.Subscription
 }
 
-// Context is the receiver shared across every state. static holds user input by
-// value (immutable per task); running is a pointer because states mutate it.
+// Context is the receiver shared across every state: the framework machinery
+// (Base: deps, effect log, snapshot envelope), the module's managers, the
+// immutable input, the durable state, and the ephemeral resources — each in
+// its own zone.
 type Context struct {
-	static  StaticContext
-	running *RunningContext
+	workflows.Base
+
+	proxies  *proxies.Manager
+	accounts *accounts.Manager
+	email    *email.Manager
+
+	in  Input
+	d   Durable
+	res resources
+
+	// order is the placed order Do returns from the submit's effect record —
+	// on a fresh run and on a recovered re-entry alike — held only for Output.
+	order Order
 }
 
-// NewContext builds a fresh context for one task, holding the module's proxy,
-// account, and email managers for lazy acquisition plus the bus for
-// inter-task coordination.
-func NewContext(input StaticContext, deps workflows.Deps, manager *proxies.Manager, accountManager *accounts.Manager, emailManager *email.Manager) *Context {
-	return &Context{
-		static: input,
-		running: &RunningContext{
-			proxies: manager,
-			email:   emailManager,
-			// Deps carries one placement per resource kind, keyed by whatever
-			// this program calls each manager. The whole placement travels
-			// together: the group to rotate within, or the one member pinned
-			// inside it. No branching here.
-			assignment: proxies.Assignment{
-				TaskID:     deps.TaskID,
-				GroupID:    deps.Assignments[proxies.Kind].GroupID,
-				ResourceID: deps.Assignments[proxies.Kind].ResourceID,
-			},
-			accounts: accountManager,
-			account: accounts.Assignment{
-				TaskID:     deps.TaskID,
-				GroupID:    deps.Assignments[accounts.Kind].GroupID,
-				ResourceID: deps.Assignments[accounts.Kind].ResourceID,
-			},
-			bus:        deps.Bus,
-			checkpoint: deps.Checkpoint,
-		},
-	}
+// NewContext builds a context for one task, holding the module's proxy,
+// account, and email managers for lazy acquisition. The module binds Base
+// afterward; Persist registers the durable state with the snapshot envelope.
+func NewContext(in Input, proxyManager *proxies.Manager, accountManager *accounts.Manager, emailManager *email.Manager) *Context {
+	c := &Context{in: in, proxies: proxyManager, accounts: accountManager, email: emailManager}
+	c.Persist(&c.d)
+	return c
 }
 
 // profile locks a site account on first use and decodes the fields this
@@ -109,18 +121,21 @@ func NewContext(input StaticContext, deps workflows.Deps, manager *proxies.Manag
 // halfway through a checkout as one persona must come back as the same one, and
 // the lock outlives both the lease and the process.
 func (c *Context) profile(ctx context.Context) (Profile, error) {
-	if c.running.accountLease == nil {
-		if c.running.account.GroupID == "" {
-			return Profile{}, fmt.Errorf("task %s has no account group assigned", c.running.account.TaskID)
+	if c.res.accountLease == nil {
+		placement := c.Assignment(accounts.Kind)
+		if placement.GroupID == "" {
+			return Profile{}, fmt.Errorf("task %s has no account group assigned", c.TaskID())
 		}
-		lease, err := c.running.accounts.Lock(ctx, c.running.account)
+		lease, err := c.accounts.Lock(ctx, accounts.Assignment{
+			TaskID: c.TaskID(), GroupID: placement.GroupID, ResourceID: placement.ResourceID,
+		})
 		if err != nil {
 			return Profile{}, fmt.Errorf("lock account: %w", err)
 		}
-		c.running.accountLease = lease
-		fmt.Printf("  task %s locked account %s\n", c.running.account.TaskID, lease.Resource().ID)
+		c.res.accountLease = lease
+		fmt.Printf("  task %s locked account %s\n", c.TaskID(), lease.Resource().ID)
 	}
-	return accounts.Bind[Profile](c.running.accountLease.Resource())
+	return accounts.Bind[Profile](c.res.accountLease.Resource())
 }
 
 // inbox subscribes to the account's forwarding inbox on first use, so a
@@ -129,38 +144,41 @@ func (c *Context) profile(ctx context.Context) (Profile, error) {
 // group's ref — and the backfill window since re-reads mail the server
 // still holds, which is what makes a resumed task lossless.
 func (c *Context) inbox(ctx context.Context, since time.Time) (email.Subscription, error) {
-	if c.running.inbox != nil {
-		return c.running.inbox, nil
+	if c.res.inbox != nil {
+		return c.res.inbox, nil
 	}
 	if _, err := c.profile(ctx); err != nil { // the account lock is the route to the inbox
 		return nil, err
 	}
-	lease := c.running.accountLease
+	lease := c.res.accountLease
 	id := accounts.ForwardingEmail(lease.Resource(), lease.Group())
 	if id == "" {
 		return nil, fmt.Errorf("account %s has no forwarding inbox attached", lease.Resource().ID)
 	}
-	sub, err := c.running.email.Listen(ctx, c.running.account.TaskID, id,
+	sub, err := c.email.Listen(ctx, c.TaskID(), id,
 		email.FromSender(VerificationSender), email.WithBackfill(since))
 	if err != nil {
 		return nil, fmt.Errorf("listen to inbox %s: %w", id, err)
 	}
-	fmt.Printf("  task %s listening on forwarding inbox %s\n", c.running.account.TaskID, id)
-	c.running.inbox = sub
+	fmt.Printf("  task %s listening on forwarding inbox %s\n", c.TaskID(), id)
+	c.res.inbox = sub
 	return sub, nil
 }
 
 // client leases a proxy and builds the client on first use, so a recovered
 // task acquires its own lease no matter which state it resumes at.
 func (c *Context) client(ctx context.Context) (*http.Client, error) {
-	if c.running.client != nil {
-		return c.running.client, nil
+	if c.res.client != nil {
+		return c.res.client, nil
 	}
 
-	if c.running.assignment.GroupID == "" {
-		return nil, fmt.Errorf("task %s has no proxy group assigned", c.running.assignment.TaskID)
+	placement := c.Assignment(proxies.Kind)
+	if placement.GroupID == "" {
+		return nil, fmt.Errorf("task %s has no proxy group assigned", c.TaskID())
 	}
-	lease, err := c.running.proxies.Acquire(ctx, c.running.assignment)
+	lease, err := c.proxies.Acquire(ctx, proxies.Assignment{
+		TaskID: c.TaskID(), GroupID: placement.GroupID, ResourceID: placement.ResourceID,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}
@@ -169,20 +187,20 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		lease.ReleaseOutcome(ctx, false)
 		return nil, err
 	}
-	fmt.Printf("  task %s leased proxy %s (%s)\n", c.running.assignment.TaskID, lease.Resource().ID, lease.Resource().URL)
+	fmt.Printf("  task %s leased proxy %s (%s)\n", c.TaskID(), lease.Resource().ID, lease.Resource().URL)
 
 	// The jar is a side effect, rebuilt empty on recovery — a restored queue
 	// cookie only survives the restart if it is re-installed here.
-	if c.running.queueCookie != "" {
-		if err := common.SetCookies(client, c.static.ProductURL,
-			&http.Cookie{Name: "queue", Value: c.running.queueCookie}); err != nil {
+	if c.d.Queue.Cookie != "" {
+		if err := common.SetCookies(client, c.in.ProductURL,
+			&http.Cookie{Name: "queue", Value: c.d.Queue.Cookie}); err != nil {
 			lease.ReleaseOutcome(ctx, false)
 			return nil, err
 		}
 	}
 
-	c.running.lease = lease
-	c.running.client = client
+	c.res.lease = lease
+	c.res.client = client
 	return client, nil
 }
 
@@ -193,16 +211,23 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 // back.
 func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
 	var released []error
-	if c.running.inbox != nil {
-		released = append(released, c.running.inbox.Close())
+	if c.res.inbox != nil {
+		released = append(released, c.res.inbox.Close())
 	}
-	if c.running.lease != nil {
-		released = append(released, c.running.lease.ReleaseOutcome(ctx, runErr == nil))
+	if c.res.lease != nil {
+		released = append(released, c.res.lease.ReleaseOutcome(ctx, runErr == nil))
 	}
-	if c.running.accountLease != nil {
-		c.running.accountLease.Release()
+	if c.res.accountLease != nil {
+		c.res.accountLease.Release()
 	}
 	return errors.Join(released...)
+}
+
+// Output returns the placed order as JSON, the task's final result. It is set
+// by SubmitCheckout, the terminal state, and read by the engine on clean
+// completion; before then the order is its zero value.
+func (c *Context) Output() ([]byte, error) {
+	return json.Marshal(c.order)
 }
 
 // origin returns the scheme://host of rawURL, the site root the cart and checkout
@@ -213,61 +238,4 @@ func origin(rawURL string) (string, error) {
 		return "", err
 	}
 	return u.Scheme + "://" + u.Host, nil
-}
-
-// snapshot is the JSON shape persisted for recovery: the immutable input plus the
-// durable running fields. Side effects (lease, client, bus) are reconstructed
-// on restore, not serialized.
-type snapshot struct {
-	Static      StaticContext `json:"static"`
-	QueueCookie string        `json:"queueCookie"`
-	VariantID   string        `json:"variantID"`
-	CSRFToken   string        `json:"csrfToken"`
-	CartID      string        `json:"cartID"`
-	VerifyURL   string        `json:"verifyURL"`
-	// Submitted and Order are the checkout submit's workflows.Once guard and
-	// its result, persisted mid-state the moment the order confirms — so a
-	// recovered task never resubmits a checkout that already went through.
-	Submitted bool                            `json:"submitted"`
-	Order     requests.SubmitCheckoutResponse `json:"order"`
-}
-
-// Output returns the placed order as JSON, the task's final result. It is set by
-// SubmitCheckout, the terminal state, and read by the engine on clean completion;
-// before then the order is its zero value.
-func (c *Context) Output() ([]byte, error) {
-	return json.Marshal(c.running.order)
-}
-
-// Snapshot serializes the durable context to JSON for checkpointing. It must be
-// valid as the entry of the state it is taken before.
-func (c *Context) Snapshot() ([]byte, error) {
-	return json.Marshal(snapshot{
-		Static:      c.static,
-		QueueCookie: c.running.queueCookie,
-		VariantID:   c.running.variantID,
-		CSRFToken:   c.running.csrfToken,
-		CartID:      c.running.cartID,
-		VerifyURL:   c.running.verifyURL,
-		Submitted:   c.running.submitted,
-		Order:       c.running.order,
-	})
-}
-
-// RestoreContext rebuilds a context from a JSON snapshot, restoring the durable
-// running fields; the lease and client are re-acquired lazily on first use.
-func RestoreContext(deps workflows.Deps, blob []byte, manager *proxies.Manager, accountManager *accounts.Manager, emailManager *email.Manager) (*Context, error) {
-	var s snapshot
-	if err := json.Unmarshal(blob, &s); err != nil {
-		return nil, err
-	}
-	c := NewContext(s.Static, deps, manager, accountManager, emailManager)
-	c.running.queueCookie = s.QueueCookie
-	c.running.variantID = s.VariantID
-	c.running.csrfToken = s.CSRFToken
-	c.running.cartID = s.CartID
-	c.running.verifyURL = s.VerifyURL
-	c.running.submitted = s.Submitted
-	c.running.order = s.Order
-	return c, nil
 }

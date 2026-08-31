@@ -20,7 +20,7 @@ func (c *Context) FollowLink(ctx context.Context) (*workflows.State, error) {
 		return nil, err
 	}
 
-	res, err := requests.FollowLink(ctx, client, requests.FollowLinkRequest{URL: c.running.verifyURL})
+	res, err := requests.FollowLink(ctx, client, requests.FollowLinkRequest{URL: c.d.Login.VerifyURL})
 	if err != nil {
 		return nil, err
 	}

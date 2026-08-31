@@ -90,17 +90,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("task manager: %v", err)
 	}
-	if err := taskManager.RegisterWorkflow(example_checkout.Name, example_checkout.New(emailManager)); err != nil {
+	checkout := example_checkout.New(emailManager)
+	if err := taskManager.RegisterWorkflow(example_checkout.Name, checkout); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}
 
-	input := example_checkout.StaticContext{
+	input := example_checkout.Input{
 		ProductURL: site.URL + "/product",
 		Size:       "M",
 	}
 
 	// Placement, one option per kind: the workflow reads both back off Deps.
-	task, err := taskManager.CreateTask(ctx, example_checkout.Name, input,
+	// Creating against the module infers the input and output types, so the
+	// task handle's Start and Output carry a decoded Order.
+	task, err := tasks.Create(ctx, taskManager, checkout, input,
 		tasks.WithResourceGroup(proxies.Kind, proxies.GlobalGroup),
 		tasks.WithResourceGroup(accounts.Kind, accounts.GlobalGroup))
 	if err != nil {
@@ -108,11 +111,11 @@ func main() {
 	}
 	fmt.Printf("created task %s (status %q) against %s\n", task.ID, task.Status, site.URL)
 
-	output, err := task.Start(ctx)
+	order, err := task.Start(ctx)
 	if err != nil {
 		log.Fatalf("start task: %v", err)
 	}
-	fmt.Printf("task %s finished with status %q, output %s\n", task.ID, task.Status, output)
+	fmt.Printf("task %s finished with status %q: order %s is %s\n", task.ID, task.Status, order.OrderID, order.Status)
 }
 
 // memEmailRepo is a minimal in-memory email.Repository; the manager owns all

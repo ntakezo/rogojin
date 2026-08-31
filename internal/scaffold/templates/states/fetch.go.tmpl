@@ -9,7 +9,8 @@ import (
 )
 
 // Fetch retrieves the input URL and stores the body for the next state. It is
-// the graph's initial state.
+// the graph's initial state; the graph retries it with backoff, so a transient
+// network failure re-runs the whole handler.
 func (c *Context) Fetch(ctx context.Context) (*workflows.State, error) {
 {{- if .Proxy}}
 	client, err := c.client(ctx)
@@ -19,7 +20,7 @@ func (c *Context) Fetch(ctx context.Context) (*workflows.State, error) {
 {{- else}}
 	client := http.DefaultClient
 {{- end}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.input.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.in.URL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -32,6 +33,10 @@ func (c *Context) Fetch(ctx context.Context) (*workflows.State, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.r.body = string(body)
+{{- if .Durable}}
+	c.d.Fetch.Body = string(body)
+{{- else}}
+	c.body = string(body)
+{{- end}}
 	return workflows.Next(process), nil
 }

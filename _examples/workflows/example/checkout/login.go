@@ -27,7 +27,7 @@ func (c *Context) Login(ctx context.Context) (*workflows.State, error) {
 	if err != nil {
 		return nil, err
 	}
-	site, err := origin(c.static.ProductURL)
+	site, err := origin(c.in.ProductURL)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +36,7 @@ func (c *Context) Login(ctx context.Context) (*workflows.State, error) {
 	res, err := requests.Login(ctx, client, requests.LoginRequest{
 		URL:       site + "/login",
 		Email:     profile.Email,
-		CSRFToken: c.running.csrfToken,
+		CSRFToken: c.d.Homepage.CSRFToken,
 	})
 	if err != nil {
 		return nil, err
@@ -62,8 +62,8 @@ func (c *Context) Login(ctx context.Context) (*workflows.State, error) {
 		if link == "" {
 			return nil, fmt.Errorf("verification mail %q carried no link", msg.Subject)
 		}
-		c.running.verifyURL = link
-		fmt.Printf("  task %s got %q from %s, link %s\n", c.running.account.TaskID, msg.Subject, msg.From, link)
+		c.d.Login.VerifyURL = link
+		fmt.Printf("  task %s got %q from %s, link %s\n", c.TaskID(), msg.Subject, msg.From, link)
 	}
 	return workflows.Next(followLink), nil
 }

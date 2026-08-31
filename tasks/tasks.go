@@ -174,14 +174,16 @@ func (t *Task) unseal() {
 }
 
 // Start executes the task synchronously until completion, error, or kill,
-// returning the workflow's output on clean completion and bringing Status,
-// Output, and UpdatedAt current on exit. The output is nil if the workflow
-// produces none, or if the run errors or is killed. A run whose terminal stamp
-// fails to persist returns its output alongside the error. A recovered task
-// resumes from its persisted checkpoint instead of the graph's initial state;
-// one recovered from a suspended checkpoint starts parked there until Resume
-// or Kill. A task built from a bare record has no runtime and refuses; create
-// or recover it through a Manager.
+// returning the workflow's raw output on clean completion and bringing
+// Status, Output, and UpdatedAt current on exit. The output is nil if the
+// workflow produces none, or if the run errors or is killed. A run whose
+// terminal stamp fails to persist returns its output alongside the error.
+// A handle from Create shadows this with a Start decoded into the workflow's
+// declared output type. A recovered task resumes from its persisted
+// checkpoint instead of the graph's initial state; one recovered from a
+// suspended checkpoint starts parked there until Resume or Kill. A task built
+// from a bare record has no runtime and refuses; create or recover it
+// through a Manager.
 func (t *Task) Start(ctx context.Context) ([]byte, error) {
 	if t.engine == nil {
 		return nil, fmt.Errorf("task %s has no runtime: create or recover it through a Manager to start it", t.ID)

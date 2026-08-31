@@ -88,7 +88,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New()); err != nil {
+	wf := {{.Package}}.New()
+	if err := svc.RegisterWorkflow({{.Package}}.Name, wf); err != nil {
 		log.Fatal(err)
 	}
 {{- else}}
@@ -97,22 +98,29 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := svc.RegisterWorkflow({{.Package}}.Name, {{.Package}}.New()); err != nil {
+	wf := {{.Package}}.New()
+	if err := svc.RegisterWorkflow({{.Package}}.Name, wf); err != nil {
 		log.Fatal(err)
 	}
 {{- end}}
 
+{{- if .Output}}
+	// Creating against the module infers the input and output types, so the
+	// task handle's Start returns a decoded states.Result.
+	task, err := tasks.Create(ctx, svc, wf, states.Input{URL: "https://example.com"}{{if .Proxy}}, tasks.WithResourceGroup(proxies.Kind, proxies.GlobalGroup){{end}})
+	if err != nil {
+		log.Fatal(err)
+	}
+	result, err := task.Start(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("task %s finished with status %q, fetched %d bytes from %s", task.ID, task.Status, result.Bytes, result.URL)
+{{- else}}
 	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://example.com"}{{if .Proxy}}, tasks.WithResourceGroup(proxies.Kind, proxies.GlobalGroup){{end}})
 	if err != nil {
 		log.Fatal(err)
 	}
-{{- if .Output}}
-	output, err := task.Start(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("task %s finished with status %q, output %s", task.ID, task.Status, output)
-{{- else}}
 	if _, err := task.Start(ctx); err != nil {
 		log.Fatal(err)
 	}

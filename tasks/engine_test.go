@@ -57,11 +57,11 @@ type testCtx struct {
 }
 
 func (c *testCtx) Graph() workflows.Graph {
-	return workflows.NewGraph(s1, workflows.States{
-		s1: c.step(s1, workflows.Next(s2)),
-		s2: c.step(s2, workflows.Next(s3)),
-		s3: c.step(s3, nil),
-	})
+	return workflows.NewGraph(s1,
+		workflows.On(s1, c.step(s1, workflows.Next(s2))),
+		workflows.On(s2, c.step(s2, workflows.Next(s3))),
+		workflows.On(s3, c.step(s3, nil)),
+	)
 }
 
 // step runs this state and advances to next.
@@ -213,42 +213,32 @@ func waitFor(t *testing.T, cond func() bool) {
 // recorded, so a test can retry and prove the effect does not repeat. lastDeps
 // captures the injected Deps so tests can call Checkpoint from outside a run.
 type effectWorkflow struct {
+	*workflows.Module[struct{}]
 	effects         int
 	failAfterEffect bool
 	lastDeps        workflows.Deps
 }
 
-type effectSnapshot struct {
-	Emitted bool `json:"emitted"`
-}
-
-func (w *effectWorkflow) ID() string                    { return "effect" }
-func (w *effectWorkflow) ValidateInput(input any) error { return nil }
-
-func (w *effectWorkflow) NewInstance(input any, deps workflows.Deps) (workflows.Instance, error) {
-	w.lastDeps = deps
-	return &effectCtx{w: w, deps: deps}, nil
-}
-
-func (w *effectWorkflow) RestoreInstance(deps workflows.Deps, snapshot []byte) (workflows.Instance, error) {
-	var s effectSnapshot
-	if err := json.Unmarshal(snapshot, &s); err != nil {
-		return nil, err
-	}
-	w.lastDeps = deps
-	return &effectCtx{w: w, deps: deps, emitted: s.Emitted}, nil
+// newEffectWorkflow wires the module's build closure back to the workflow so
+// tests can observe effects and deps through it.
+func newEffectWorkflow() *effectWorkflow {
+	w := &effectWorkflow{}
+	w.Module = workflows.NewModule("effect", func(in struct{}, deps workflows.Deps) (workflows.Instance, error) {
+		w.lastDeps = deps
+		return &effectCtx{w: w}, nil
+	})
+	return w
 }
 
 type effectCtx struct {
-	w       *effectWorkflow
-	deps    workflows.Deps
-	emitted bool
+	workflows.Base
+	w *effectWorkflow
 }
 
 func (c *effectCtx) Graph() workflows.Graph {
-	return workflows.NewGraph(s1, workflows.States{
-		s1: func(ctx context.Context) (*workflows.State, error) {
-			err := workflows.Once(ctx, &c.emitted, c.deps.Checkpoint, func(ctx context.Context) error {
+	return workflows.NewGraph(s1,
+		workflows.On(s1, func(ctx context.Context) (*workflows.State, error) {
+			err := c.Once(ctx, "emit", func(ctx context.Context) error {
 				c.w.effects++ // the external side effect
 				return nil
 			})
@@ -260,13 +250,23 @@ func (c *effectCtx) Graph() workflows.Graph {
 				return nil, errors.New("post-effect failure")
 			}
 			return workflows.Next(s2), nil
-		},
-		s2: func(ctx context.Context) (*workflows.State, error) { return nil, nil },
-	})
+		}),
+		workflows.On(s2, func(ctx context.Context) (*workflows.State, error) { return nil, nil }),
+	)
 }
 
-func (c *effectCtx) Snapshot() ([]byte, error) {
-	return json.Marshal(effectSnapshot{Emitted: c.emitted})
+// effectRecorded reports whether a persisted snapshot's effect log carries the
+// s1 effect — the envelope-level view of the guard the old mirror struct held.
+func effectRecorded(t *testing.T, snapshot []byte) bool {
+	t.Helper()
+	var env struct {
+		Effects map[string]json.RawMessage `json:"effects"`
+	}
+	if err := json.Unmarshal(snapshot, &env); err != nil {
+		t.Fatalf("decode snapshot envelope: %v", err)
+	}
+	_, ok := env.Effects["emit"]
+	return ok
 }
 
 // TestMidStateCheckpointRecordsProgress verifies Deps.Checkpoint persists the
@@ -275,7 +275,7 @@ func (c *effectCtx) Snapshot() ([]byte, error) {
 // from that moment on recovers into a state that knows the effect happened.
 func TestMidStateCheckpointRecordsProgress(t *testing.T) {
 	store := &fakeStore{}
-	wf := &effectWorkflow{}
+	wf := newEffectWorkflow()
 	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
 
 	if err := engine.Execute(context.Background(), nil); err != nil {
@@ -284,19 +284,14 @@ func TestMidStateCheckpointRecordsProgress(t *testing.T) {
 	if wf.effects != 1 {
 		t.Fatalf("effects = %d, want 1", wf.effects)
 	}
-	// Saves: pre-state s1 (guard down), mid-state s1 (guard up), pre-state s2.
+	// Saves: pre-state s1 (log empty), mid-state s1 (effect recorded), pre-state s2.
 	if got := store.states(); !reflect.DeepEqual(got, []workflows.State{s1, s1, s2}) {
 		t.Fatalf("checkpoint states = %v, want [s1 s1 s2]", got)
 	}
-	var first, mid effectSnapshot
-	if err := json.Unmarshal(store.saves[0].snapshot, &first); err != nil {
-		t.Fatalf("unmarshal pre-state snapshot: %v", err)
-	}
-	if err := json.Unmarshal(store.saves[1].snapshot, &mid); err != nil {
-		t.Fatalf("unmarshal mid-state snapshot: %v", err)
-	}
-	if first.Emitted || !mid.Emitted {
-		t.Fatalf("guards = pre:%v mid:%v, want pre:false mid:true", first.Emitted, mid.Emitted)
+	first := effectRecorded(t, store.saves[0].snapshot)
+	mid := effectRecorded(t, store.saves[1].snapshot)
+	if first || !mid {
+		t.Fatalf("effect recorded = pre:%v mid:%v, want pre:false mid:true", first, mid)
 	}
 	if store.saves[1].status != workflows.StatusRunning {
 		t.Fatalf("mid-state checkpoint status = %q, want running", store.saves[1].status)
@@ -310,7 +305,8 @@ func TestMidStateCheckpointRecordsProgress(t *testing.T) {
 // work that never succeeded.
 func TestRetryAfterMidStateCheckpointSkipsEffect(t *testing.T) {
 	store := &fakeStore{}
-	wf := &effectWorkflow{failAfterEffect: true}
+	wf := newEffectWorkflow()
+	wf.failAfterEffect = true
 	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
 
 	err := engine.Execute(context.Background(), nil)
@@ -347,7 +343,7 @@ func TestRetryAfterMidStateCheckpointSkipsEffect(t *testing.T) {
 // overwrite the durable outcome with a stale running stamp.
 func TestMidStateCheckpointOutsideRunRefuses(t *testing.T) {
 	store := &fakeStore{}
-	wf := &effectWorkflow{}
+	wf := newEffectWorkflow()
 	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
 
 	if err := engine.Execute(context.Background(), nil); err != nil {
@@ -366,7 +362,7 @@ func TestMidStateCheckpointOutsideRunRefuses(t *testing.T) {
 // with no repository wired, Deps.Checkpoint succeeds as a no-op, so the same
 // workflow code runs unchanged without durability.
 func TestMidStateCheckpointNoRepoIsNoOp(t *testing.T) {
-	wf := &effectWorkflow{}
+	wf := newEffectWorkflow()
 	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, nil)
 
 	if err := engine.Execute(context.Background(), nil); err != nil {
@@ -524,17 +520,17 @@ type gatedCtx struct {
 }
 
 func (c *gatedCtx) Graph() workflows.Graph {
-	return workflows.NewGraph(s1, workflows.States{
-		s1: func(ctx context.Context) (*workflows.State, error) {
+	return workflows.NewGraph(s1,
+		workflows.On(s1, func(ctx context.Context) (*workflows.State, error) {
 			*c.log = append(*c.log, s1)
 			c.visited++
 			close(c.entered)
 			<-c.release
 			return workflows.Next(s2), nil
-		},
-		s2: c.step(s2, workflows.Next(s3)),
-		s3: c.step(s3, nil),
-	})
+		}),
+		workflows.On(s2, c.step(s2, workflows.Next(s3))),
+		workflows.On(s3, c.step(s3, nil)),
+	)
 }
 
 func (c *gatedCtx) step(this workflows.State, next *workflows.State) workflows.StateHandler {
@@ -1019,11 +1015,11 @@ type teardownCtx struct {
 }
 
 func (c *teardownCtx) Graph() workflows.Graph {
-	return workflows.NewGraph(s1, workflows.States{
-		s1: c.step(s1, workflows.Next(s2)),
-		s2: c.step(s2, workflows.Next(s3)),
-		s3: c.step(s3, nil),
-	})
+	return workflows.NewGraph(s1,
+		workflows.On(s1, c.step(s1, workflows.Next(s2))),
+		workflows.On(s2, c.step(s2, workflows.Next(s3))),
+		workflows.On(s3, c.step(s3, nil)),
+	)
 }
 
 func (c *teardownCtx) step(this workflows.State, next *workflows.State) workflows.StateHandler {
@@ -1249,14 +1245,14 @@ type outputCtx struct {
 }
 
 func (c *outputCtx) Graph() workflows.Graph {
-	return workflows.NewGraph(s1, workflows.States{
-		s1: func(ctx context.Context) (*workflows.State, error) {
+	return workflows.NewGraph(s1,
+		workflows.On(s1, func(ctx context.Context) (*workflows.State, error) {
 			if c.w.failRun {
 				return nil, errors.New("run failed")
 			}
 			return nil, nil
-		},
-	})
+		}),
+	)
 }
 
 func (c *outputCtx) Output() ([]byte, error) { return c.w.output, c.w.outErr }

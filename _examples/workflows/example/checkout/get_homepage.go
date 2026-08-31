@@ -11,7 +11,7 @@ import (
 const getHomepage workflows.State = "get-homepage"
 
 // GetHomepage fetches the product page and records the variant matching the
-// requested size and the CSRF token, both written to the running context.
+// requested size and the CSRF token in its durable section.
 func (c *Context) GetHomepage(ctx context.Context) (*workflows.State, error) {
 	client, err := c.client(ctx)
 	if err != nil {
@@ -19,8 +19,8 @@ func (c *Context) GetHomepage(ctx context.Context) (*workflows.State, error) {
 	}
 
 	res, err := requests.GetHomepage(ctx, client, requests.GetHomepageRequest{
-		URL:  c.static.ProductURL,
-		Size: c.static.Size,
+		URL:  c.in.ProductURL,
+		Size: c.in.Size,
 	})
 	if err != nil {
 		return nil, err
@@ -31,8 +31,7 @@ func (c *Context) GetHomepage(ctx context.Context) (*workflows.State, error) {
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		return nil, err
 	}
-	c.running.variantID = body.VariantID
-	c.running.csrfToken = body.CSRFToken
+	c.d.Homepage = HomepageState{VariantID: body.VariantID, CSRFToken: body.CSRFToken}
 
 	return workflows.Next(waitInQueue), nil
 }
