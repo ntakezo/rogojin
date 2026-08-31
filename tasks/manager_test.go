@@ -994,7 +994,7 @@ func TestIsRunningReadsSuspendedAsLive(t *testing.T) {
 		t.Fatalf("Suspend: %v", err)
 	}
 	close(wf.release)
-	waitUntil(t, func() bool { return task.engine.Status() == workflows.StatusSuspended })
+	waitUntil(t, func() bool { return task.LiveStatus() == workflows.StatusSuspended })
 
 	if !svc.IsRunning(task.ID) {
 		t.Fatal("IsRunning = false while suspended: parked is not finished")

@@ -209,10 +209,25 @@ func (t *Task) Start(ctx context.Context) ([]byte, error) {
 }
 
 // IsRunning reports whether the task is started and not yet terminal. A
-// suspended task counts: it is parked, not finished. It reads the live run,
-// so it is safe from any goroutine.
+// suspended task counts: it is parked, not finished — use LiveStatus to
+// distinguish. It reads the live run, so it is safe from any goroutine.
 func (t *Task) IsRunning() bool {
 	return t.engine != nil && t.engine.IsRunning()
+}
+
+// LiveStatus reports the task's current lifecycle status. Once the run has
+// started it reads the live engine — running, suspended, killed, failed,
+// done — and is safe from any goroutine. Before the run starts, or on a task
+// with no runtime, it reports the durable Status mirror (the status as of the
+// last checkpoint or terminal stamp), so a recovered-but-unstarted task still
+// answers with the status it will start under.
+func (t *Task) LiveStatus() workflows.Status {
+	if t.engine != nil {
+		if s := t.engine.Status(); s != workflows.StatusNotStarted {
+			return s
+		}
+	}
+	return workflows.Status(t.Status)
 }
 
 // Suspend signals the task to park before processing the next state. It is a

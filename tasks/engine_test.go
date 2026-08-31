@@ -475,6 +475,68 @@ func TestRecoveredSuspendedTaskStartsPaused(t *testing.T) {
 	}
 }
 
+// TestLiveStatusTracksLifecycle verifies LiveStatus follows the run live —
+// not started, running, suspended, done — where the Status field only catches
+// up when Start exits, and that a rehydrated-but-unstarted task falls back to
+// its persisted status instead of reporting not started.
+func TestLiveStatusTracksLifecycle(t *testing.T) {
+	var log []workflows.State
+	store := &fakeStore{}
+	wf := &gatedWorkflow{
+		log:     &log,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	task, err := createTask(wf, wf.ID(), nil, nil, store, "", nil, nil)
+	if err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+
+	if got := task.LiveStatus(); got != workflows.StatusNotStarted {
+		t.Fatalf("LiveStatus before Start = %q, want not started", got)
+	}
+
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(context.Background()); done <- serr }()
+
+	select {
+	case <-wf.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("s1 never entered")
+	}
+	if got := task.LiveStatus(); got != workflows.StatusRunning {
+		t.Fatalf("LiveStatus mid-s1 = %q, want running", got)
+	}
+
+	if err := task.Suspend(); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	close(wf.release)
+	waitFor(t, func() bool { return task.LiveStatus() == workflows.StatusSuspended })
+
+	if err := task.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("task did not complete after resume")
+	}
+	if got := task.LiveStatus(); got != workflows.StatusDone {
+		t.Fatalf("LiveStatus after completion = %q, want done", got)
+	}
+
+	// A recovered task that has not started yet answers with its persisted
+	// status — an operator inspecting it must not read "not started".
+	parked := rehydrateTask(&testWorkflow{log: &log}, Task{ID: "task-2", State: string(s2), Status: string(workflows.StatusSuspended)}, nil, store, nil)
+	if got := parked.LiveStatus(); got != workflows.StatusSuspended {
+		t.Fatalf("LiveStatus on rehydrated unstarted task = %q, want suspended", got)
+	}
+}
+
 // TestRecoveredTerminalTaskRefusesStart verifies a task recovered with a
 // terminal outcome cannot be started again: MarkTerminal leaves state and
 // snapshot in place, so a permissive Start would silently re-execute the final
