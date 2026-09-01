@@ -6,13 +6,15 @@
 //
 // Run it from inside the Go module that will own the workflow; generated imports
 // resolve against that module's path. Flags subtract features from the default
-// full scaffold:
+// full scaffold, and one flag picks the repository:
 //
-//	--no-durable             omit the Snapshot/Restore recovery hooks
-//	--no-output              omit the Output result hook
-//	--no-proxy               omit per-task proxy leasing
-//	--no-task-persistence    run tasks in memory (nil repo) instead of SQLite
-//	--no-proxy-persistence   use an in-memory proxy pool instead of SQLite
+//	--no-durable    omit the Snapshot/Restore recovery hooks
+//	--no-proxy      omit per-task proxy leasing
+//	--no-accounts   omit per-task site-account locking
+//	--no-payments   omit per-task payment-instrument leasing
+//	--no-email      omit inbox listening
+//	--repo          sqlite (default) persists everything; memory runs the
+//	                managers on nil repositories, nothing surviving the process
 package main
 
 import (
@@ -48,14 +50,15 @@ func main() {
 func runNew(args []string) error {
 	fs := flag.NewFlagSet("new", flag.ContinueOnError)
 	noDurable := fs.Bool("no-durable", false, "omit the Snapshot/Restore recovery hooks")
-	noOutput := fs.Bool("no-output", false, "omit the Output result hook")
 	noProxy := fs.Bool("no-proxy", false, "omit per-task proxy leasing")
-	noTaskPersist := fs.Bool("no-task-persistence", false, "run tasks in memory instead of SQLite")
-	noProxyPersist := fs.Bool("no-proxy-persistence", false, "use an in-memory proxy pool instead of SQLite")
+	noAccounts := fs.Bool("no-accounts", false, "omit per-task site-account locking")
+	noPayments := fs.Bool("no-payments", false, "omit per-task payment-instrument leasing")
+	noEmail := fs.Bool("no-email", false, "omit inbox listening")
+	repo := fs.String("repo", "sqlite", "repository behind the managers: sqlite or memory")
 
-	// Pull the workflow name out of the args so flags may appear on either side of
-	// it: the flag package stops at the first non-flag, and all our flags are
-	// boolean (no values to mistake the name for).
+	// Pull the workflow name out of the args so flags may appear on either side
+	// of it: the flag package stops at the first non-flag, and splitName knows
+	// which flags consume the token after them.
 	name, flags := splitName(args)
 	if err := fs.Parse(flags); err != nil {
 		return err
@@ -64,19 +67,25 @@ func runNew(args []string) error {
 		return fmt.Errorf("usage: rogojin new <name> [flags]")
 	}
 
-	opts := scaffold.Options{
-		Name:         name,
-		Package:      scaffold.PackageName(name),
-		Durable:      !*noDurable,
-		Output:       !*noOutput,
-		Proxy:        !*noProxy,
-		TaskPersist:  !*noTaskPersist,
-		ProxyPersist: !*noProxyPersist,
+	var persist bool
+	switch *repo {
+	case "sqlite":
+		persist = true
+	case "memory":
+		persist = false
+	default:
+		return fmt.Errorf("unknown repository %q: --repo takes sqlite or memory", *repo)
 	}
-	// Proxy persistence is meaningless without a proxy pool, so --no-proxy
-	// normalizes it off — stated explicitly alongside it or not.
-	if !opts.Proxy {
-		opts.ProxyPersist = false
+
+	opts := scaffold.Options{
+		Name:     name,
+		Package:  scaffold.PackageName(name),
+		Durable:  !*noDurable,
+		Proxy:    !*noProxy,
+		Accounts: !*noAccounts,
+		Payments: !*noPayments,
+		Email:    !*noEmail,
+		Persist:  persist,
 	}
 
 	cwd, err := os.Getwd()
@@ -102,15 +111,22 @@ func runNew(args []string) error {
 }
 
 // splitName returns the first non-flag token as the workflow name and every
-// other token as flags, so the name may sit before or after the flags. It is
-// safe because all of new's flags are boolean and never consume a value.
+// other token as flags, so the name may sit before or after the flags. The
+// boolean flags never consume a value, and the one value flag, --repo, only
+// swallows the next token in its separated form (--repo=memory is
+// self-contained) — so the first remaining non-flag token is the name.
 func splitName(args []string) (name string, flags []string) {
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if name == "" && !strings.HasPrefix(a, "-") {
 			name = a
 			continue
 		}
 		flags = append(flags, a)
+		if trimmed := strings.TrimLeft(a, "-"); trimmed == "repo" && i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
 	}
 	return name, flags
 }
@@ -122,10 +138,12 @@ Usage:
   rogojin new <name> [flags]
 
 Flags:
-  --no-durable             omit the Snapshot/Restore recovery hooks
-  --no-output              omit the Output result hook
-  --no-proxy               omit per-task proxy leasing
-  --no-task-persistence    run tasks in memory (nil repo) instead of SQLite
-  --no-proxy-persistence   use an in-memory proxy pool instead of SQLite
+  --no-durable    omit the Snapshot/Restore recovery hooks
+  --no-proxy      omit per-task proxy leasing
+  --no-accounts   omit per-task site-account locking
+  --no-payments   omit per-task payment-instrument leasing
+  --no-email      omit inbox listening
+  --repo          sqlite (default) persists everything; memory runs the
+                  managers on nil repositories, nothing surviving the process
 `)
 }

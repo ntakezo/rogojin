@@ -1,23 +1,32 @@
 // Command run wires the {{.Name}} workflow onto a task service and runs one
 // task end to end. It is a starting point — edit the input, swap the
-// persistence, and add proxies to taste.
+// repositories, and grow the inventory to taste.
 package main
 
 import (
 	"context"
+{{- if and (not .Persist) (or .Accounts .Payments)}}
+	"encoding/json"
+{{- end}}
 	"log"
-{{- if .Proxy}}{{if not .ProxyPersist}}
-	"sync"
-{{- end}}{{end}}
 
 	"github.com/ntakezo/rogojin/comms"
-{{- if .Proxy}}{{if not .ProxyPersist}}
+{{- if .Accounts}}
+	"github.com/ntakezo/rogojin/accounts"
+{{- end}}
+{{- if .Email}}
+	"github.com/ntakezo/rogojin/email"
+{{- end}}
+{{- if and (not .Persist) (or .Proxy .Accounts .Payments)}}
 	"github.com/ntakezo/rogojin/leasing"
-{{- end}}{{end}}
+{{- end}}
+{{- if .Payments}}
+	"github.com/ntakezo/rogojin/payments"
+{{- end}}
 {{- if .Proxy}}
 	"github.com/ntakezo/rogojin/proxies"
 {{- end}}
-{{- if or .TaskPersist .ProxyPersist}}
+{{- if .Persist}}
 	"github.com/ntakezo/rogojin/sqlite"
 {{- end}}
 	"github.com/ntakezo/rogojin/tasks"
@@ -28,86 +37,161 @@ import (
 func main() {
 	ctx := context.Background()
 
-{{- if or .TaskPersist .ProxyPersist}}
+{{- if .Persist}}
 
-{{- if and .TaskPersist .ProxyPersist}}
-	// One database holds both the proxy pool and the task history: every store
+	// One database holds every store — tasks and inventory alike: each store
 	// records its migrations under its own name in a shared ledger. Open a
-	// second file if you would rather keep them apart.
-{{- end}}
+	// second file if you would rather keep them apart. The inventory seeded
+	// below persists across runs, so grow it once and it stays.
 	db, err := sqlite.Open("{{.Package}}.db")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
+{{- else}}
+
+	// Every repository below is nil: the managers run purely in memory, so
+	// nothing — inventory, locks, task history — survives the process. Swap
+	// in the sqlite constructors for durability.
+{{- end}}
+
+{{- if .Email}}
+
+	// Email is not a leased resource — no groups, no rotation, no locks. The
+	// inventory holds the inboxes tasks listen to.
+{{- if .Persist}}
+	emailRepo, err := sqlite.NewEmails(db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	emailManager, err := email.NewManager(ctx, emailRepo)
+{{- else}}
+	emailManager, err := email.NewManager(ctx, nil)
+{{- end}}
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer emailManager.Close()
+{{- if not .Persist}}
+	if err := emailManager.Add(ctx, email.Email{
+		ID:      "inbox-1", // replace with a real inbox
+		Address: "you@example.com",
+		Inbox:   &email.Inbox{Vendor: email.Gmail, Auth: email.Auth{Kind: email.AuthPassword, Password: "app-password"}},
+	}); err != nil {
+		log.Fatal(err)
+	}
+{{- end}}
 {{- end}}
 
 {{- if .Proxy}}
 
-{{- if .ProxyPersist}}
+{{- if .Persist}}
 	proxyRepo, err := sqlite.NewProxies(db)
 	if err != nil {
 		log.Fatal(err)
 	}
+	proxyManager, err := proxies.NewManager(ctx, proxyRepo)
 {{- else}}
-
-	// An in-memory proxy pool to get started. Seed it with real proxies, or
-	// swap in sqlite.NewProxies for a durable pool.
-	proxyRepo := newMemProxyRepo(
-		proxies.Proxy{Resource: leasing.Resource{ID: "proxy-1"}, URL: "http://127.0.0.1:8080"},
-	)
+	proxyManager, err := proxies.NewManager(ctx, nil)
 {{- end}}
-
-	manager, err := proxies.NewManager(ctx, proxyRepo)
 	if err != nil {
 		log.Fatal(err)
 	}
+{{- if not .Persist}}
+	if err := proxyManager.Add(ctx, proxies.Proxy{
+		Resource: leasing.Resource{ID: "proxy-1"}, // replace with real proxies
+		URL:      "http://127.0.0.1:8080",
+	}); err != nil {
+		log.Fatal(err)
+	}
+{{- end}}
 {{- end}}
 
-{{- if .TaskPersist}}
+{{- if .Accounts}}
+
+{{- if .Persist}}
+	accountRepo, err := sqlite.NewAccounts(db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	accountManager, err := accounts.NewManager(ctx, accountRepo{{if .Email}}, accounts.WithEmail(emailManager){{end}})
+{{- else}}
+	accountManager, err := accounts.NewManager(ctx, nil{{if .Email}}, accounts.WithEmail(emailManager){{end}})
+{{- end}}
+	if err != nil {
+		log.Fatal(err)
+	}
+{{- if not .Persist}}
+	if err := accountManager.Add(ctx, accounts.Account{
+		Resource: leasing.Resource{ID: "account-1"}, // replace with real accounts
+{{- if .Email}}
+		EmailID:  "inbox-1", // this account's forwarding inbox
+{{- end}}
+		Fields: json.RawMessage(`{"email":"you@example.com","name":"Sample Buyer","address":"1 Example St"}`),
+	}); err != nil {
+		log.Fatal(err)
+	}
+{{- end}}
+{{- end}}
+
+{{- if .Payments}}
+
+{{- if .Persist}}
+	paymentRepo, err := sqlite.NewPayments(db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	paymentManager, err := payments.NewManager(ctx, paymentRepo)
+{{- else}}
+	paymentManager, err := payments.NewManager(ctx, nil)
+{{- end}}
+	if err != nil {
+		log.Fatal(err)
+	}
+{{- if not .Persist}}
+	if err := paymentManager.Add(ctx, payments.Payment{
+		Resource: leasing.Resource{ID: "payment-1"}, // replace with real instruments
+		Fields:   json.RawMessage(`{"number":"4242424242424242","expiry":"12/30","cvv":"123"}`),
+	}); err != nil {
+		log.Fatal(err)
+	}
+{{- end}}
+{{- end}}
+
+{{- if .Persist}}
 
 	repo, err := sqlite.NewTasks(db)
 	if err != nil {
 		log.Fatal(err)
 	}
-{{- else}}
-
-	// A nil task repository runs tasks purely in memory: no checkpoints, no
-	// recovery. Swap in sqlite.NewTasks (or your own Repository) for durability.
 {{- end}}
-{{- if .Proxy}}
-	// Proxy locks outlive the process, so the manager registers under its kind:
-	// deleting a task frees its lock, and repointing one drops the lock its new
-	// placement no longer fits. Nothing else ever clears them. Add a second kind
-	// the same way. This is the manager's one entry point: RegisterWorkflow
-	// hands it to the workflow through UseResources, so the instance a task
-	// leases through is the instance a deletion unlocks through.
-	svc, err := tasks.NewManager(ctx, {{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus(),
-		tasks.WithResource(proxies.Kind, manager))
+{{- if or .Proxy .Accounts .Payments}}
+	// Leases and locks outlive the process, so each manager registers under
+	// its kind: deleting a task frees its locks, and repointing one drops the
+	// lock its new placement no longer fits. This is each manager's one entry
+	// point: RegisterWorkflow hands them to the workflow through UseResources,
+	// so the instance a task leases through is the instance a deletion
+	// unlocks through.
+{{- end}}
+	svc, err := tasks.NewManager(ctx, {{if .Persist}}repo{{else}}nil{{end}}, comms.NewBus(){{if .Proxy}},
+		tasks.WithResource(proxies.Kind, proxyManager){{end}}{{if .Accounts}},
+		tasks.WithResource(accounts.Kind, accountManager){{end}}{{if .Payments}},
+		tasks.WithResource(payments.Kind, paymentManager){{end}})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	wf := {{.Package}}.New()
+	wf := {{.Package}}.New({{if .Email}}emailManager{{end}})
 	if err := svc.RegisterWorkflow({{.Package}}.Name, wf); err != nil {
 		log.Fatal(err)
 	}
-{{- else}}
-	svc, err := tasks.NewManager(ctx, {{if .TaskPersist}}repo{{else}}nil{{end}}, comms.NewBus())
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	wf := {{.Package}}.New()
-	if err := svc.RegisterWorkflow({{.Package}}.Name, wf); err != nil {
-		log.Fatal(err)
-	}
-{{- end}}
-
-{{- if .Output}}
 	// Creating against the module infers the input and output types, so the
 	// task handle's Start returns a decoded states.Result.
-	task, err := tasks.Create(ctx, svc, wf, states.Input{URL: "https://example.com"}{{if .Proxy}}, tasks.WithResourceGroup(proxies.Kind, proxies.GlobalGroup){{end}})
+	task, err := tasks.Create(ctx, svc, wf, states.Input{URL: "https://example.com"{{if and .Email (not .Accounts)}}, EmailID: "inbox-1"{{end}}}{{if .Proxy}},
+		tasks.WithResourceGroup(proxies.Kind, proxies.GlobalGroup){{end}}{{if .Accounts}},
+		tasks.WithResourceGroup(accounts.Kind, accounts.GlobalGroup){{end}}{{if .Payments}},
+		tasks.WithResourceGroup(payments.Kind, payments.GlobalGroup){{end}})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -116,86 +200,4 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("task %s finished with status %q, fetched %d bytes from %s", task.ID, task.Status, result.Bytes, result.URL)
-{{- else}}
-	task, err := svc.CreateTask(ctx, {{.Package}}.Name, states.Input{URL: "https://example.com"}{{if .Proxy}}, tasks.WithResourceGroup(proxies.Kind, proxies.GlobalGroup){{end}})
-	if err != nil {
-		log.Fatal(err)
-	}
-	if _, err := task.Start(ctx); err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("task %s finished with status %q", task.ID, task.Status)
-{{- end}}
 }
-{{if and .Proxy (not .ProxyPersist)}}
-// memProxyRepo is a minimal in-memory proxies.Repository: a dumb store of the
-// seeded pool. The Manager owns all live lease state, so this only holds records.
-type memProxyRepo struct {
-	mu      sync.Mutex
-	records map[string]proxies.Proxy
-	order   []string
-	groups  map[string]proxies.Group
-}
-
-func newMemProxyRepo(seed ...proxies.Proxy) *memProxyRepo {
-	r := &memProxyRepo{records: make(map[string]proxies.Proxy), groups: make(map[string]proxies.Group)}
-	for _, p := range seed {
-		r.records[p.ID] = p
-		r.order = append(r.order, p.ID)
-	}
-	return r
-}
-
-func (r *memProxyRepo) List(ctx context.Context) ([]proxies.Proxy, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]proxies.Proxy, 0, len(r.order))
-	for _, id := range r.order {
-		if p, ok := r.records[id]; ok {
-			out = append(out, p)
-		}
-	}
-	return out, nil
-}
-
-func (r *memProxyRepo) Save(ctx context.Context, p proxies.Proxy) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.records[p.ID]; !ok {
-		r.order = append(r.order, p.ID)
-	}
-	r.records[p.ID] = p
-	return nil
-}
-
-func (r *memProxyRepo) Delete(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.records, id)
-	return nil
-}
-
-func (r *memProxyRepo) ListGroups(ctx context.Context) ([]proxies.Group, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]proxies.Group, 0, len(r.groups))
-	for _, g := range r.groups {
-		out = append(out, g)
-	}
-	return out, nil
-}
-
-func (r *memProxyRepo) SaveGroup(ctx context.Context, g proxies.Group) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.groups[g.ID] = g
-	return nil
-}
-
-func (r *memProxyRepo) DeleteGroup(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.groups, id)
-	return nil
-}
-{{end}}

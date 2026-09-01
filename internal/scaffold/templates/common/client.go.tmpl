@@ -1,0 +1,29 @@
+// Package common holds the side-effect ports shared by the {{.Package}}
+// workflow's states, starting with the HTTP client every task talks to its
+// target through. Keep cross-cutting request plumbing here; keep the target's
+// individual calls in the requests package.
+package common
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+)
+
+// NewClient builds an HTTP client, routing through proxyURL when one is given
+// and talking directly when it is empty. Each task builds its own so no
+// session state bleeds from one task into another.
+//
+// This is stdlib net/http for the scaffold's sake. Swap in a fingerprinting
+// client (fhttp and friends) here, behind this one seam, when the target
+// starts caring what the TLS handshake and header order look like.
+func NewClient(proxyURL string) (*http.Client, error) {
+	if proxyURL == "" {
+		return &http.Client{}, nil
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse proxy url: %w", err)
+	}
+	return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}}, nil
+}

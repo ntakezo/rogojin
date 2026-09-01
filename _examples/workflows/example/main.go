@@ -51,16 +51,22 @@ func main() {
 	// Email is not a leased resource — no groups, no rotation, no locks. The
 	// inventory holds the forwarding inboxes accounts point at; a workflow
 	// reaches its inbox through its locked account (ForwardingEmail, then
-	// Listen with a sender filter and a backfill window).
-	emailManager, err := email.NewManager(ctx, newMemEmailRepo(email.Email{
-		ID:      "inbox-1",
-		Address: "orders@example.com",
-		Inbox:   &email.Inbox{Vendor: email.Gmail, Auth: email.Auth{Kind: email.AuthPassword, Password: "app-password"}},
-	}), email.WithDialer(mailServer.dial))
+	// Listen with a sender filter and a backfill window). The nil repository
+	// runs the inventory in memory — this example wants no rows surviving it —
+	// where the proxy and task repositories below are written out because they
+	// do something with their writes.
+	emailManager, err := email.NewManager(ctx, nil, email.WithDialer(mailServer.dial))
 	if err != nil {
 		log.Fatalf("email manager: %v", err)
 	}
 	defer emailManager.Close()
+	if err := emailManager.Add(ctx, email.Email{
+		ID:      "inbox-1",
+		Address: "orders@example.com",
+		Inbox:   &email.Inbox{Vendor: email.Gmail, Auth: email.Auth{Kind: email.AuthPassword, Password: "app-password"}},
+	}); err != nil {
+		log.Fatalf("add email: %v", err)
+	}
 
 	// Accounts are the same machinery minus the rotation knob. The account
 	// group named "global" is never confused with the proxy group of the same
@@ -68,13 +74,16 @@ func main() {
 	// account's guaranteed field — its forwarding inbox — and WithEmail
 	// closes the referential loop: an inbox a held or locked account forwards
 	// to refuses deletion, exactly like a leased resource would.
-	accountManager, err := accounts.NewManager(ctx, newMemAccountRepo(accounts.Account{
+	accountManager, err := accounts.NewManager(ctx, nil, accounts.WithEmail(emailManager))
+	if err != nil {
+		log.Fatalf("account manager: %v", err)
+	}
+	if err := accountManager.Add(ctx, accounts.Account{
 		Resource: leasing.Resource{ID: "buyer-1", GroupID: accounts.GlobalGroup},
 		EmailID:  "inbox-1",
 		Fields:   profileFields(example_checkout.Profile{Email: "buyer@example.com", Name: "Buyer", Address: "1 Example St"}),
-	}), accounts.WithEmail(emailManager))
-	if err != nil {
-		log.Fatalf("account manager: %v", err)
+	}); err != nil {
+		log.Fatalf("add account: %v", err)
 	}
 
 	// Both kinds of lock outlive the process, so each manager registers under
@@ -116,52 +125,6 @@ func main() {
 		log.Fatalf("start task: %v", err)
 	}
 	fmt.Printf("task %s finished with status %q: order %s is %s\n", task.ID, task.Status, order.OrderID, order.Status)
-}
-
-// memEmailRepo is a minimal in-memory email.Repository; the manager owns all
-// listener state, so this only stores the inventory and its cursors.
-type memEmailRepo struct {
-	mu      sync.Mutex
-	records map[string]email.Email
-	order   []string
-}
-
-func newMemEmailRepo(seed ...email.Email) *memEmailRepo {
-	r := &memEmailRepo{records: make(map[string]email.Email)}
-	for _, e := range seed {
-		r.records[e.ID] = e
-		r.order = append(r.order, e.ID)
-	}
-	return r
-}
-
-func (r *memEmailRepo) List(ctx context.Context) ([]email.Email, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]email.Email, 0, len(r.order))
-	for _, id := range r.order {
-		if e, ok := r.records[id]; ok {
-			out = append(out, e)
-		}
-	}
-	return out, nil
-}
-
-func (r *memEmailRepo) Save(ctx context.Context, e email.Email) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.records[e.ID]; !ok {
-		r.order = append(r.order, e.ID)
-	}
-	r.records[e.ID] = e
-	return nil
-}
-
-func (r *memEmailRepo) Delete(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.records, id)
-	return nil
 }
 
 // newForwardProxy serves a minimal HTTP forward proxy so the workflow's traffic
@@ -387,78 +350,6 @@ func profileFields(p example_checkout.Profile) json.RawMessage {
 		log.Fatalf("encode account fields: %v", err)
 	}
 	return raw
-}
-
-// memAccountRepo is a minimal in-memory accounts.Repository seeded with a fixed
-// set of logins; the manager owns all live lease state, so this only stores the
-// records.
-type memAccountRepo struct {
-	mu      sync.Mutex
-	records map[string]accounts.Account
-	order   []string
-	groups  map[string]accounts.Group
-}
-
-func newMemAccountRepo(seed ...accounts.Account) *memAccountRepo {
-	r := &memAccountRepo{records: make(map[string]accounts.Account), groups: make(map[string]accounts.Group)}
-	for _, a := range seed {
-		r.records[a.ID] = a
-		r.order = append(r.order, a.ID)
-	}
-	return r
-}
-
-func (r *memAccountRepo) List(ctx context.Context) ([]accounts.Account, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]accounts.Account, 0, len(r.order))
-	for _, id := range r.order {
-		if a, ok := r.records[id]; ok {
-			out = append(out, a)
-		}
-	}
-	return out, nil
-}
-
-func (r *memAccountRepo) Save(ctx context.Context, a accounts.Account) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.records[a.ID]; !ok {
-		r.order = append(r.order, a.ID)
-	}
-	r.records[a.ID] = a
-	return nil
-}
-
-func (r *memAccountRepo) Delete(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.records, id)
-	return nil
-}
-
-func (r *memAccountRepo) ListGroups(ctx context.Context) ([]accounts.Group, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]accounts.Group, 0, len(r.groups))
-	for _, g := range r.groups {
-		out = append(out, g)
-	}
-	return out, nil
-}
-
-func (r *memAccountRepo) SaveGroup(ctx context.Context, g accounts.Group) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.groups[g.ID] = g
-	return nil
-}
-
-func (r *memAccountRepo) DeleteGroup(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.groups, id)
-	return nil
 }
 
 // memRepo is a minimal in-memory Repository: a dumb byte store that records each

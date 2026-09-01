@@ -15,18 +15,18 @@ import (
 // flight, and a graph Retry re-runs it. A side effect a re-run must not
 // repeat rides in workflows.Do (or c.Once), whose effect log records the
 // success durably and replays it instead of repeating it.
+{{- if or .Accounts .Payments .Email}}
+//
+// The context's lazy helpers — {{.Helpers}} — hold this task's leased
+// resources; call them from whichever state needs them.
+{{- end}}
 func (c *Context) Process(ctx context.Context) (*workflows.State, error) {
 {{- if .Durable}}
 	fmt.Printf("fetched %d bytes from %s\n", len(c.d.Fetch.Body), c.in.URL)
-{{- else}}
-	fmt.Printf("fetched %d bytes from %s\n", len(c.body), c.in.URL)
-{{- end}}
-{{- if .Output}}
-{{- if .Durable}}
 	c.result = Result{URL: c.in.URL, Bytes: len(c.d.Fetch.Body)}
 {{- else}}
+	fmt.Printf("fetched %d bytes from %s\n", len(c.body), c.in.URL)
 	c.result = Result{URL: c.in.URL, Bytes: len(c.body)}
-{{- end}}
 {{- end}}
 	return nil, nil
 }

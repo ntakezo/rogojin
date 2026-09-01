@@ -3,14 +3,17 @@ package states
 import (
 	"context"
 	"io"
-	"net/http"
 
 	"github.com/ntakezo/rogojin/workflows"
+{{- if not .Proxy}}
+	"{{.ModulePath}}/{{.Package}}/common"
+{{- end}}
+	"{{.ModulePath}}/{{.Package}}/requests"
 )
 
-// Fetch retrieves the input URL and stores the body for the next state. It is
-// the graph's initial state; the graph retries it with backoff, so a transient
-// network failure re-runs the whole handler.
+// Fetch retrieves the input URL through a request function and stores the body
+// for the next state. It is the graph's initial state; the graph retries it
+// with backoff, so a transient network failure re-runs the whole handler.
 func (c *Context) Fetch(ctx context.Context) (*workflows.State, error) {
 {{- if .Proxy}}
 	client, err := c.client(ctx)
@@ -18,17 +21,18 @@ func (c *Context) Fetch(ctx context.Context) (*workflows.State, error) {
 		return nil, err
 	}
 {{- else}}
-	client := http.DefaultClient
-{{- end}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.in.URL, nil)
+	client, err := common.NewClient("")
 	if err != nil {
 		return nil, err
 	}
-	res, err := client.Do(req)
+{{- end}}
+	res, err := requests.GetPage(ctx, client, requests.GetPageRequest{URL: c.in.URL})
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
+	// The starter target returns HTML, so read the body raw. For a JSON
+	// endpoint, json.Unmarshal it into a requests.GetPageResponse instead.
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, err

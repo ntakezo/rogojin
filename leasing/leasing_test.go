@@ -73,11 +73,37 @@ func TestPayloadSurvivesALockAndARestart(t *testing.T) {
 	}
 }
 
-// TestNewManagerRequiresARepository verifies the one hard requirement is
-// reported rather than deferred to a nil dereference mid-lease.
-func TestNewManagerRequiresARepository(t *testing.T) {
-	if _, err := NewManager[res, *res](context.Background(), nil); err == nil {
-		t.Fatal("expected a repository to be required")
+// TestNilRepositoryRunsInMemory verifies the documented in-memory mode: a nil
+// repository yields an empty manager whose whole leasing surface — seeding,
+// groups, acquisition, durable locks, deletion — works with nothing durable
+// behind it.
+func TestNilRepositoryRunsInMemory(t *testing.T) {
+	ctx := context.Background()
+	m, err := NewManager[res, *res](ctx, nil)
+	if err != nil {
+		t.Fatalf("NewManager with nil repo: %v", err)
+	}
+
+	if err := m.CreateGroup(ctx, Group{ID: "eu"}); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := m.Add(ctx, res{Resource: Resource{ID: "k1", GroupID: "eu"}, payload: payload{secret: "s1"}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	lease, err := m.Lock(ctx, Assignment{TaskID: "t1", GroupID: "eu"})
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	if got := lease.Resource().payload.secret; got != "s1" {
+		t.Fatalf("payload secret = %q, want s1", got)
+	}
+	lease.Release()
+	if err := m.Unlock(ctx, "t1"); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	if unbound, err := m.Delete(ctx, "k1"); err != nil || len(unbound) != 0 {
+		t.Fatalf("delete = (%v, %v), want no stranded tasks and no error", unbound, err)
 	}
 }
 

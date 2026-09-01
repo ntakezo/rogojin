@@ -496,6 +496,33 @@ func TestBackfillRedeliversServerHistory(t *testing.T) {
 	assertQuiet(t, sub)
 }
 
+// TestNilRepositoryRunsInMemory verifies the documented in-memory mode: a nil
+// repository yields an empty manager whose whole surface — seeding, listening
+// (with backfill standing in for the never-stored cursor), deletion — works
+// with nothing durable behind it.
+func TestNilRepositoryRunsInMemory(t *testing.T) {
+	server := newFakeServer()
+	m := newTestManager(t, nil, server)
+	addEmail(t, m, testEmail("inbox-1"))
+
+	server.deliver(Message{Subject: "missed", Date: time.Now()})
+	sub, err := m.Listen(context.Background(), "t1", "inbox-1", WithBackfill(time.Now().Add(-time.Hour)))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	if msg := recv(t, sub); msg.Subject != "missed" {
+		t.Fatalf("backfill delivered %q, want missed", msg.Subject)
+	}
+	sub.Close()
+
+	if _, err := m.Delete(context.Background(), "inbox-1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := m.Get(context.Background(), "inbox-1"); !errors.Is(err, ErrEmailNotFound) {
+		t.Fatalf("get after delete err = %v, want ErrEmailNotFound", err)
+	}
+}
+
 // TestAddressOnlyEmailRefusesToListen verifies the two halves of an
 // address-only email: readable as data, unlistenable as an inbox.
 func TestAddressOnlyEmailRefusesToListen(t *testing.T) {

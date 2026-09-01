@@ -57,7 +57,7 @@ rogojin new checkout
 go run ./checkout/cmd/run
 ```
 
-`rogojin new <name>` emits a full workflow package wired onto a SQLite-backed task service; flags like `--no-proxy`, `--no-durable`, and `--no-task-persistence` subtract the pieces you don't need.
+`rogojin new <name>` emits a full workflow package — proxy leasing, site accounts, payment instruments, inbox listening, crash recovery — wired onto a SQLite-backed task service. Flags subtract the pieces you don't need (`--no-proxy`, `--no-accounts`, `--no-payments`, `--no-email`, `--no-durable`), and `--repo memory` swaps SQLite for nil repositories so everything runs in memory.
 
 ### Run the example
 

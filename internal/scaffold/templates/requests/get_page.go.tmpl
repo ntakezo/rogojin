@@ -1,0 +1,38 @@
+// Package requests holds the target's request functions. Each is pure: given a
+// client and a typed request struct it fires one HTTP call and returns the raw
+// response, leaving decode and body-close to the caller. The exported response
+// struct is the shape a JSON body unmarshals into — a state calls the function,
+// then json.Unmarshal's the body into it.
+package requests
+
+import (
+	"context"
+	"net/http"
+)
+
+// GetPageRequest is the input to GetPage: the URL to fetch. Grow it with the
+// headers, query params, or body your target expects — that is why the input
+// is a struct and not a bare string.
+type GetPageRequest struct {
+	URL string
+}
+
+// GetPageResponse is the shape GetPage's body decodes into. The scaffold's
+// starter target returns HTML, so Fetch reads the body raw and nothing decodes
+// into this yet; give it fields and json.Unmarshal the body when your endpoint
+// speaks JSON.
+type GetPageResponse struct {
+	Title string `json:"title"`
+}
+
+// GetPage fetches r.URL and returns the raw response; the caller reads and
+// closes the body. Pure by construction — every input it needs arrives in r,
+// so it is trivial to test against a canned client.
+func GetPage(ctx context.Context, client *http.Client, r GetPageRequest) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/html,application/json")
+	return client.Do(req)
+}

@@ -1,7 +1,9 @@
 // Package scaffold renders a runnable rogojin workflow package from a small set
 // of embedded templates. The feature flags on Options gate the durability hooks,
-// the output hook, proxy leasing, and the persistence wiring in the generated
-// main, so a generated tree always compiles and never carries code it cannot use.
+// the leased resource kinds (proxies, accounts, payments), the email inbox
+// wiring, and whether the generated main persists to SQLite or runs the
+// managers in memory, so a generated tree always compiles and never carries
+// code it cannot use.
 //
 // The templates reproduce framework surface (the workflows interfaces, the opt-in
 // capabilities, the manager constructors), so they drift when that
@@ -36,17 +38,38 @@ type Options struct {
 	// Durable emits the Durable state section, registered with the snapshot
 	// envelope via Persist, so crash recovery restores mid-run progress.
 	Durable bool
-	// Output emits the Outputter implementation: a Result type the terminal
-	// state fills and Output marshals on clean completion.
-	Output bool
 	// Proxy emits per-task proxy leasing and the Teardown that releases it.
 	Proxy bool
-	// TaskPersist wires a SQLite task repository in main; false uses a nil
-	// (in-memory) repository.
-	TaskPersist bool
-	// ProxyPersist wires a SQLite proxy repository in main; false emits an
-	// in-memory one. Meaningful only when Proxy is set.
-	ProxyPersist bool
+	// Accounts emits per-task site-account locking: a lazily locked account
+	// whose fields decode into the workflow's Profile.
+	Accounts bool
+	// Payments emits per-task payment-instrument leasing, mirroring accounts
+	// with a Card payload.
+	Payments bool
+	// Email emits inbox listening. With Accounts the route runs through the
+	// locked account's forwarding inbox; without, the workflow listens on an
+	// email ID named in its Input.
+	Email bool
+	// Persist wires SQLite repositories behind every manager in main; false
+	// passes nil repositories, running everything in memory with seeded
+	// placeholder records.
+	Persist bool
+}
+
+// Helpers names the lazy context helpers the enabled features emit, joined
+// for the generated comment that points at them.
+func (o Options) Helpers() string {
+	var h []string
+	if o.Accounts {
+		h = append(h, "profile")
+	}
+	if o.Payments {
+		h = append(h, "payment")
+	}
+	if o.Email {
+		h = append(h, "inbox")
+	}
+	return strings.Join(h, ", ")
 }
 
 // templateData is what the templates see. ModulePath is the consuming module's
@@ -60,12 +83,14 @@ type templateData struct {
 // destination root. Paths use the package name as their leading segment.
 func (o Options) outputs() map[string]string {
 	return map[string]string{
-		"templates/workflow.go.tmpl":       path.Join(o.Package, o.Package+".go"),
-		"templates/states/context.go.tmpl": path.Join(o.Package, "states", "context.go"),
-		"templates/states/graph.go.tmpl":   path.Join(o.Package, "states", "graph.go"),
-		"templates/states/fetch.go.tmpl":   path.Join(o.Package, "states", "fetch.go"),
-		"templates/states/process.go.tmpl": path.Join(o.Package, "states", "process.go"),
-		"templates/cmd/run/main.go.tmpl":   path.Join(o.Package, "cmd", "run", "main.go"),
+		"templates/workflow.go.tmpl":          path.Join(o.Package, o.Package+".go"),
+		"templates/states/context.go.tmpl":    path.Join(o.Package, "states", "context.go"),
+		"templates/states/graph.go.tmpl":      path.Join(o.Package, "states", "graph.go"),
+		"templates/states/fetch.go.tmpl":      path.Join(o.Package, "states", "fetch.go"),
+		"templates/states/process.go.tmpl":    path.Join(o.Package, "states", "process.go"),
+		"templates/common/client.go.tmpl":     path.Join(o.Package, "common", "client.go"),
+		"templates/requests/get_page.go.tmpl": path.Join(o.Package, "requests", "get_page.go"),
+		"templates/cmd/run/main.go.tmpl":      path.Join(o.Package, "cmd", "run", "main.go"),
 	}
 }
 
@@ -83,11 +108,8 @@ func (o Options) Validate() error {
 	if token.IsKeyword(o.Package) || o.Package == "main" {
 		return fmt.Errorf("workflow name %q yields package %q, which is not usable as an importable package name — choose another name", o.Name, o.Package)
 	}
-	if o.Durable && !o.TaskPersist {
-		return fmt.Errorf("a durable workflow needs task persistence: a nil task repository never writes the snapshots the durability hooks produce — pass --no-durable too")
-	}
-	if o.ProxyPersist && !o.Proxy {
-		return fmt.Errorf("proxy persistence requires a proxy pool: set Proxy, or clear ProxyPersist")
+	if o.Durable && !o.Persist {
+		return fmt.Errorf("a durable workflow needs a sqlite repository: an in-memory task repository never writes the snapshots the durability hooks produce — pass --no-durable or --repo sqlite")
 	}
 	return nil
 }

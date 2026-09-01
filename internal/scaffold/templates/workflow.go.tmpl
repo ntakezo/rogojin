@@ -6,8 +6,19 @@ package {{.Package}}
 
 import (
 	"{{.ModulePath}}/{{.Package}}/states"
-{{- if .Proxy}}
+{{- if .Accounts}}
+	"github.com/ntakezo/rogojin/accounts"
+{{- end}}
+{{- if .Email}}
+	"github.com/ntakezo/rogojin/email"
+{{- end}}
+{{- if or .Proxy .Accounts .Payments}}
 	"github.com/ntakezo/rogojin/leasing"
+{{- end}}
+{{- if .Payments}}
+	"github.com/ntakezo/rogojin/payments"
+{{- end}}
+{{- if .Proxy}}
 	"github.com/ntakezo/rogojin/proxies"
 {{- end}}
 	"github.com/ntakezo/rogojin/workflows"
@@ -18,24 +29,46 @@ const Name = "{{.Name}}"
 
 // New builds the workflow module. Instances embed workflows.Base, so the
 // module binds each task's deps into them and restores snapshots without
-// hand-written plumbing.{{if .Output}} The module declares states.Result as its output, so
-// tasks.Create returns a handle typed to it.{{end}}{{if .Proxy}} The proxy manager arrives through
-// WithResources at registration — from the task manager's own registry, so
-// the manager a task leases through is the same instance the task manager
-// unlocks through; a missing or mistyped kind fails the registration at
-// boot.{{end}}
-func New() {{if .Output}}*workflows.OutModule[states.Input, states.Result]{{else}}workflows.Workflow{{end}} {
+// hand-written plumbing. The module declares states.Result as its output, so
+// tasks.Create returns a handle typed to it.{{if or .Proxy .Accounts .Payments}} The resource managers arrive
+// through WithResources at registration — from the task manager's own
+// registry, so the manager a task leases through is the same instance the
+// task manager unlocks through; a missing or mistyped kind fails the
+// registration at boot.{{end}}{{if .Email}} Only the email manager is injected at
+// construction: listening is not leasing, so it never passes through the
+// task manager.{{end}}
+func New({{if .Email}}emailManager *email.Manager{{end}}) *workflows.OutModule[states.Input, states.Result] {
 {{- if .Proxy}}
-	var manager *proxies.Manager
+	var proxyManager *proxies.Manager
+{{- end}}
+{{- if .Accounts}}
+	var accountManager *accounts.Manager
+{{- end}}
+{{- if .Payments}}
+	var paymentManager *payments.Manager
 {{- end}}
 	return workflows.NewModule(Name,
 		func(in states.Input, deps workflows.Deps) (workflows.Instance, error) {
-			return states.NewContext(in{{if .Proxy}}, manager{{end}}), nil
-		}){{if .Proxy}}.
+			return states.NewContext(in{{if .Proxy}}, proxyManager{{end}}{{if .Accounts}}, accountManager{{end}}{{if .Payments}}, paymentManager{{end}}{{if .Email}}, emailManager{{end}}), nil
+		}){{if or .Proxy .Accounts .Payments}}.
 		WithResources(func(managers map[leasing.Kind]any) error {
 			var err error
-			manager, err = workflows.Resource[*proxies.Manager](managers, proxies.Kind)
-			return err
-		}){{end}}{{if .Output}}.
-		Returns[states.Result](){{end}}
+{{- if .Proxy}}
+			if proxyManager, err = workflows.Resource[*proxies.Manager](managers, proxies.Kind); err != nil {
+				return err
+			}
+{{- end}}
+{{- if .Accounts}}
+			if accountManager, err = workflows.Resource[*accounts.Manager](managers, accounts.Kind); err != nil {
+				return err
+			}
+{{- end}}
+{{- if .Payments}}
+			if paymentManager, err = workflows.Resource[*payments.Manager](managers, payments.Kind); err != nil {
+				return err
+			}
+{{- end}}
+			return nil
+		}){{end}}.
+		Returns[states.Result]()
 }

@@ -27,18 +27,25 @@ func TestPackageName(t *testing.T) {
 	}
 }
 
-// TestValidateRejectsIncoherentCombos guards the two combinations that would
-// otherwise generate code that lies about what it does. These are the whole
-// reason Validate exists, so they must fail loudly rather than render.
+// TestValidateRejectsIncoherentCombos guards the one combination that would
+// otherwise generate code that lies about what it does — and pins that the
+// combos deliberately kept independent stay valid.
 func TestValidateRejectsIncoherentCombos(t *testing.T) {
-	durableWithoutTaskPersist := Options{Name: "x", Package: "x", Durable: true, TaskPersist: false}
-	if err := durableWithoutTaskPersist.Validate(); err == nil {
-		t.Error("durable + no task persistence should be rejected: snapshots would never be written")
+	durableInMemory := Options{Name: "x", Package: "x", Durable: true, Persist: false}
+	if err := durableInMemory.Validate(); err == nil {
+		t.Error("durable + memory repo should be rejected: snapshots would never be written")
 	}
 
-	proxyPersistWithoutProxy := Options{Name: "x", Package: "x", Proxy: false, ProxyPersist: true}
-	if err := proxyPersistWithoutProxy.Validate(); err == nil {
-		t.Error("proxy persistence without a proxy pool should be rejected")
+	// Email and accounts are independent features: an inbox can be listened to
+	// without routing through an account's forwarding reference, and accounts
+	// need no inbox at all.
+	emailWithoutAccounts := Options{Name: "x", Package: "x", Email: true, Accounts: false, Persist: true}
+	if err := emailWithoutAccounts.Validate(); err != nil {
+		t.Errorf("email without accounts should be valid, got %v", err)
+	}
+	accountsWithoutEmail := Options{Name: "x", Package: "x", Accounts: true, Email: false, Persist: true}
+	if err := accountsWithoutEmail.Validate(); err != nil {
+		t.Errorf("accounts without email should be valid, got %v", err)
 	}
 }
 
@@ -48,55 +55,43 @@ func TestValidateRejectsIncoherentCombos(t *testing.T) {
 // error over the full rendered source.
 func TestValidateRejectsUnusablePackageNames(t *testing.T) {
 	for _, name := range []string{"type", "select", "func", "main", "Go!"} {
-		o := Options{Name: name, Package: PackageName(name), TaskPersist: true}
+		o := Options{Name: name, Package: PackageName(name), Persist: true}
 		if err := o.Validate(); err == nil {
 			t.Errorf("Validate accepted name %q (package %q), want rejection", name, o.Package)
 		}
 	}
 }
 
-// validCombos enumerates every flag combination that survives normalization and
-// Validate, so the compile test covers the whole feature matrix.
+// validCombos enumerates every flag combination that survives Validate, so the
+// compile test covers the whole feature matrix.
 func validCombos() []Options {
+	bools := []bool{true, false}
 	var out []Options
-	for _, durable := range []bool{true, false} {
-		for _, output := range []bool{true, false} {
-			for _, proxy := range []bool{true, false} {
-				for _, taskPersist := range []bool{true, false} {
-					for _, proxyPersist := range []bool{true, false} {
-						o := Options{
-							Name:         "sample",
-							Package:      "sample",
-							Durable:      durable,
-							Output:       output,
-							Proxy:        proxy,
-							TaskPersist:  taskPersist,
-							ProxyPersist: proxyPersist,
+	for _, durable := range bools {
+		for _, proxy := range bools {
+			for _, accounts := range bools {
+				for _, payments := range bools {
+					for _, mail := range bools {
+						for _, persist := range bools {
+							o := Options{
+								Name:     "sample",
+								Package:  "sample",
+								Durable:  durable,
+								Proxy:    proxy,
+								Accounts: accounts,
+								Payments: payments,
+								Email:    mail,
+								Persist:  persist,
+							}
+							if o.Validate() != nil {
+								continue
+							}
+							out = append(out, o)
 						}
-						if !o.Proxy {
-							o.ProxyPersist = false // mirror CLI normalization
-						}
-						if o.Validate() != nil {
-							continue
-						}
-						out = append(out, o)
 					}
 				}
 			}
 		}
-	}
-	return dedupe(out)
-}
-
-func dedupe(in []Options) []Options {
-	seen := make(map[Options]bool)
-	var out []Options
-	for _, o := range in {
-		if seen[o] {
-			continue
-		}
-		seen[o] = true
-		out = append(out, o)
 	}
 	return out
 }
@@ -172,6 +167,6 @@ replace github.com/ntakezo/rogojin => %s
 }
 
 func comboName(o Options) string {
-	return fmt.Sprintf("durable=%t_output=%t_proxy=%t_taskpersist=%t_proxypersist=%t",
-		o.Durable, o.Output, o.Proxy, o.TaskPersist, o.ProxyPersist)
+	return fmt.Sprintf("durable=%t_proxy=%t_accounts=%t_payments=%t_email=%t_persist=%t",
+		o.Durable, o.Proxy, o.Accounts, o.Payments, o.Email, o.Persist)
 }

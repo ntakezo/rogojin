@@ -39,6 +39,18 @@ type Manager[R any, P Leasable[R]] struct {
 	bindings   map[string]string         // taskID -> locked resource ID
 }
 
+// noopRepository is the Repository a nil one is swapped for: it loads nothing
+// and drops every write, leaving the manager's own maps as the only copy. The
+// manager treats the store as a mirror everywhere, so no call site changes.
+type noopRepository[R any] struct{}
+
+func (noopRepository[R]) List(context.Context) ([]R, error)           { return nil, nil }
+func (noopRepository[R]) Save(context.Context, R) error               { return nil }
+func (noopRepository[R]) Delete(context.Context, string) error        { return nil }
+func (noopRepository[R]) ListGroups(context.Context) ([]Group, error) { return nil, nil }
+func (noopRepository[R]) SaveGroup(context.Context, Group) error      { return nil }
+func (noopRepository[R]) DeleteGroup(context.Context, string) error   { return nil }
+
 // NewManager loads the groups and pool from the repository, persisting the
 // global group if absent. Round robin is always installed and is always the
 // default: a group naming no strategy rotates round robin. Groups and pool
@@ -48,9 +60,13 @@ type Manager[R any, P Leasable[R]] struct {
 // fails construction with ErrGroupNotFound, so a repository seeded directly
 // must SaveGroup before Save. Resources with no GroupID land in the global
 // group, which is created here if absent.
+//
+// A nil repository runs the pool purely in memory: the manager starts empty
+// (seed it through Add), and no inventory or durable lock survives the
+// process — the same bargain a nil task repository strikes.
 func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], opts ...Option[R, P]) (*Manager[R, P], error) {
 	if repo == nil {
-		return nil, errors.New("repository is required")
+		repo = noopRepository[R]{}
 	}
 
 	m := &Manager[R, P]{

@@ -1,20 +1,38 @@
 package states
 
 import (
-{{- if .Proxy}}
+{{- if or .Proxy .Accounts .Payments .Email}}
 	"context"
 {{- end}}
-{{- if .Output}}
 	"encoding/json"
+{{- if or .Proxy .Email}}
+	"errors"
+{{- end}}
+{{- if or .Proxy .Accounts .Payments .Email}}
+	"fmt"
 {{- end}}
 {{- if .Proxy}}
-	"fmt"
 	"net/http"
-	"net/url"
-
-	"github.com/ntakezo/rogojin/proxies"
 {{- end}}
+{{- if .Email}}
+	"time"
+{{- end}}
+
 	"github.com/ntakezo/rogojin/workflows"
+{{- if .Accounts}}
+	"github.com/ntakezo/rogojin/accounts"
+{{- end}}
+{{- if .Email}}
+	"github.com/ntakezo/rogojin/email"
+{{- end}}
+{{- if .Payments}}
+	"github.com/ntakezo/rogojin/payments"
+{{- end}}
+{{- if .Proxy}}
+	"github.com/ntakezo/rogojin/proxies"
+
+	"{{.ModulePath}}/{{.Package}}/common"
+{{- end}}
 )
 
 // Input is the immutable per-task input the caller supplies at CreateTask. Add
@@ -23,15 +41,37 @@ import (
 // contexts from it.
 type Input struct {
 	URL string `json:"url"`
+{{- if and .Email (not .Accounts)}}
+	// EmailID names the inbox in the email inventory this task listens to.
+	EmailID string `json:"emailID"`
+{{- end}}
 }
-
-{{- if .Output}}
 
 // Result is the workflow's output, set by the terminal state and marshaled by
 // Output on clean completion. Shape it to whatever your workflow produces.
 type Result struct {
 	URL   string `json:"url"`
 	Bytes int    `json:"bytes"`
+}
+
+{{- if .Accounts}}
+
+// Profile is this workflow's account shape. The accounts package stores it as
+// opaque JSON, so another workflow's accounts can look nothing like this one's.
+type Profile struct {
+	Email   string `json:"email"`
+	Name    string `json:"name"`
+	Address string `json:"address"`
+}
+{{- end}}
+{{- if .Payments}}
+
+// Card is this workflow's payment shape. The payments package stores it as
+// opaque JSON — shape it to whatever the checkout asks for.
+type Card struct {
+	Number string `json:"number"`
+	Expiry string `json:"expiry"`
+	CVV    string `json:"cvv"`
 }
 {{- end}}
 {{- if .Durable}}
@@ -49,14 +89,25 @@ type FetchState struct {
 	Body string `json:"body"`
 }
 {{- end}}
-{{- if .Proxy}}
+{{- if or .Proxy .Accounts .Payments .Email}}
 
-// resources holds the per-run side effects: the proxy lease and the client
-// built over it. They are acquired lazily on first use and rebuilt the same
-// way after recovery — never serialized.
+// resources holds the per-run side effects: leases, the client built over the
+// proxy, the inbox subscription. They are acquired lazily on first use and
+// rebuilt the same way after recovery — never serialized.
 type resources struct {
+{{- if .Proxy}}
 	lease  *proxies.Lease
 	client *http.Client
+{{- end}}
+{{- if .Accounts}}
+	accountLease *accounts.Lease
+{{- end}}
+{{- if .Payments}}
+	paymentLease *payments.Lease
+{{- end}}
+{{- if .Email}}
+	inbox email.Subscription
+{{- end}}
 }
 {{- end}}
 
@@ -65,9 +116,20 @@ type resources struct {
 // and the workflow's own state — each in its own zone.
 type Context struct {
 	workflows.Base
-{{- if .Proxy}}
+{{- if or .Proxy .Accounts .Payments .Email}}
 
+{{- if .Proxy}}
 	proxies *proxies.Manager
+{{- end}}
+{{- if .Accounts}}
+	accounts *accounts.Manager
+{{- end}}
+{{- if .Payments}}
+	payments *payments.Manager
+{{- end}}
+{{- if .Email}}
+	email *email.Manager
+{{- end}}
 {{- end}}
 
 	in Input
@@ -76,34 +138,31 @@ type Context struct {
 {{- else}}
 	body string
 {{- end}}
-{{- if .Proxy}}
+{{- if or .Proxy .Accounts .Payments .Email}}
 	res resources
 {{- end}}
-{{- if .Output}}
 
 	result Result
-{{- end}}
 }
 
 // NewContext builds a context for one task; the module binds Base afterward.
 {{- if .Durable}}
 // Persist registers the durable state with the snapshot envelope.
 {{- end}}
-func NewContext(in Input{{if .Proxy}}, manager *proxies.Manager{{end}}) *Context {
-	c := &Context{in: in{{if .Proxy}}, proxies: manager{{end}}}
+func NewContext(in Input{{if .Proxy}}, proxyManager *proxies.Manager{{end}}{{if .Accounts}}, accountManager *accounts.Manager{{end}}{{if .Payments}}, paymentManager *payments.Manager{{end}}{{if .Email}}, emailManager *email.Manager{{end}}) *Context {
+	c := &Context{in: in{{if .Proxy}}, proxies: proxyManager{{end}}{{if .Accounts}}, accounts: accountManager{{end}}{{if .Payments}}, payments: paymentManager{{end}}{{if .Email}}, email: emailManager{{end}}}
 {{- if .Durable}}
 	c.Persist(&c.d)
 {{- end}}
 	return c
 }
-{{if .Output}}
+
 // Output marshals the workflow's result to JSON. The engine reads it only on
 // clean completion; a run that is killed or errors produces none.
 func (c *Context) Output() ([]byte, error) {
 	return json.Marshal(c.result)
 }
-{{end}}
-{{- if .Proxy}}
+{{if .Proxy}}
 // client leases a proxy and builds the HTTP client on first use, so a recovered
 // task acquires its own lease wherever in the graph it resumes.
 func (c *Context) client(ctx context.Context) (*http.Client, error) {
@@ -123,23 +182,135 @@ func (c *Context) client(ctx context.Context) (*http.Client, error) {
 		// task naked instead.
 		return nil, fmt.Errorf("acquire proxy: %w", err)
 	}
-	proxyURL, err := url.Parse(lease.Resource().URL)
+	client, err := common.NewClient(lease.Resource().URL)
 	if err != nil {
 		lease.ReleaseOutcome(ctx, false)
-		return nil, fmt.Errorf("parse proxy url: %w", err)
+		return nil, fmt.Errorf("build client: %w", err)
 	}
 	c.res.lease = lease
-	c.res.client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	c.res.client = client
 	return c.res.client, nil
 }
-
-// Teardown releases the task's proxy lease exactly once when the run exits,
-// reporting the outcome its selection learns from — success being the absence
-// of a run error.
-func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
-	if c.res.lease == nil {
-		return nil
+{{end}}
+{{- if .Accounts}}
+// profile locks a site account on first use and decodes the fields this
+// workflow needs. Locking rather than acquiring is the point: a task that
+// advanced as one identity must come back as the same one, and the lock
+// outlives both the lease and the process.
+func (c *Context) profile(ctx context.Context) (Profile, error) {
+	if c.res.accountLease == nil {
+		placement := c.Assignment(accounts.Kind)
+		if placement.GroupID == "" {
+			return Profile{}, fmt.Errorf("task %s has no account group assigned", c.TaskID())
+		}
+		lease, err := c.accounts.Lock(ctx, accounts.Assignment{
+			TaskID: c.TaskID(), GroupID: placement.GroupID, ResourceID: placement.ResourceID,
+		})
+		if err != nil {
+			return Profile{}, fmt.Errorf("lock account: %w", err)
+		}
+		c.res.accountLease = lease
 	}
-	return c.res.lease.ReleaseOutcome(ctx, runErr == nil)
+	return accounts.Bind[Profile](c.res.accountLease.Resource())
+}
+{{end}}
+{{- if .Payments}}
+// payment leases a payment instrument on first use and decodes the fields
+// this workflow needs. Acquiring (not locking) suffices here: rotation
+// already guarantees no two tasks charge the same instrument at once. Reach
+// for Lock instead if a resumed task must charge the card it started with.
+func (c *Context) payment(ctx context.Context) (Card, error) {
+	if c.res.paymentLease == nil {
+		placement := c.Assignment(payments.Kind)
+		if placement.GroupID == "" {
+			return Card{}, fmt.Errorf("task %s has no payment group assigned", c.TaskID())
+		}
+		lease, err := c.payments.Acquire(ctx, payments.Assignment{
+			TaskID: c.TaskID(), GroupID: placement.GroupID, ResourceID: placement.ResourceID,
+		})
+		if err != nil {
+			return Card{}, fmt.Errorf("acquire payment: %w", err)
+		}
+		c.res.paymentLease = lease
+	}
+	return payments.Bind[Card](c.res.paymentLease.Resource())
+}
+{{end}}
+{{- if .Email}}
+// inbox subscribes to the task's inbox on first use, so a recovered task
+// re-subscribes no matter which state it resumes in. The backfill window
+// since re-reads mail the server still holds, which is what makes a resumed
+// task lossless. Narrow the feed with email.FromSender once you know who the
+// mail comes from.
+func (c *Context) inbox(ctx context.Context, since time.Time) (email.Subscription, error) {
+	if c.res.inbox != nil {
+		return c.res.inbox, nil
+	}
+{{- if .Accounts}}
+	if _, err := c.profile(ctx); err != nil { // the account lock is the route to the inbox
+		return nil, err
+	}
+	lease := c.res.accountLease
+	id := accounts.ForwardingEmail(lease.Resource(), lease.Group())
+	if id == "" {
+		return nil, fmt.Errorf("account %s has no forwarding inbox attached", lease.Resource().ID)
+	}
+{{- else}}
+	id := c.in.EmailID
+	if id == "" {
+		return nil, fmt.Errorf("task %s names no inbox: set Input.EmailID", c.TaskID())
+	}
+{{- end}}
+	sub, err := c.email.Listen(ctx, c.TaskID(), id, email.WithBackfill(since))
+	if err != nil {
+		return nil, fmt.Errorf("listen to inbox %s: %w", id, err)
+	}
+	c.res.inbox = sub
+	return sub, nil
+}
+{{end}}
+{{- if or .Proxy .Accounts .Payments .Email}}
+// Teardown releases the task's per-run resources exactly once when the run
+// exits{{if .Proxy}}, the proxy's with the outcome its selection learns from — success
+// being the absence of a run error{{end}}.{{if .Accounts}} The account's durable lock survives on
+// purpose: it is the task's identity, and only deleting the task gives it
+// back.{{end}}
+func (c *Context) Teardown(ctx context.Context, status workflows.Status, runErr error) error {
+{{- if or .Proxy .Email}}
+	var released []error
+{{- if .Email}}
+	if c.res.inbox != nil {
+		released = append(released, c.res.inbox.Close())
+	}
+{{- end}}
+{{- if .Proxy}}
+	if c.res.lease != nil {
+		released = append(released, c.res.lease.ReleaseOutcome(ctx, runErr == nil))
+	}
+{{- end}}
+{{- if .Payments}}
+	if c.res.paymentLease != nil {
+		c.res.paymentLease.Release()
+	}
+{{- end}}
+{{- if .Accounts}}
+	if c.res.accountLease != nil {
+		c.res.accountLease.Release()
+	}
+{{- end}}
+	return errors.Join(released...)
+{{- else}}
+{{- if .Payments}}
+	if c.res.paymentLease != nil {
+		c.res.paymentLease.Release()
+	}
+{{- end}}
+{{- if .Accounts}}
+	if c.res.accountLease != nil {
+		c.res.accountLease.Release()
+	}
+{{- end}}
+	return nil
+{{- end}}
 }
 {{end}}
