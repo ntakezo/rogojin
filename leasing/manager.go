@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ntakezo/rogojin/comms"
 )
 
 // An Option configures a Manager at construction.
@@ -19,23 +21,60 @@ func WithStrategy[R any, P Leasable[R]](name string, factory StrategyFactory[R])
 	return func(m *Manager[R, P]) { m.factories[name] = factory }
 }
 
+// WithNotifier sets the Notifier acquires park on while they wait for
+// capacity (default: the in-process comms.NewNotifier). A distributed
+// deployment installs a shared one so a release on one node wakes acquirers
+// on another; even without one, waiters re-check on the lease TTL's cadence,
+// since expiry frees capacity in the store no matter who is watching.
+func WithNotifier[R any, P Leasable[R]](n comms.Notifier) Option[R, P] {
+	if n == nil {
+		panic("leasing: WithNotifier requires a notifier")
+	}
+	return func(m *Manager[R, P]) { m.notifier = n }
+}
+
+// WithTopic names the notifier topic this manager's waiters park on. Every
+// node of a distributed deployment must name the same topic for the same
+// kind — the resource packages pass their Kind — while the default is a
+// per-manager string, correct for a process-local notifier.
+func WithTopic[R any, P Leasable[R]](topic string) Option[R, P] {
+	if topic == "" {
+		panic("leasing: WithTopic requires a topic")
+	}
+	return func(m *Manager[R, P]) { m.topic = topic }
+}
+
+// WithLeaseTTL sets how long a hold lives between heartbeat renewals
+// (default 30s). Shorter reclaims a crashed holder's capacity sooner but
+// tightens the renewal deadline a healthy holder must keep meeting.
+func WithLeaseTTL[R any, P Leasable[R]](d time.Duration) Option[R, P] {
+	if d <= 0 {
+		panic("leasing: WithLeaseTTL requires a positive duration")
+	}
+	return func(m *Manager[R, P]) { m.ttl = d }
+}
+
 // A Manager allocates records of one model to tasks: locked resources go only
 // to their owner, unlocked ones rotate within their group through the group's
-// selection strategy under the resource's holder cap. It owns all live lease
-// state; the Repository only stores bytes. R is the model, a struct embedding
-// Resource; P is its pointer, inferred everywhere but a type alias. A Manager
-// is safe for concurrent use.
+// selection strategy under the resource's holder cap. The Repository is the
+// authority on capacity, locks, and versions — what a Manager holds are
+// caches of it, refreshed when an acquirer runs out of candidates — so
+// several managers over one store agree by construction. R is the model, a
+// struct embedding Resource; P is its pointer, inferred everywhere but a type
+// alias. A Manager is safe for concurrent use.
 type Manager[R any, P Leasable[R]] struct {
 	repo      Repository[R]
 	factories map[string]StrategyFactory[R]
+	notifier  comms.Notifier
+	topic     string
+	ttl       time.Duration
 
 	mu         sync.Mutex
-	cond       *sync.Cond
 	groups     map[string]Group
 	strategies map[string]Selection[R] // one instance per group, keyed by group ID
 	pool       map[string]R
 	order      []string                  // stable candidate order for selection
-	holders    map[string]map[string]int // resource ID -> holding task ID -> live lease count
+	holders    map[string]map[string]int // resource ID -> holding task ID -> live lease count, this process's leases only
 	bindings   map[string]string         // taskID -> locked resource ID
 }
 
@@ -64,6 +103,7 @@ func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], o
 		factories: map[string]StrategyFactory[R]{
 			StrategyRoundRobin: func() Selection[R] { return NewRoundRobin[R]() },
 		},
+		ttl:        30 * time.Second,
 		groups:     make(map[string]Group),
 		strategies: make(map[string]Selection[R]),
 		pool:       make(map[string]R),
@@ -73,7 +113,12 @@ func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], o
 	for _, opt := range opts {
 		opt(m)
 	}
-	m.cond = sync.NewCond(&m.mu)
+	if m.notifier == nil {
+		m.notifier = comms.NewNotifier()
+	}
+	if m.topic == "" {
+		m.topic = fmt.Sprintf("lease/%p", m)
+	}
 
 	// A task the store shows locked to several resources — two nodes' blind
 	// writes of an earlier era, or a crash between a release and its retry —
@@ -352,7 +397,7 @@ func (m *Manager[R, P]) DeleteGroup(ctx context.Context, id string) (unbound []s
 	}
 	delete(m.groups, id)
 	delete(m.strategies, id)
-	m.cond.Broadcast()
+	m.notifier.Notify(m.topic)
 	sort.Strings(unbound)
 	return unbound, nil
 }
@@ -407,7 +452,7 @@ func (m *Manager[R, P]) Add(ctx context.Context, p R) error {
 	c.Version = version
 	m.pool[c.ID] = p
 	m.order = append(m.order, c.ID)
-	m.cond.Broadcast()
+	m.notifier.Notify(m.topic)
 	return nil
 }
 
@@ -460,10 +505,13 @@ func (m *Manager[R, P]) Lock(ctx context.Context, a Assignment) (*Lease[R, P], e
 	return m.acquire(ctx, a, true)
 }
 
-// acquire is the shared blocking loop behind Acquire and Lock. A bound task
-// only ever leases its own resource, one lease at a time; an unbound task takes
-// its pin, or rotates the group's unlocked members, durably binding the pick
-// first when lock is set.
+// acquire is the shared blocking loop behind Acquire and Lock. Each pass
+// asks the store for the actual grant, so several managers over one file
+// agree; a pass that finds no candidate refreshes the caches from the store
+// — a resource added or unlocked on another node becomes visible exactly
+// when a waiter runs dry — and only then parks on the notifier. The park is
+// bounded by a fraction of the lease TTL, because expiry frees capacity in
+// the store whether or not anyone sends a wakeup.
 func (m *Manager[R, P]) acquire(ctx context.Context, a Assignment, lock bool) (*Lease[R, P], error) {
 	if a.TaskID == "" {
 		return nil, errors.New("assignment task id is required")
@@ -472,84 +520,180 @@ func (m *Manager[R, P]) acquire(ctx context.Context, a Assignment, lock bool) (*
 		a.GroupID = GlobalGroup
 	}
 
-	// cond.Wait cannot watch ctx, so a watcher wakes the loop on cancellation.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			m.mu.Lock()
-			m.cond.Broadcast()
-			m.mu.Unlock()
-		case <-stop:
-		}
-	}()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	refreshed := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-
-		// Checked every pass, not once: the pin can be deleted while the loop
-		// waits, and a task must not park forever on a resource that is gone.
-		if err := m.checkPin(a); err != nil {
+		lease, err := m.tryAcquire(ctx, a, lock)
+		if lease != nil {
+			return lease, nil
+		}
+		// A configuration miss — unknown group, empty group, broken pin — is
+		// reported only after a refresh has had a chance to see it created or
+		// repaired on another node; anything else fails as-is.
+		if err != nil && (refreshed || !configErr(err)) {
 			return nil, err
 		}
-
-		id, bound := m.bindings[a.TaskID]
-		if _, live := m.pool[id]; bound && !live {
-			// the bound resource is gone; rotate rather than lease a phantom.
-			delete(m.bindings, a.TaskID)
-			bound = false
-		}
-		if bound {
-			// A pin is deliberate and outranks a stale lock, but a lease must not
-			// make the durable write that resolves it; the deleter of the lock has
-			// to be the reassignment that created the disagreement.
-			if a.ResourceID != "" && a.ResourceID != id {
-				return nil, fmt.Errorf("%w: task %s is locked to %s but pinned to %s; reassign the task to release the lock", ErrPinConflict, a.TaskID, id, a.ResourceID)
-			}
-			// a locked resource is exclusive to its owner: one lease at a time.
-			if m.heldCount(id) == 0 {
-				m.hold(id, a.TaskID)
-				return m.lease(m.pool[id], a.TaskID), nil
-			}
-		} else {
-			g, ok := m.groups[a.GroupID]
-			if !ok {
-				return nil, fmt.Errorf("acquire from group %s: %w", a.GroupID, ErrGroupNotFound)
-			}
-			if !m.groupHasResources(g.ID) {
-				return nil, fmt.Errorf("group %s: %w", g.ID, ErrNoResources)
-			}
-			// A lock takes only an idle resource; if none is free right now the
-			// loop waits, since a release or unlock can still produce one.
-			p, found, err := m.selectUnlocked(a, lock)
-			if err != nil {
+		if !refreshed {
+			if err := m.refresh(ctx); err != nil {
 				return nil, err
 			}
-			if found {
-				c := m.core(&p)
-				if lock {
-					c.OwnerID = a.TaskID
-					c.UpdatedAt = time.Now().UTC()
-					version, err := m.repo.Save(ctx, p)
-					if err != nil {
-						return nil, fmt.Errorf("persist lock: %w", err)
-					}
-					c.Version = version
-					m.pool[c.ID] = p
-					m.bindings[a.TaskID] = c.ID
-				}
-				m.hold(c.ID, a.TaskID)
-				return m.lease(p, a.TaskID), nil
+			refreshed = true
+			continue
+		}
+		if err := m.notifier.Wait(ctx, m.topic, m.ttl/3); err != nil {
+			return nil, err
+		}
+		refreshed = false
+	}
+}
+
+// configErr reports whether err describes the assignment rather than the
+// moment: the kind of miss a stale cache can manufacture and a refresh can
+// clear.
+func configErr(err error) bool {
+	return errors.Is(err, ErrGroupNotFound) || errors.Is(err, ErrNoResources) ||
+		errors.Is(err, ErrResourceNotFound) || errors.Is(err, ErrResourceNotInGroup) ||
+		errors.Is(err, ErrResourceLocked) || errors.Is(err, ErrPinConflict)
+}
+
+// refresh reloads every cache from the store, releasing any duplicate locks
+// the reload surfaces; convergence is left to the next refresh.
+func (m *Manager[R, P]) refresh(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	repairs, err := m.load(ctx)
+	if err != nil {
+		return fmt.Errorf("refresh pool: %w", err)
+	}
+	for _, r := range repairs {
+		if err := m.repo.ReleaseLock(ctx, r.resourceID, r.taskID); err != nil {
+			return fmt.Errorf("release duplicate lock on %s: %w", r.resourceID, err)
+		}
+	}
+	return nil
+}
+
+// tryAcquire makes one pass under the lock: candidates come from the caches,
+// the grant comes from the store. A nil, nil return is a miss — nothing
+// acquirable right now — which the blocking loop turns into a refresh or a
+// wait.
+func (m *Manager[R, P]) tryAcquire(ctx context.Context, a Assignment, lock bool) (*Lease[R, P], error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Checked every pass, not once: the pin can be deleted while the loop
+	// waits, and a task must not park forever on a resource that is gone.
+	if err := m.checkPin(a); err != nil {
+		return nil, err
+	}
+
+	id, bound := m.bindings[a.TaskID]
+	if _, live := m.pool[id]; bound && !live {
+		// the bound resource is gone; rotate rather than lease a phantom.
+		delete(m.bindings, a.TaskID)
+		bound = false
+	}
+	if bound {
+		// A pin is deliberate and outranks a stale lock, but a lease must not
+		// make the durable write that resolves it; the deleter of the lock has
+		// to be the reassignment that created the disagreement.
+		if a.ResourceID != "" && a.ResourceID != id {
+			return nil, fmt.Errorf("%w: task %s is locked to %s but pinned to %s; reassign the task to release the lock", ErrPinConflict, a.TaskID, id, a.ResourceID)
+		}
+		// A locked resource is exclusive to its owner — cap 1 at the store —
+		// and the store also rejects a lock the cache has not caught up to.
+		switch h, err := m.repo.Acquire(ctx, id, a.TaskID, 1, m.ttl); {
+		case err == nil:
+			_ = h
+			m.hold(id, a.TaskID)
+			return m.lease(m.pool[id], a.TaskID), nil
+		case errors.Is(err, ErrCapacity), errors.Is(err, ErrLockHeld):
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("acquire %s: %w", id, err)
+		}
+	}
+
+	g, ok := m.groups[a.GroupID]
+	if !ok {
+		return nil, fmt.Errorf("acquire from group %s: %w", a.GroupID, ErrGroupNotFound)
+	}
+	if !m.groupHasResources(g.ID) {
+		return nil, fmt.Errorf("group %s: %w", g.ID, ErrNoResources)
+	}
+
+	// The cache-filtered candidates are an optimistic guess; each pick is
+	// proven against the store, and a refusal there — someone else's lock or
+	// capacity the cache had not seen — just drops the candidate and rotates
+	// to the next.
+	remaining, err := m.eligible(a, lock)
+	if err != nil {
+		return nil, err
+	}
+	for len(remaining) > 0 {
+		p, err := m.pick(ctx, a, remaining)
+		if err != nil {
+			return nil, err
+		}
+		c := m.core(&p)
+		if lock {
+			switch err := m.repo.ClaimLock(ctx, c.ID, a.TaskID); {
+			case err == nil:
+			case errors.Is(err, ErrLockHeld):
+				remaining = dropCandidate[R, P](remaining, c.ID)
+				continue
+			default:
+				return nil, fmt.Errorf("persist lock: %w", err)
 			}
 		}
-
-		m.cond.Wait()
+		cap := effectiveCap(c)
+		if cap == UnlimitedHolders {
+			cap = 0
+		}
+		if lock {
+			cap = 1
+		}
+		switch _, err := m.repo.Acquire(ctx, c.ID, a.TaskID, cap, m.ttl); {
+		case err == nil:
+			if lock {
+				// ClaimLock bumped the stored version by one; the cache
+				// tracks it so the next conditional Save still matches.
+				c.OwnerID = a.TaskID
+				c.Version++
+				c.UpdatedAt = time.Now().UTC()
+				m.pool[c.ID] = p
+				m.bindings[a.TaskID] = c.ID
+			}
+			m.hold(c.ID, a.TaskID)
+			return m.lease(p, a.TaskID), nil
+		case errors.Is(err, ErrCapacity), errors.Is(err, ErrLockHeld):
+			if lock {
+				// The lock landed but the lease did not — someone still holds
+				// a lease the idle filter missed. Undo the lock: a binding
+				// without its lease would park every later pass behind it.
+				if err := m.repo.ReleaseLock(ctx, c.ID, a.TaskID); err != nil {
+					return nil, fmt.Errorf("undo lock on %s: %w", c.ID, err)
+				}
+			}
+			remaining = dropCandidate[R, P](remaining, c.ID)
+		default:
+			return nil, fmt.Errorf("acquire %s: %w", c.ID, err)
+		}
 	}
+	return nil, nil
+}
+
+// dropCandidate removes the resource from the candidate slice, preserving
+// order for the strategies that depend on it.
+func dropCandidate[R any, P Leasable[R]](candidates []R, id string) []R {
+	for i := range candidates {
+		if P(&candidates[i]).core().ID == id {
+			return append(candidates[:i], candidates[i+1:]...)
+		}
+	}
+	return candidates
 }
 
 // lease wraps p, as of now, in the Lease handed to taskID, carrying the group
@@ -780,16 +924,16 @@ func (m *Manager[R, P]) holderIDs(resourceID string) []string {
 	return ids
 }
 
-// selectUnlocked picks an unlocked, under-capacity resource from the
-// assignment's group via that group's strategy instance, or the pinned resource
-// alone when a names one; found is false when there are no candidates.
-// requireIdle narrows the field to resources nobody is holding, for the callers
-// that are about to bind one: a lock must not land on a resource another task is
-// already leasing, or the owner would queue behind a stranger on its own.
+// eligible collects the assignment's acquirable candidates from the caches:
+// group members, unlocked as far as this process knows, under their cap as
+// far as this process's own leases say. requireIdle narrows the field to
+// resources nobody here is holding, for the callers about to bind one: a
+// lock must not land on a resource another task is already leasing, or the
+// owner would queue behind a stranger on its own. The store re-checks every
+// pick, so a stale answer here costs a round trip, never correctness.
 // Callers hold m.mu.
-func (m *Manager[R, P]) selectUnlocked(a Assignment, requireIdle bool) (R, bool, error) {
+func (m *Manager[R, P]) eligible(a Assignment, requireIdle bool) ([]R, error) {
 	candidates := make([]R, 0, len(m.order))
-	eligible := make(map[string]R, len(m.order))
 	for _, id := range m.order {
 		p := m.pool[id]
 		c := m.core(&p)
@@ -805,32 +949,32 @@ func (m *Manager[R, P]) selectUnlocked(a Assignment, requireIdle bool) (R, bool,
 		}
 		if cap := effectiveCap(c); cap == UnlimitedHolders || held < cap {
 			candidates = append(candidates, p)
-			eligible[c.ID] = p
 		}
 	}
-	if len(candidates) == 0 {
-		return zero[R](), false, nil
-	}
-	// A pin leaves exactly one candidate. Running it through the group's
-	// strategy anyway would advance shared rotation state for a choice nobody
-	// made, skewing what the group's other tasks get next.
-	if a.ResourceID != "" {
-		return candidates[0], true, nil
-	}
+	return candidates, nil
+}
 
+// pick chooses one candidate: the pin alone when a names one — running it
+// through the group's strategy would advance shared rotation state for a
+// choice nobody made — otherwise the group's strategy instance, validated
+// against the candidates so a strategy returning some other pooled resource
+// cannot hand out one already at capacity. Callers hold m.mu.
+func (m *Manager[R, P]) pick(ctx context.Context, a Assignment, candidates []R) (R, error) {
+	if a.ResourceID != "" {
+		return candidates[0], nil
+	}
 	picked, err := m.strategies[a.GroupID].Select(candidates)
 	if err != nil {
-		return zero[R](), false, fmt.Errorf("selection: %w", err)
+		return zero[R](), fmt.Errorf("selection: %w", err)
 	}
-	// Validated against the candidates, not the pool: a strategy returning some
-	// other pooled resource would hand out one already at capacity, or let a lock
-	// overwrite another task's binding.
 	pickedID := m.core(&picked).ID
-	live, ok := eligible[pickedID]
-	if !ok {
-		return zero[R](), false, fmt.Errorf("selection returned resource %s, which was not a candidate", pickedID)
+	for _, p := range candidates {
+		live := p
+		if m.core(&live).ID == pickedID {
+			return live, nil
+		}
 	}
-	return live, true, nil
+	return zero[R](), fmt.Errorf("selection returned resource %s, which was not a candidate", pickedID)
 }
 
 // zero is the empty record returned alongside an error or a miss.
@@ -893,22 +1037,20 @@ func fits(a Assignment, c *Resource) bool {
 // waking waiters. A binding whose resource is already gone is simply dropped.
 // Callers hold m.mu.
 func (m *Manager[R, P]) unlock(ctx context.Context, taskID, resourceID string) error {
-	p, live := m.pool[resourceID]
-	if !live {
-		delete(m.bindings, taskID)
-		return nil
-	}
-	c := m.core(&p)
-	c.OwnerID = ""
-	c.UpdatedAt = time.Now().UTC()
-	version, err := m.repo.Save(ctx, p)
-	if err != nil {
+	if err := m.repo.ReleaseLock(ctx, resourceID, taskID); err != nil {
 		return fmt.Errorf("persist unlock: %w", err)
 	}
-	c.Version = version
-	m.pool[resourceID] = p
+	if p, live := m.pool[resourceID]; live {
+		// ReleaseLock bumped the stored version by one; the cache tracks it
+		// so the next conditional Save still matches.
+		c := m.core(&p)
+		c.OwnerID = ""
+		c.Version++
+		c.UpdatedAt = time.Now().UTC()
+		m.pool[resourceID] = p
+	}
 	delete(m.bindings, taskID)
-	m.cond.Broadcast()
+	m.notifier.Notify(m.topic)
 	return nil
 }
 
@@ -970,7 +1112,7 @@ func (m *Manager[R, P]) remove(ctx context.Context, id string) error {
 			break
 		}
 	}
-	m.cond.Broadcast()
+	m.notifier.Notify(m.topic)
 	return nil
 }
 
@@ -1000,12 +1142,16 @@ func (l *Lease[R, P]) Release() {
 	l.once.Do(func() { l.manager.release(l.manager.core(&l.resource).ID, l.taskID) })
 }
 
-// release frees the holder slot and wakes waiters. Nothing about the record
-// changed, so nothing is written.
+// release frees the holder slot durably, then locally, then wakes waiters.
+// The store write is best-effort on a background context: Release carries no
+// ctx and no error path by design, and a hold the release could not clear
+// drains at its TTL — expiry is the backstop that makes swallowing the
+// failure safe.
 func (m *Manager[R, P]) release(id, taskID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	_ = m.repo.ReleaseHold(context.Background(), id, taskID)
 	m.unhold(id, taskID)
-	m.cond.Broadcast()
+	m.notifier.Notify(m.topic)
 }
