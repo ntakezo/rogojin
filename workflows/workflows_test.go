@@ -22,12 +22,38 @@ func (s *checkpointSpy) fn(ctx context.Context) error {
 	return s.err
 }
 
+// recorderSpy is a Deps.RecordEffect that mimics the store: the first write
+// per key wins, later calls read it back. err, when set, fails the record the
+// way a store outage would.
+type recorderSpy struct {
+	stored map[string][]byte
+	calls  int
+	err    error
+}
+
+func (s *recorderSpy) fn(ctx context.Context, key string, result []byte) ([]byte, bool, error) {
+	s.calls++
+	if s.err != nil {
+		return nil, false, s.err
+	}
+	if v, ok := s.stored[key]; ok {
+		return v, false, nil
+	}
+	if s.stored == nil {
+		s.stored = make(map[string][]byte)
+	}
+	s.stored[key] = append([]byte(nil), result...)
+	return result, true, nil
+}
+
 // TestDoRunsEffectOncePersistsResult verifies the happy path: the effect runs,
-// its result lands in the effect log before the checkpoint fires, and a second
-// call returns the recorded result without re-running the effect.
+// its result is recorded durably the moment it lands — with no checkpoint
+// involved — and a second call returns the recorded result without re-running
+// the effect or touching the store again.
 func TestDoRunsEffectOncePersistsResult(t *testing.T) {
 	spy := &checkpointSpy{}
-	b := NewBase(Deps{Checkpoint: spy.fn})
+	rec := &recorderSpy{}
+	b := NewBase(Deps{Checkpoint: spy.fn, RecordEffect: rec.fn})
 	effects := 0
 	run := func() (string, error) {
 		return Do(context.Background(), &b, "mint", func(ctx context.Context) (string, error) {
@@ -40,16 +66,47 @@ func TestDoRunsEffectOncePersistsResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	if got != "cookie-1" || effects != 1 || spy.calls != 1 {
-		t.Fatalf("got=%q effects=%d checkpoints=%d, want cookie-1/1/1", got, effects, spy.calls)
+	if got != "cookie-1" || effects != 1 || rec.calls != 1 {
+		t.Fatalf("got=%q effects=%d records=%d, want cookie-1/1/1", got, effects, rec.calls)
+	}
+	if spy.calls != 0 {
+		t.Fatalf("checkpoints = %d, want 0 — effect durability must not ride on a checkpoint", spy.calls)
 	}
 
 	got, err = run()
 	if err != nil {
 		t.Fatalf("Do replay: %v", err)
 	}
-	if got != "cookie-1" || effects != 1 || spy.calls != 1 {
-		t.Fatalf("replay got=%q effects=%d checkpoints=%d, want cached cookie-1 with no new effect or checkpoint", got, effects, spy.calls)
+	if got != "cookie-1" || effects != 1 || rec.calls != 1 {
+		t.Fatalf("replay got=%q effects=%d records=%d, want cached cookie-1 with no new effect or record", got, effects, rec.calls)
+	}
+}
+
+// TestDoDiscardsLoserOfARecordRace verifies the at-most-once contract under a
+// racing duplicate run: when the store already holds another run's result for
+// the key, Do discards the local result and returns the recorded one, because
+// whatever built on the recorded result elsewhere must not be contradicted.
+func TestDoDiscardsLoserOfARecordRace(t *testing.T) {
+	rec := &recorderSpy{stored: map[string][]byte{"mint": []byte(`"cookie-theirs"`)}}
+	b := NewBase(Deps{RecordEffect: rec.fn})
+
+	got, err := Do(context.Background(), &b, "mint", func(ctx context.Context) (string, error) {
+		return "cookie-ours", nil
+	})
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if got != "cookie-theirs" {
+		t.Fatalf("got %q, want the recorded cookie-theirs", got)
+	}
+
+	// The replay serves the recorded result from the cache.
+	got, err = Do(context.Background(), &b, "mint", func(ctx context.Context) (string, error) {
+		t.Fatal("effect re-ran")
+		return "", nil
+	})
+	if err != nil || got != "cookie-theirs" {
+		t.Fatalf("replay got %q, %v; want cookie-theirs, nil", got, err)
 	}
 }
 
@@ -85,13 +142,14 @@ func TestDoFailedEffectRecordsNothing(t *testing.T) {
 	}
 }
 
-// TestDoCheckpointErrorSurfacedRecordStays verifies a checkpoint failure is
-// returned but the in-memory record stays: the effect did happen, so an
-// in-process retry must not repeat it.
-func TestDoCheckpointErrorSurfacedRecordStays(t *testing.T) {
+// TestDoRecordErrorSurfacedCacheStays verifies a record failure is returned
+// but the in-memory cache stays: the effect did happen, so a retry must not
+// repeat it — yet Do keeps failing until the record lands, because a state
+// must not report success while its effect's durability is still owed.
+func TestDoRecordErrorSurfacedCacheStays(t *testing.T) {
 	fail := errors.New("store down")
-	spy := &checkpointSpy{err: fail}
-	b := NewBase(Deps{Checkpoint: spy.fn})
+	rec := &recorderSpy{err: fail}
+	b := NewBase(Deps{RecordEffect: rec.fn})
 	effects := 0
 	run := func() (string, error) {
 		return Do(context.Background(), &b, "submit", func(ctx context.Context) (string, error) {
@@ -101,12 +159,24 @@ func TestDoCheckpointErrorSurfacedRecordStays(t *testing.T) {
 	}
 
 	if _, err := run(); !errors.Is(err, fail) {
-		t.Fatalf("Do err = %v, want the checkpoint failure", err)
+		t.Fatalf("Do err = %v, want the record failure", err)
 	}
-	spy.err = nil
+	// The store is still down: the retry skips the effect but fails again.
+	if _, err := run(); !errors.Is(err, fail) {
+		t.Fatalf("retry err = %v, want the record failure again", err)
+	}
+	if effects != 1 {
+		t.Fatalf("effects = %d, want 1 — the cache must skip the effect", effects)
+	}
+
+	// The store recovers: the retry lands the record and succeeds.
+	rec.err = nil
 	got, err := run()
 	if err != nil || got != "order-1" {
 		t.Fatalf("replay got %q, %v; want the recorded order-1, nil", got, err)
+	}
+	if _, ok := rec.stored["submit"]; !ok {
+		t.Fatal("record never landed after the store recovered")
 	}
 	if effects != 1 {
 		t.Fatalf("effects = %d, want 1", effects)
@@ -130,14 +200,18 @@ func TestOnceNilCheckpointTolerated(t *testing.T) {
 	}
 }
 
-// TestSnapshotRoundTrip verifies the envelope carries input, effect log, and
-// registered durable state through Snapshot and back through restore.
+// TestSnapshotRoundTrip verifies the envelope carries input and registered
+// durable state through Snapshot and back through restore, while the effect
+// log rides the store: the snapshot no longer embeds it, and the seed the
+// framework passes through Deps.Effects is what makes a rebuilt instance skip
+// a recorded effect.
 func TestSnapshotRoundTrip(t *testing.T) {
 	type durable struct {
 		Cookie string `json:"cookie"`
 	}
+	rec := &recorderSpy{}
 	b := NewBase(Deps{})
-	b.bind(Deps{}, json.RawMessage(`{"url":"https://example.com"}`))
+	b.bind(Deps{RecordEffect: rec.fn}, json.RawMessage(`{"url":"https://example.com"}`))
 	d := durable{Cookie: "queue-1"}
 	b.Persist(&d)
 	if err := b.Once(context.Background(), "emit", func(ctx context.Context) error { return nil }); err != nil {
@@ -153,7 +227,11 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(blob, &env); err != nil {
 		t.Fatalf("decode envelope: %v", err)
 	}
+	if env.Effects != nil {
+		t.Fatal("snapshot embeds the effect log; it lives in the store now")
+	}
 	restored := NewBase(Deps{})
+	restored.bind(Deps{Effects: rec.stored}, env.Input)
 	var d2 durable
 	restored.Persist(&d2)
 	if err := restored.restore(env); err != nil {
@@ -168,6 +246,54 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if effects != 0 {
 		t.Fatal("restored effect log did not skip a recorded effect")
+	}
+}
+
+// TestRestoreMigratesLegacyEffects verifies a snapshot from the envelope era
+// still protects its effects: restore folds them into the cache and writes
+// them through to the store eagerly, because the next checkpoint no longer
+// carries them — left unmigrated, a crash after it would re-fire the effect.
+func TestRestoreMigratesLegacyEffects(t *testing.T) {
+	rec := &recorderSpy{}
+	b := NewBase(Deps{})
+	b.bind(Deps{RecordEffect: rec.fn}, nil)
+	env := envelope{Effects: map[string]json.RawMessage{"emit": json.RawMessage(`{}`)}}
+	if err := b.restore(env); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if _, ok := rec.stored["emit"]; !ok {
+		t.Fatal("legacy effect was not written through to the store")
+	}
+	effects := 0
+	if err := b.Once(context.Background(), "emit", func(ctx context.Context) error { effects++; return nil }); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if effects != 0 {
+		t.Fatal("legacy effect log did not skip the recorded effect")
+	}
+
+	// A store-seeded record for the same key outranks the envelope copy.
+	seeded := NewBase(Deps{})
+	seeded.bind(Deps{Effects: map[string][]byte{"emit": []byte(`{"v":"store"}`)}, RecordEffect: rec.fn}, nil)
+	migrations := rec.calls
+	if err := seeded.restore(env); err != nil {
+		t.Fatalf("restore with seed: %v", err)
+	}
+	if rec.calls != migrations {
+		t.Fatal("a store-seeded key was re-migrated from the envelope")
+	}
+
+	// With no store wired the envelope copy still serves the cache.
+	bare := NewBase(Deps{})
+	if err := bare.restore(env); err != nil {
+		t.Fatalf("restore without store: %v", err)
+	}
+	effects = 0
+	if err := bare.Once(context.Background(), "emit", func(ctx context.Context) error { effects++; return nil }); err != nil {
+		t.Fatalf("Once without store: %v", err)
+	}
+	if effects != 0 {
+		t.Fatal("storeless legacy restore did not skip the recorded effect")
 	}
 }
 
@@ -367,10 +493,13 @@ func TestModuleBindsDeps(t *testing.T) {
 }
 
 // TestModuleRestoreRoundTrip verifies a snapshot rebuilds the instance with
-// its input, durable state, and effect log intact.
+// its input and durable state intact, and that the store's effect log —
+// carried in through Deps.Effects — makes the rebuilt instance skip a
+// recorded effect.
 func TestModuleRestoreRoundTrip(t *testing.T) {
 	m := testModule()
-	inst, err := m.NewInstance(testInput{URL: "https://example.com"}, Deps{TaskID: "task-1"})
+	rec := &recorderSpy{}
+	inst, err := m.NewInstance(testInput{URL: "https://example.com"}, Deps{TaskID: "task-1", RecordEffect: rec.fn})
 	if err != nil {
 		t.Fatalf("NewInstance: %v", err)
 	}
@@ -384,7 +513,7 @@ func TestModuleRestoreRoundTrip(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
-	restored, err := m.RestoreInstance(Deps{TaskID: "task-1"}, blob)
+	restored, err := m.RestoreInstance(Deps{TaskID: "task-1", Effects: rec.stored}, blob)
 	if err != nil {
 		t.Fatalf("RestoreInstance: %v", err)
 	}

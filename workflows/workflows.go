@@ -170,14 +170,24 @@ type Deps struct {
 	Assignments map[leasing.Kind]Assignment
 	// Checkpoint persists the instance's snapshot durably, stamped at the
 	// state currently executing, so progress made inside a handler survives a
-	// crash. Do and Base.Once call it for you the moment an effect's success
-	// lands in the effect log: recovery re-enters the state, reads the log
-	// from the snapshot, and skips the effect instead of duplicating it. An
-	// error after the call retries the state without repeating the recorded
-	// effect. It is a no-op returning nil when the instance cannot snapshot
+	// crash. It is a no-op returning nil when the instance cannot snapshot
 	// or no repository is wired, and refuses when no state is executing. The
 	// framework fills it; a Deps built by hand carries nil.
 	Checkpoint func(ctx context.Context) error
+	// RecordEffect stores an effect's marshaled result durably under key, at
+	// most once per key for the life of the task, returning the recorded
+	// bytes and whether this call recorded them — a later caller gets the
+	// first record back, whatever it brought. Do and Base.Once call it the
+	// moment an effect's success lands, which is what makes the effect log
+	// durable independent of any checkpoint. The framework fills it; a Deps
+	// built by hand carries nil, and the effect log then lives in memory
+	// only.
+	RecordEffect func(ctx context.Context, key string, result []byte) (stored []byte, first bool, err error)
+	// Effects seeds the instance's effect cache with the task's durably
+	// recorded effects on recovery; Base.bind copies it in once at
+	// construction. The framework fills it from the store; a Deps built by
+	// hand carries nil.
+	Effects map[string][]byte
 }
 
 // An Assignment is a task's resolved placement for one resource kind: the

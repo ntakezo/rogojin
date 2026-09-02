@@ -41,9 +41,16 @@ type engine struct {
 
 func newEngine(workflow workflows.Workflow, deps workflows.Deps, repo Repository) *engine {
 	e := &engine{workflow: workflow, repo: repo}
-	// The instance's mid-state checkpoint rides in on Deps, so a handler can
-	// make an effect's success durable the moment it lands.
+	// The instance's mid-state checkpoint and effect recorder ride in on
+	// Deps, so a handler can make progress and effects durable the moment
+	// they land.
 	deps.Checkpoint = e.midCheckpoint
+	if repo != nil {
+		taskID := deps.TaskID
+		deps.RecordEffect = func(ctx context.Context, key string, result []byte) ([]byte, bool, error) {
+			return repo.RecordEffect(ctx, taskID, key, result)
+		}
+	}
 	e.deps = deps
 	e.cond = sync.NewCond(&e.mu)
 	return e
@@ -67,6 +74,16 @@ func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows
 	pw, ok := e.workflow.(workflows.PersistableWorkflow)
 	if !ok {
 		return fmt.Errorf("workflow %s is not persistable", e.workflow.ID())
+	}
+	// The store's effect log rides in on Deps so the rebuilt instance skips
+	// recorded effects — including ones a checkpoint never saw, recorded in
+	// the crash window between an effect and the next snapshot.
+	if e.repo != nil {
+		effects, err := e.repo.ListEffects(ctx, e.deps.TaskID)
+		if err != nil {
+			return fmt.Errorf("list effects: %w", err)
+		}
+		e.deps.Effects = effects
 	}
 	instance, err := pw.RestoreInstance(e.deps, snapshot)
 	if err != nil {

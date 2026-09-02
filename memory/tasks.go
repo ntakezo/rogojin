@@ -19,13 +19,19 @@ type Tasks struct {
 	records map[string]tasks.Task
 	order   []string
 	groups  map[string]tasks.Group
+	// effects is the durable effect log, task id -> effect key -> result.
+	effects map[string]map[string][]byte
 }
 
 var _ tasks.Repository = (*Tasks)(nil)
 
 // NewTasks builds an empty in-memory tasks store.
 func NewTasks() tasks.Repository {
-	return &Tasks{records: make(map[string]tasks.Task), groups: make(map[string]tasks.Group)}
+	return &Tasks{
+		records: make(map[string]tasks.Task),
+		groups:  make(map[string]tasks.Group),
+		effects: make(map[string]map[string][]byte),
+	}
 }
 
 // CreateTask inserts a fresh task record: workflow, placement, and
@@ -243,10 +249,39 @@ func (s *Tasks) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
 	return records, nil
 }
 
-// DeleteTask removes the task's record; absent ids are a no-op.
+// RecordEffect stores result under (taskID, key) if no record exists, and
+// returns the stored result either way; first reports whether this call
+// created it. The store does not require the task record to exist.
+func (s *Tasks) RecordEffect(ctx context.Context, taskID, key string, result []byte) ([]byte, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if stored, ok := s.effects[taskID][key]; ok {
+		return copyBytes(stored), false, nil
+	}
+	if s.effects[taskID] == nil {
+		s.effects[taskID] = make(map[string][]byte)
+	}
+	s.effects[taskID][key] = copyBytes(result)
+	return copyBytes(result), true, nil
+}
+
+// ListEffects returns every effect recorded for the task, keyed by effect key.
+func (s *Tasks) ListEffects(ctx context.Context, taskID string) (map[string][]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	effects := make(map[string][]byte, len(s.effects[taskID]))
+	for key, result := range s.effects[taskID] {
+		effects[key] = copyBytes(result)
+	}
+	return effects, nil
+}
+
+// DeleteTask removes the task's record and its recorded effects; absent ids
+// are a no-op.
 func (s *Tasks) DeleteTask(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(s.effects, id)
 	if _, ok := s.records[id]; !ok {
 		return nil
 	}
