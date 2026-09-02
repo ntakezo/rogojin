@@ -16,28 +16,16 @@ rogojin is an end-to-end web automation framework in Go, written to be written b
 
 </div>
 
-## FAQ
+---
 
-### Whats it for?
+The portal to the internet is built for humans. Websites exclude bots from that interface — but they don't have to be excluded. rogojin gives you the tools to act as a bot while presenting as a human in a browser.
 
-The portal to the internet is built for humans. Bots are excluded from that interface by websites -- but they don't have to be. Rogojin gives you all the tools to perform actions as a bot while presenting yourself as a human in a browser.
+## Use cases
 
-usecases:
-
-- ecommerce automation(ACO)
-- web scraping
-
-### Why not just use a browser agent?
-
-inference and browsers at scale are costly. if speed and/or cost is a concern, request based automation is often the answer. moreover, rogojin lends itself nicely to generating request based bots on top of your existing browser fleet or hybrid workflow approaches.
-
-### Can i use a browser agent with Rogojin?
-
-yes. although we provide many primitives and tooling for request based automation, we intentionally leave it up to the user to decide what medium they prefer to drive an automation with. You can still benefit from the task orchestration, identity primitives, session management and more.
-
-## Isn't maintaining request based bots laborious?
-
-Before agents this task was very costly in labor. Now with agents you can build and maintain multiple platforms at once.
+- **Ecommerce automation (ACO)** — carting and checkout under contention
+- **Scraping past the login** — targets whose data sits behind a session, a multi-step flow, or a queue, rather than one page a stateless crawler can hit.
+- **Account lifecycle** — signup, verification, warming: waiting on a mailed link or code is a state the task resumes from, not a sleep it burns a process on.
+- **Monitors and drops** — long-lived watchers that survive restarts and hand off to a checkout the moment something lands.
 
 ---
 
@@ -70,6 +58,20 @@ cd _examples && go run ./workflows/example
 ## Documentation
 
 The [API reference](https://pkg.go.dev/github.com/ntakezo/rogojin) is the documentation — start with `workflows` for the model, `tasks` for the runtime. Every package stands alone and carries a doc comment saying what it owns and why.
+
+## FAQ
+
+### Why not just use a browser agent?
+
+Inference and browsers at scale are costly. If speed or cost is a concern, request-based automation is often the answer. rogojin also lends itself to generating request-based bots on top of an existing browser fleet, or to hybrid approaches.
+
+### Can I use a browser agent with rogojin?
+
+Yes. We provide primitives and tooling for request-based automation, but the medium you drive an automation with is deliberately left to you — the task orchestration, identity primitives, and session management are yours either way.
+
+### Isn't maintaining request-based bots laborious?
+
+Before agents it was, in labor. Now you can build and maintain several platforms at once.
 
 ## Versioning
 
