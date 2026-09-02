@@ -3,11 +3,14 @@ package leasing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ntakezo/rogojin/comms"
 )
 
 // These tests cover the leasing layer itself — pooling, groups, holder caps,
@@ -1645,6 +1648,190 @@ func TestUpdateGroupStrategyChange(t *testing.T) {
 		}
 		if l.Resource().ID != "p1" {
 			t.Fatalf("after strategy change picked %s, want the deterministic first p1", l.Resource().ID)
+		}
+		l.Release()
+	}
+}
+
+// sharedWiring is the option set two managers over one store share so a
+// release on either wakes the other's waiters, the way a distributed
+// notifier would.
+func sharedWiring(n comms.Notifier, ttl time.Duration) []Option[res, *res] {
+	return []Option[res, *res]{
+		WithNotifier[res, *res](n),
+		WithTopic[res, *res]("test-kind"),
+		WithLeaseTTL[res, *res](ttl),
+	}
+}
+
+// TestCapacityIsSharedAcrossManagers verifies two managers over one store
+// agree on a cap-1 resource: the second's acquirer blocks on the first's
+// lease — capacity the first manager's maps never told it about — and a
+// release on the first frees it.
+func TestCapacityIsSharedAcrossManagers(t *testing.T) {
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
+	n := comms.NewNotifier()
+	a := newTestManager(t, repo, sharedWiring(n, 200*time.Millisecond)...)
+	defer a.Close()
+	b := rebuildManager(t, repo, sharedWiring(n, 200*time.Millisecond)...)
+	defer b.Close()
+
+	held, err := a.Acquire(context.Background(), Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("acquire on a: %v", err)
+	}
+	waiter := acquireAsync(context.Background(), b, "t2", GlobalGroup)
+	mustBlock(t, waiter)
+
+	held.Release()
+	got := mustComplete(t, waiter)
+	if got.err != nil {
+		t.Fatalf("acquire on b after release: %v", got.err)
+	}
+	got.lease.Release()
+}
+
+// TestLockIsVisibleAcrossManagers verifies a lock taken through one manager
+// excludes the other's acquirers — the store refuses, not the stale cache —
+// and its Unlock through the first frees the second.
+func TestLockIsVisibleAcrossManagers(t *testing.T) {
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
+	n := comms.NewNotifier()
+	a := newTestManager(t, repo, sharedWiring(n, 200*time.Millisecond)...)
+	defer a.Close()
+	b := rebuildManager(t, repo, sharedWiring(n, 200*time.Millisecond)...)
+	defer b.Close()
+
+	locked, err := a.Lock(context.Background(), Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("lock on a: %v", err)
+	}
+	waiter := acquireAsync(context.Background(), b, "t2", GlobalGroup)
+	mustBlock(t, waiter)
+
+	locked.Release()
+	if err := a.Unlock(context.Background(), "t1"); err != nil {
+		t.Fatalf("unlock on a: %v", err)
+	}
+	got := mustComplete(t, waiter)
+	if got.err != nil {
+		t.Fatalf("acquire on b after unlock: %v", got.err)
+	}
+	got.lease.Release()
+}
+
+// TestRefreshDiscoversResourcesAddedElsewhere verifies a waiter drained of
+// candidates picks up a resource added through another manager without a
+// restart: the refresh-on-miss is what un-freezes the boot-time cache.
+func TestRefreshDiscoversResourcesAddedElsewhere(t *testing.T) {
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
+	n := comms.NewNotifier()
+	a := newTestManager(t, repo, sharedWiring(n, 200*time.Millisecond)...)
+	defer a.Close()
+	b := rebuildManager(t, repo, sharedWiring(n, 200*time.Millisecond)...)
+	defer b.Close()
+
+	// p1 is at its cap of 1, so a's waiter parks with no candidates.
+	held, err := b.Acquire(context.Background(), Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("acquire on b: %v", err)
+	}
+	defer held.Release()
+	waiter := acquireAsync(context.Background(), a, "t2", GlobalGroup)
+	mustBlock(t, waiter)
+
+	if err := b.Add(context.Background(), res{Resource: Resource{ID: "p2"}}); err != nil {
+		t.Fatalf("add on b: %v", err)
+	}
+	got := mustComplete(t, waiter)
+	if got.err != nil {
+		t.Fatalf("acquire on a after add: %v", got.err)
+	}
+	if id := got.lease.Resource().ID; id != "p2" {
+		t.Fatalf("acquired %s, want the freshly added p2", id)
+	}
+	got.lease.Release()
+}
+
+// TestHeartbeatOutlivesTheTTL verifies a live manager's lease survives well
+// past its TTL — the renewal loop keeps it — while a second manager's
+// acquirer stays refused the whole time.
+func TestHeartbeatOutlivesTheTTL(t *testing.T) {
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
+	n := comms.NewNotifier()
+	ttl := 60 * time.Millisecond
+	a := newTestManager(t, repo, sharedWiring(n, ttl)...)
+	defer a.Close()
+	b := rebuildManager(t, repo, sharedWiring(n, ttl)...)
+	defer b.Close()
+
+	held, err := a.Acquire(context.Background(), Assignment{TaskID: "t1"})
+	if err != nil {
+		t.Fatalf("acquire on a: %v", err)
+	}
+	defer held.Release()
+
+	// Several TTLs later the store must still refuse t2 outright.
+	time.Sleep(5 * ttl)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*ttl)
+	defer cancel()
+	if _, err := b.Acquire(ctx, Assignment{TaskID: "t2"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("acquire on b = %v, want a deadline while the renewed lease holds", err)
+	}
+}
+
+// TestExpiryFreesAClosedManagersLeases verifies the crash story: a manager
+// that stops renewing (Close, standing in for a dead process) forfeits its
+// leases after one quiet TTL, and another manager's waiter gets the
+// capacity without anyone releasing.
+func TestExpiryFreesAClosedManagersLeases(t *testing.T) {
+	repo := newFakeRepo(res{Resource: Resource{ID: "p1"}})
+	n := comms.NewNotifier()
+	ttl := 80 * time.Millisecond
+	a := newTestManager(t, repo, sharedWiring(n, ttl)...)
+	b := rebuildManager(t, repo, sharedWiring(n, ttl)...)
+	defer b.Close()
+
+	if _, err := a.Acquire(context.Background(), Assignment{TaskID: "t1"}); err != nil {
+		t.Fatalf("acquire on a: %v", err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+
+	waiter := acquireAsync(context.Background(), b, "t2", GlobalGroup)
+	got := mustComplete(t, waiter)
+	if got.err != nil {
+		t.Fatalf("acquire on b after expiry: %v", got.err)
+	}
+	got.lease.Release()
+}
+
+// TestRotationCursorIsShared verifies the default round robin rotates one
+// store-side cursor: two managers alternating acquires continue a single
+// rotation instead of each starting at zero.
+func TestRotationCursorIsShared(t *testing.T) {
+	repo := newFakeRepo(
+		res{Resource: Resource{ID: "p1", MaxHolders: UnlimitedHolders}},
+		res{Resource: Resource{ID: "p2", MaxHolders: UnlimitedHolders}},
+	)
+	if err := repo.SaveGroup(context.Background(), Group{ID: GlobalGroup, Strategy: StrategyRoundRobin}); err != nil {
+		t.Fatalf("seed global group: %v", err)
+	}
+	a := rebuildManager(t, repo)
+	defer a.Close()
+	b := rebuildManager(t, repo)
+	defer b.Close()
+
+	want := []string{"p1", "p2", "p1", "p2"}
+	managers := []*Manager[res, *res]{a, b, a, b}
+	for i, m := range managers {
+		l, err := m.Acquire(context.Background(), Assignment{TaskID: fmt.Sprintf("t%d", i)})
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		if id := l.Resource().ID; id != want[i] {
+			t.Fatalf("pick %d = %s, want %s (one shared rotation)", i, id, want[i])
 		}
 		l.Release()
 	}

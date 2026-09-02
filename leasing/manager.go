@@ -92,8 +92,11 @@ type Manager[R any, P Leasable[R]] struct {
 
 // NewManager loads the groups and pool from the repository, persisting the
 // global group if absent. Round robin is always installed and is always the
-// default: a group naming no strategy rotates round robin. Groups and pool
-// change afterwards only through CreateGroup, DeleteGroup, Add, and Delete.
+// default: a group naming no strategy rotates round robin. The caches change
+// afterwards through CreateGroup, DeleteGroup, Add, and Delete — and through
+// the acquire loop's refresh, which re-reads the store whenever a waiter
+// runs out of candidates, so another node's changes surface without a
+// restart.
 //
 // Seed groups before resources: a resource whose GroupID has no stored group
 // fails construction with ErrGroupNotFound, so a repository seeded directly
@@ -525,13 +528,14 @@ func (m *Manager[R, P]) Add(ctx context.Context, p R) error {
 
 // Update applies fn to the pooled record and persists the result. It is how a
 // model's own fields change after Add — an outcome count, a rotated
-// credential. The manager never reads those fields, but it owns the copy every
-// lease is cut from and the write that makes a change durable, so the edit has
-// to go through it: a record saved around the manager would be overwritten by
-// its next write of that row, and would never reach the strategies selecting
-// over the pool. The leasing fields are not fn's to change — whatever it does
-// to them is undone before the save — and it runs under the manager's lock,
-// so it must not block.
+// credential. The manager never reads those fields, but it holds the copy
+// every lease is cut from, so the edit has to go through it to reach the
+// strategies selecting over the pool; a record saved around the manager is
+// caught by the version condition instead of silently overwritten, and the
+// manager's own stale copy loses the same way, surfacing as ErrStale here.
+// The leasing fields are not fn's to change — whatever it does to them is
+// undone before the save — and it runs under the manager's lock, so it must
+// not block.
 func (m *Manager[R, P]) Update(ctx context.Context, id string, fn func(*R)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
