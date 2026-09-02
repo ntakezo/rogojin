@@ -16,8 +16,6 @@ import (
 	"errors"
 	"sort"
 	"time"
-
-	"github.com/ntakezo/rogojin/leasing"
 )
 
 // copyBytes clones a byte payload, keeping nil nil.
@@ -71,37 +69,4 @@ func sortedIDs[V any](m map[string]V) []string {
 	}
 	sort.Strings(ids)
 	return ids
-}
-
-// groupStore is the group half every leasing-shaped store shares: upsert
-// preserving created_at, stable-order listing, no-op deletes.
-type groupStore struct {
-	groups map[string]leasing.Group
-}
-
-func newGroupStore() groupStore {
-	return groupStore{groups: make(map[string]leasing.Group)}
-}
-
-func (s *groupStore) save(g leasing.Group) {
-	g.Refs = copyMap(g.Refs)
-	g.CreatedAt, g.UpdatedAt = storeTime(g.CreatedAt), storeTime(g.UpdatedAt)
-	if kept, ok := s.groups[g.ID]; ok {
-		g.CreatedAt = kept.CreatedAt
-	}
-	s.groups[g.ID] = g
-}
-
-func (s *groupStore) list() []leasing.Group {
-	listed := make([]leasing.Group, 0, len(s.groups))
-	for _, id := range sortedIDs(s.groups) {
-		g := s.groups[id]
-		g.Refs = copyMap(g.Refs)
-		listed = append(listed, g)
-	}
-	return listed
-}
-
-func (s *groupStore) delete(id string) {
-	delete(s.groups, id)
 }

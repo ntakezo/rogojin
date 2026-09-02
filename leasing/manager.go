@@ -39,45 +39,6 @@ type Manager[R any, P Leasable[R]] struct {
 	bindings   map[string]string         // taskID -> locked resource ID
 }
 
-// noopRepository is the Repository a nil one is swapped for: it loads nothing
-// and drops every write, leaving the manager's own maps as the only copy. The
-// manager treats the store as a mirror everywhere, so no call site changes.
-type noopRepository[R any] struct{}
-
-func (noopRepository[R]) List(context.Context) ([]R, error)                 { return nil, nil }
-func (noopRepository[R]) Delete(context.Context, string) error              { return nil }
-func (noopRepository[R]) ListGroups(context.Context) ([]Group, error)       { return nil, nil }
-func (noopRepository[R]) SaveGroup(context.Context, Group) error            { return nil }
-func (noopRepository[R]) DeleteGroup(context.Context, string) error         { return nil }
-func (noopRepository[R]) ReleaseHold(context.Context, string, string) error { return nil }
-func (noopRepository[R]) RenewHolds(context.Context, string, time.Duration) error {
-	return nil
-}
-func (noopRepository[R]) ListHolds(context.Context) ([]Hold, error)         { return nil, nil }
-func (noopRepository[R]) ClaimLock(context.Context, string, string) error   { return nil }
-func (noopRepository[R]) ReleaseLock(context.Context, string, string) error { return nil }
-
-// Save echoes the conditional-write contract without storing: the version
-// advances so the manager's cache stays coherent with what a real store
-// would have said.
-func (noopRepository[R]) Save(_ context.Context, record R) (int64, error) {
-	if p, ok := any(&record).(interface{ core() *Resource }); ok {
-		return p.core().Version + 1, nil
-	}
-	return 1, nil
-}
-
-// Acquire grants unconditionally, echoing the inputs: with no shared store
-// there is no second process to contend with, and the manager's own maps
-// remain the only live state.
-func (noopRepository[R]) Acquire(_ context.Context, resourceID, taskID string, _ int, ttl time.Duration) (Hold, error) {
-	return Hold{ResourceID: resourceID, TaskID: taskID, Count: 1, ExpiresAt: time.Now().Add(ttl)}, nil
-}
-
-func (noopRepository[R]) Increment(_ context.Context, _, _ string, delta int64) (int64, error) {
-	return delta, nil
-}
-
 // NewManager loads the groups and pool from the repository, persisting the
 // global group if absent. Round robin is always installed and is always the
 // default: a group naming no strategy rotates round robin. Groups and pool
@@ -88,12 +49,14 @@ func (noopRepository[R]) Increment(_ context.Context, _, _ string, delta int64) 
 // must SaveGroup before Save. Resources with no GroupID land in the global
 // group, which is created here if absent.
 //
-// A nil repository runs the pool purely in memory: the manager starts empty
-// (seed it through Add), and no inventory or durable lock survives the
-// process — the same bargain a nil task repository strikes.
+// A nil repository runs the pool purely in memory, on the same in-process
+// store NewMemoryRepository returns: capacity, locks, and versions are
+// enforced for real, but the manager starts empty (seed it through Add) and
+// no inventory or durable lock survives the process — the same bargain a nil
+// task repository strikes.
 func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], opts ...Option[R, P]) (*Manager[R, P], error) {
 	if repo == nil {
-		repo = noopRepository[R]{}
+		repo = NewMemoryRepository[R, P]()
 	}
 
 	m := &Manager[R, P]{
