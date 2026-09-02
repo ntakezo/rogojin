@@ -9,6 +9,20 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rogojin
+          POSTGRES_PASSWORD: rogojin
+          POSTGRES_DB: rogojin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rogojin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -16,6 +30,8 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test -race ./...
+        env:
+          ROGOJIN_POSTGRES_DSN: postgres://rogojin:rogojin@localhost:5432/rogojin?sslmode=disable
       # _examples is its own module in an underscore directory, so the root
       # go commands skip it; build it explicitly or the example rots silently.
       - run: go build ./... && go vet ./...
