@@ -112,28 +112,37 @@ type fakeStore struct {
 	terminalErr error
 }
 
-func (f *fakeStore) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
+func (f *fakeStore) SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.saves = append(f.saves, recordedSave{id, workflows.Status(status), workflows.State(state), append([]byte(nil), snapshot...)})
 	if f.saveErr != nil {
-		return f.saveErr(workflows.State(state))
+		return 0, f.saveErr(workflows.State(state))
 	}
-	return nil
+	return int64(len(f.saves)), nil
 }
 
-func (f *fakeStore) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
+func (f *fakeStore) MarkTerminal(ctx context.Context, id string, version int64, node, outcome string, output []byte) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.terminalErr != nil {
-		return f.terminalErr
+		return 0, f.terminalErr
 	}
 	f.terminal = workflows.Status(outcome)
 	f.terminalSet = true
 	// append to a nil slice preserves nil, so "no output" stays distinguishable.
 	f.terminalOutput = append([]byte(nil), output...)
+	return int64(len(f.saves)) + 1, nil
+}
+
+func (f *fakeStore) ClaimTask(ctx context.Context, id, node string, ttl time.Duration) (Task, error) {
+	return Task{}, nil
+}
+func (f *fakeStore) RenewClaim(ctx context.Context, id, node string, ttl time.Duration) error {
 	return nil
 }
+func (f *fakeStore) ReleaseClaim(ctx context.Context, id, node string) error { return nil }
+func (f *fakeStore) ListClaimable(ctx context.Context) ([]Task, error)       { return nil, nil }
 
 func (f *fakeStore) CreateTask(ctx context.Context, record Task) error { return nil }
 func (f *fakeStore) SaveAssignment(ctx context.Context, id string, kind leasing.Kind, a Assignment) error {

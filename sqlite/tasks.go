@@ -10,6 +10,7 @@ import (
 
 	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/tasks"
+	"github.com/ntakezo/rogojin/workflows"
 )
 
 // ErrTaskNotFound is returned when no record exists for the id. It is the
@@ -59,6 +60,43 @@ var taskMigrations = []migration{
 			updated_at      TEXT NOT NULL DEFAULT ''
 		)`,
 	},
+	{
+		Name: "add version column",
+		SQL:  `ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0`,
+	},
+	{
+		Name: "add owner_node column",
+		SQL:  `ALTER TABLE tasks ADD COLUMN owner_node TEXT NOT NULL DEFAULT ''`,
+	},
+	{
+		Name: "add lease_expires_at column",
+		SQL:  `ALTER TABLE tasks ADD COLUMN lease_expires_at INTEGER NOT NULL DEFAULT 0`,
+	},
+}
+
+// The lease expiry is stored as unix milliseconds, not RFC3339Nano text like
+// the other timestamps: it is a comparison column — every claim predicate
+// orders it against "now" in SQL — and variable-width fractional-second text
+// does not compare correctly. 0 is the zero time (unclaimed). The claim
+// predicates compare against the adapter's own clock: the store is the
+// authority on liveness, and for sqlite the process clock is the store clock,
+// so node clock skew never decides ownership.
+
+// formatMillis renders a timestamp for the lease column; the zero time
+// stores as 0.
+func formatMillis(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
+// parseMillis is the inverse of formatMillis.
+func parseMillis(ms int64) time.Time {
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms).UTC()
 }
 
 // CreateTask inserts a fresh task row from its record: workflow, placement,
@@ -78,18 +116,100 @@ func (s *Tasks) CreateTask(ctx context.Context, rec tasks.Task) error {
 	return nil
 }
 
-// SaveCheckpoint overwrites the task's last-checkpointed status, state, and
-// snapshot, refreshing updated_at. It fails with ErrTaskNotFound if no record
-// exists: a checkpoint that lands nowhere must not report durability the
-// store does not have.
-func (s *Tasks) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
+// ClaimTask atomically takes ownership for node iff the task is unclaimed,
+// already node's, or leased past expiry, returning the claimed record with
+// its new version; ErrClaimHeld reports a live claim by another node. One
+// conditional UPDATE is the whole race: whichever node's statement runs
+// first wins, and the loser's matches no row.
+func (s *Tasks) ClaimTask(ctx context.Context, id, node string, ttl time.Duration) (tasks.Task, error) {
+	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE tasks SET status = ?, state = ?, snapshot = ?, updated_at = ? WHERE id = ?`,
-		status, state, snapshot, formatTime(time.Now().UTC()), id)
+		`UPDATE tasks SET owner_node = ?, lease_expires_at = ?, version = version + 1, updated_at = ?
+		 WHERE id = ? AND (owner_node = '' OR owner_node = ? OR lease_expires_at < ?)`,
+		node, formatMillis(now.Add(ttl)), formatTime(now), id, node, formatMillis(now))
 	if err != nil {
-		return fmt.Errorf("save checkpoint %s: %w", id, err)
+		return tasks.Task{}, fmt.Errorf("claim task %s: %w", id, err)
 	}
-	return errRowMissing("save checkpoint", id, res)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return tasks.Task{}, fmt.Errorf("claim task %s: %w", id, err)
+	}
+	if n == 0 {
+		if _, err := s.RecoverTask(ctx, id); err != nil {
+			return tasks.Task{}, fmt.Errorf("claim task %s: %w", id, tasks.ErrTaskNotFound)
+		}
+		return tasks.Task{}, fmt.Errorf("claim task %s: %w", id, tasks.ErrClaimHeld)
+	}
+	rec, err := s.RecoverTask(ctx, id)
+	if err != nil {
+		return tasks.Task{}, fmt.Errorf("claim task %s: %w", id, err)
+	}
+	return rec, nil
+}
+
+// RenewClaim extends the lease iff node still owns the claim, expired or
+// not, without bumping the version — renewal moves only the lease clock, so
+// it never invalidates the owner's own in-flight conditional writes.
+// ErrStale reports the claim gone or another node's.
+func (s *Tasks) RenewClaim(ctx context.Context, id, node string, ttl time.Duration) error {
+	if node == "" {
+		return fmt.Errorf("renew claim %s: %w", id, tasks.ErrStale)
+	}
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND owner_node = ?`,
+		formatMillis(now.Add(ttl)), formatTime(now), id, node)
+	if err != nil {
+		return fmt.Errorf("renew claim %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("renew claim %s: %w", id, err)
+	}
+	if n == 0 {
+		if _, err := s.RecoverTask(ctx, id); err != nil {
+			return fmt.Errorf("renew claim %s: %w", id, tasks.ErrTaskNotFound)
+		}
+		return fmt.Errorf("renew claim %s: %w", id, tasks.ErrStale)
+	}
+	return nil
+}
+
+// ReleaseClaim clears the claim iff node owns it, silently a no-op
+// otherwise: a release racing its own usurpation is a shutdown path, not an
+// error.
+func (s *Tasks) ReleaseClaim(ctx context.Context, id, node string) error {
+	if node == "" {
+		return nil
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET owner_node = '', lease_expires_at = 0, version = version + 1, updated_at = ?
+		 WHERE id = ? AND owner_node = ?`,
+		formatTime(time.Now().UTC()), id, node)
+	if err != nil {
+		return fmt.Errorf("release claim %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("release claim %s: %w", id, err)
+	}
+	if n == 0 {
+		if _, err := s.RecoverTask(ctx, id); err != nil {
+			return fmt.Errorf("release claim %s: %w", id, tasks.ErrTaskNotFound)
+		}
+	}
+	return nil
+}
+
+// SaveCheckpoint overwrites the task's last-checkpointed status, state, and
+// snapshot iff version matches and node owns the claim, bumping and
+// returning the version; ErrStale reports the write lost. tasks.AnyVersion
+// with an empty node skips the predicate. It fails with ErrTaskNotFound if
+// no record exists: a checkpoint that lands nowhere must not report
+// durability the store does not have.
+func (s *Tasks) SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error) {
+	return s.conditionalWrite(ctx, "save checkpoint", id, version, node,
+		`status = ?, state = ?, snapshot = ?`, status, state, snapshot)
 }
 
 // SaveAssignment repoints a task's placement for one kind, leaving every other
@@ -126,38 +246,53 @@ func (s *Tasks) SaveAssignment(ctx context.Context, id string, kind leasing.Kind
 	return nil
 }
 
-// MarkTerminal stamps the terminal outcome and the run's output, refreshing
-// updated_at and leaving state and snapshot intact as a valid resume entry.
-// output is nil for runs that produce no result or did not complete cleanly.
-// It fails with ErrTaskNotFound if no record exists.
-func (s *Tasks) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE tasks SET status = ?, output = ?, updated_at = ? WHERE id = ?`,
-		outcome, output, formatTime(time.Now().UTC()), id)
-	if err != nil {
-		return fmt.Errorf("mark terminal %s: %w", id, err)
-	}
-	return errRowMissing("mark terminal", id, res)
+// MarkTerminal stamps the terminal outcome and the run's output under
+// SaveCheckpoint's conditionality, additionally clearing the claim — a
+// finished task is nobody's to run. State and snapshot stay intact as a
+// valid resume entry. output is nil for runs that produce no result or did
+// not complete cleanly. It fails with ErrTaskNotFound if no record exists.
+func (s *Tasks) MarkTerminal(ctx context.Context, id string, version int64, node, outcome string, output []byte) (int64, error) {
+	return s.conditionalWrite(ctx, "mark terminal", id, version, node,
+		`status = ?, output = ?, owner_node = '', lease_expires_at = 0`, outcome, output)
 }
 
-// errRowMissing turns an update that matched no row into ErrTaskNotFound, so
-// a write to a deleted task fails loud instead of silently landing nowhere.
-func errRowMissing(op, id string, res sql.Result) error {
-	n, err := res.RowsAffected()
+// conditionalWrite runs one guarded UPDATE — the version and ownership
+// predicate appended unless the caller passed tasks.AnyVersion with an empty
+// node — bumping the version and returning it via RETURNING, so the write
+// and the version read are one statement even with another process on the
+// file. A write that matched no row is ErrStale if the record exists and
+// ErrTaskNotFound if it does not.
+func (s *Tasks) conditionalWrite(ctx context.Context, op, id string, version int64, node, sets string, args ...any) (int64, error) {
+	query := `UPDATE tasks SET ` + sets + `, version = version + 1, updated_at = ? WHERE id = ?`
+	args = append(args, formatTime(time.Now().UTC()), id)
+	if version != tasks.AnyVersion || node != "" {
+		query += ` AND version = ? AND owner_node = ?`
+		args = append(args, version, node)
+	}
+	query += ` RETURNING version`
+
+	var v int64
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := s.RecoverTask(ctx, id); err != nil {
+			return 0, fmt.Errorf("%s %s: %w", op, id, tasks.ErrTaskNotFound)
+		}
+		return 0, fmt.Errorf("%s %s: %w", op, id, tasks.ErrStale)
+	}
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", op, id, err)
+		return 0, fmt.Errorf("%s %s: %w", op, id, err)
 	}
-	if n == 0 {
-		return fmt.Errorf("%s %s: %w", op, id, ErrTaskNotFound)
-	}
-	return nil
+	return v, nil
 }
+
+// taskColumns is the SELECT list scanTask reads, shared so every read path
+// stays in step with the schema.
+const taskColumns = `id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at, version, owner_node, lease_expires_at`
 
 // RecoverTask returns the record for id, or ErrTaskNotFound if none exists.
 func (s *Tasks) RecoverTask(ctx context.Context, id string) (tasks.Task, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
-		 FROM tasks WHERE id = ?`, id)
+		`SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id)
 	rec, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return tasks.Task{}, fmt.Errorf("recover task %s: %w", id, ErrTaskNotFound)
@@ -170,11 +305,22 @@ func (s *Tasks) RecoverTask(ctx context.Context, id string) (tasks.Task, error) 
 
 // RecoverAll returns every persisted record, terminal ones included.
 func (s *Tasks) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at
-		 FROM tasks`)
+	return s.listTasks(ctx, "recover all", `SELECT `+taskColumns+` FROM tasks`)
+}
+
+// ListClaimable returns the non-terminal tasks whose claim is free for any
+// taker — unclaimed or leased past expiry, by the store's clock.
+func (s *Tasks) ListClaimable(ctx context.Context) ([]tasks.Task, error) {
+	return s.listTasks(ctx, "list claimable",
+		`SELECT `+taskColumns+` FROM tasks WHERE status != ? AND status != ? AND (owner_node = '' OR lease_expires_at < ?)`,
+		string(workflows.StatusDone), string(workflows.StatusKilled), formatMillis(time.Now().UTC()))
+}
+
+// listTasks runs one listing query and scans every row.
+func (s *Tasks) listTasks(ctx context.Context, op, query string, args ...any) ([]tasks.Task, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("recover all: %w", err)
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	defer rows.Close()
 
@@ -182,12 +328,12 @@ func (s *Tasks) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
 	for rows.Next() {
 		rec, err := scanTask(rows)
 		if err != nil {
-			return nil, fmt.Errorf("recover all: %w", err)
+			return nil, fmt.Errorf("%s: %w", op, err)
 		}
 		records = append(records, rec)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("recover all: %w", err)
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	return records, nil
 }
@@ -290,13 +436,15 @@ func (s *Tasks) TasksInGroup(ctx context.Context, groupID string) ([]string, err
 	return ids, nil
 }
 
-// scanTask reads one row into a tasks.Task.
+// scanTask reads one row (in taskColumns order) into a tasks.Task.
 func scanTask(row scanner) (tasks.Task, error) {
 	var rec tasks.Task
 	var assignments, created, updated string
-	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &assignments, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated); err != nil {
+	var leaseMillis int64
+	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &assignments, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated, &rec.Version, &rec.OwnerNode, &leaseMillis); err != nil {
 		return tasks.Task{}, err
 	}
+	rec.LeaseExpiresAt = parseMillis(leaseMillis)
 	var err error
 	if rec.Assignments, err = decodeAssignments(assignments); err != nil {
 		return tasks.Task{}, err
