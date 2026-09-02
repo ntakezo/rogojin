@@ -2,6 +2,7 @@ package comms
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -62,6 +63,73 @@ func TestTopicRoundTrip(t *testing.T) {
 	}
 	if got.URL != "https://x" {
 		t.Errorf("got %q, want https://x", got.URL)
+	}
+}
+
+// TestTopicDecodesWirePayloads verifies the typed layer's transport
+// neutrality: a payload arriving in the wire form — the JSON encoding a
+// cross-process bus delivers — decodes back to T on the topic's feed, so
+// receive code written against an in-process bus runs unchanged over a
+// distributed one.
+func TestTopicDecodesWirePayloads(t *testing.T) {
+	b := NewBus()
+	ctx := context.Background()
+
+	type result struct{ URL string }
+	topic := NewTopic[result](b, "results")
+
+	sub, _ := topic.On(ctx)
+	defer sub.Close()
+
+	// Publish the wire form directly, as a distributed bus adapter would
+	// deliver it.
+	if err := b.Publish(ctx, "results", json.RawMessage(`{"URL":"https://x"}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	got, ok := recv(t, sub.C()).(result)
+	if !ok {
+		t.Fatal("wire payload did not decode back to the emitted type")
+	}
+	if got.URL != "https://x" {
+		t.Errorf("got %q, want https://x", got.URL)
+	}
+}
+
+// TestTopicDropsUndecodablePayloads verifies a payload that is neither a T
+// nor JSON decoding into one is dropped rather than delivered mistyped —
+// at-most-once already permits the drop, and a later good payload still
+// arrives.
+func TestTopicDropsUndecodablePayloads(t *testing.T) {
+	b := NewBus()
+	ctx := context.Background()
+
+	topic := NewTopic[string](b, "cookies")
+	sub, _ := topic.On(ctx)
+	defer sub.Close()
+
+	b.Publish(ctx, "cookies", 42)                         // not a string, not wire bytes
+	b.Publish(ctx, "cookies", json.RawMessage(`{"a":1}`)) // wire bytes of the wrong shape
+	topic.Emit(ctx, "the-good-one")
+
+	if got := recv(t, sub.C()); got.(string) != "the-good-one" {
+		t.Errorf("got %v, want the payload after the dropped ones", got)
+	}
+}
+
+// TestTopicSubscriptionCloseEndsTheFeed verifies the decoding wrapper keeps
+// Subscription's teardown contract: Close ends the feed and is safe to call
+// more than once.
+func TestTopicSubscriptionCloseEndsTheFeed(t *testing.T) {
+	b := NewBus()
+	topic := NewTopic[string](b, "t")
+
+	sub, _ := topic.On(context.Background())
+	sub.Close()
+	sub.Close()
+
+	if _, ok := <-sub.C(); ok {
+		t.Fatal("received on a closed topic subscription")
 	}
 }
 
