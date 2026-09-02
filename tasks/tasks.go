@@ -54,6 +54,12 @@ var ErrAlreadyTerminal = errors.New("task already reached a terminal outcome")
 // one through the Manager to start it again.
 var ErrDetached = errors.New("task detached from its suspended run")
 
+// ErrTaskNotFound is returned by a Repository when no record exists for the
+// id, so a missing task is never conflated with a store failure. Every
+// adapter fails with it, which is what lets callers branch on errors.Is
+// without knowing which store they run over.
+var ErrTaskNotFound = errors.New("task not found")
+
 // A Task is one task, whole: the durable record of its workflow, its
 // placement (task group, plus a per-kind resource assignment), its
 // last-checkpointed status and resume state with the snapshot taken there —
