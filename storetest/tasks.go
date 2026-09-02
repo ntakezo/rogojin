@@ -3,6 +3,8 @@ package storetest
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -73,7 +75,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		repo := open(t)
 		seedTask(t, repo, "t1", "wf1")
 
-		if err := repo.SaveCheckpoint(ctx, "t1", "running", "add_to_cart", []byte(`{"cart":"abc"}`)); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "add_to_cart", []byte(`{"cart":"abc"}`)); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 		rec, err := repo.RecoverTask(ctx, "t1")
@@ -84,7 +86,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 			t.Fatalf("got %+v, want running/add_to_cart checkpoint", rec)
 		}
 
-		if err := repo.SaveCheckpoint(ctx, "t1", "suspended", "s2", []byte("b")); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "suspended", "s2", []byte("b")); err != nil {
 			t.Fatalf("SaveCheckpoint 2: %v", err)
 		}
 		rec, _ = repo.RecoverTask(ctx, "t1")
@@ -98,11 +100,11 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 	t.Run("MarkTerminal", func(t *testing.T) {
 		repo := open(t)
 		seedTask(t, repo, "t1", "wf1")
-		if err := repo.SaveCheckpoint(ctx, "t1", "running", "submit", []byte("snap")); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "submit", []byte("snap")); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 		out := []byte(`{"orderID":"order-1"}`)
-		if err := repo.MarkTerminal(ctx, "t1", "done", out); err != nil {
+		if _, err := repo.MarkTerminal(ctx, "t1", tasks.AnyVersion, "", "done", out); err != nil {
 			t.Fatalf("MarkTerminal: %v", err)
 		}
 
@@ -122,10 +124,10 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		if _, err := repo.RecoverTask(ctx, "nope"); !errors.Is(err, tasks.ErrTaskNotFound) {
 			t.Fatalf("RecoverTask: err = %v, want tasks.ErrTaskNotFound", err)
 		}
-		if err := repo.SaveCheckpoint(ctx, "ghost", "running", "s1", nil); !errors.Is(err, tasks.ErrTaskNotFound) {
+		if _, err := repo.SaveCheckpoint(ctx, "ghost", tasks.AnyVersion, "", "running", "s1", nil); !errors.Is(err, tasks.ErrTaskNotFound) {
 			t.Fatalf("SaveCheckpoint: err = %v, want tasks.ErrTaskNotFound", err)
 		}
-		if err := repo.MarkTerminal(ctx, "ghost", "done", nil); !errors.Is(err, tasks.ErrTaskNotFound) {
+		if _, err := repo.MarkTerminal(ctx, "ghost", tasks.AnyVersion, "", "done", nil); !errors.Is(err, tasks.ErrTaskNotFound) {
 			t.Fatalf("MarkTerminal: err = %v, want tasks.ErrTaskNotFound", err)
 		}
 	})
@@ -140,7 +142,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 
 		seedTask(t, repo, "t1", "wf1")
 		seedTask(t, repo, "t2", "wf2")
-		if err := repo.MarkTerminal(ctx, "t2", "done", nil); err != nil {
+		if _, err := repo.MarkTerminal(ctx, "t2", tasks.AnyVersion, "", "done", nil); err != nil {
 			t.Fatalf("MarkTerminal: %v", err)
 		}
 
@@ -283,7 +285,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask: %v", err)
 		}
-		if err := repo.SaveCheckpoint(ctx, "t1", "running", "s1", []byte(`{"v":1}`)); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "s1", []byte(`{"v":1}`)); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 
@@ -381,7 +383,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 			t.Fatalf("timestamps = %v/%v, want both %v", got.CreatedAt, got.UpdatedAt, created)
 		}
 
-		if err := repo.SaveCheckpoint(ctx, "t1", "running", "s1", nil); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "s1", nil); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 		got, _ = repo.RecoverTask(ctx, "t1")
@@ -479,7 +481,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 			t.Fatalf("CreateTask: %v", err)
 		}
 		snap := []byte("snap")
-		if err := repo.SaveCheckpoint(ctx, "t1", "running", "s1", snap); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "s1", snap); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 
@@ -517,7 +519,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 					t.Errorf("CreateTask %s: %v", id, err)
 					return
 				}
-				if err := repo.SaveCheckpoint(ctx, id, "running", "s1", []byte(id)); err != nil {
+				if _, err := repo.SaveCheckpoint(ctx, id, tasks.AnyVersion, "", "running", "s1", []byte(id)); err != nil {
 					t.Errorf("SaveCheckpoint %s: %v", id, err)
 				}
 				if _, err := repo.RecoverAll(ctx); err != nil {
@@ -530,6 +532,347 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		recs, err := repo.RecoverAll(ctx)
 		if err != nil || len(recs) != 4 {
 			t.Fatalf("RecoverAll = %d records, err %v; want all 4", len(recs), err)
+		}
+	})
+
+	// The claim primitives: the store is the authority on which node runs a
+	// task and until when. Expiry is judged by the store's own clock.
+	t.Run("Claims", func(t *testing.T) {
+		// A ttl long enough to never expire inside a test.
+		const forever = time.Minute
+
+		t.Run("ClaimRoundTrip", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+
+			before := time.Now()
+			rec, err := repo.ClaimTask(ctx, "t1", "node-a", forever)
+			if err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+			if rec.OwnerNode != "node-a" || rec.Version == 0 {
+				t.Fatalf("claimed record = owner %q version %d, want node-a with a bumped version", rec.OwnerNode, rec.Version)
+			}
+			if !rec.LeaseExpiresAt.After(before) {
+				t.Fatalf("lease expires %v, want after the claim", rec.LeaseExpiresAt)
+			}
+
+			kept, err := repo.RecoverTask(ctx, "t1")
+			if err != nil {
+				t.Fatalf("RecoverTask: %v", err)
+			}
+			if kept.OwnerNode != rec.OwnerNode || kept.Version != rec.Version || !kept.LeaseExpiresAt.Equal(rec.LeaseExpiresAt) {
+				t.Fatalf("recovered claim %q v%d %v, want the claimed %q v%d %v",
+					kept.OwnerNode, kept.Version, kept.LeaseExpiresAt, rec.OwnerNode, rec.Version, rec.LeaseExpiresAt)
+			}
+
+			if _, err := repo.ClaimTask(ctx, "ghost", "node-a", forever); !errors.Is(err, tasks.ErrTaskNotFound) {
+				t.Fatalf("ClaimTask ghost: err = %v, want tasks.ErrTaskNotFound", err)
+			}
+		})
+
+		t.Run("HeldClaimRefusesAnotherNode", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			if _, err := repo.ClaimTask(ctx, "t1", "node-a", forever); err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+
+			if _, err := repo.ClaimTask(ctx, "t1", "node-b", forever); !errors.Is(err, tasks.ErrClaimHeld) {
+				t.Fatalf("ClaimTask by node-b: err = %v, want tasks.ErrClaimHeld", err)
+			}
+			// The same node re-claims freely — recovery after a local restart
+			// inside one lease.
+			if _, err := repo.ClaimTask(ctx, "t1", "node-a", forever); err != nil {
+				t.Fatalf("re-claim by the owner: %v", err)
+			}
+		})
+
+		t.Run("ExpiredLeaseIsClaimable", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			if _, err := repo.ClaimTask(ctx, "t1", "node-a", 10*time.Millisecond); err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+			time.Sleep(30 * time.Millisecond)
+
+			rec, err := repo.ClaimTask(ctx, "t1", "node-b", forever)
+			if err != nil {
+				t.Fatalf("ClaimTask after expiry: %v", err)
+			}
+			if rec.OwnerNode != "node-b" {
+				t.Fatalf("owner = %q, want node-b", rec.OwnerNode)
+			}
+		})
+
+		t.Run("RenewMovesOnlyTheLease", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			rec, err := repo.ClaimTask(ctx, "t1", "node-a", 10*time.Millisecond)
+			if err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+
+			// A late renewal that nobody usurped still wins.
+			time.Sleep(30 * time.Millisecond)
+			if err := repo.RenewClaim(ctx, "t1", "node-a", forever); err != nil {
+				t.Fatalf("late RenewClaim: %v", err)
+			}
+
+			kept, err := repo.RecoverTask(ctx, "t1")
+			if err != nil {
+				t.Fatalf("RecoverTask: %v", err)
+			}
+			if kept.Version != rec.Version {
+				t.Fatalf("renewal bumped the version %d -> %d; it must move only the lease", rec.Version, kept.Version)
+			}
+			if !kept.LeaseExpiresAt.After(rec.LeaseExpiresAt) {
+				t.Fatalf("lease %v not extended past %v", kept.LeaseExpiresAt, rec.LeaseExpiresAt)
+			}
+
+			if err := repo.RenewClaim(ctx, "ghost", "node-a", forever); !errors.Is(err, tasks.ErrTaskNotFound) {
+				t.Fatalf("RenewClaim ghost: err = %v, want tasks.ErrTaskNotFound", err)
+			}
+		})
+
+		t.Run("UsurpationEndsTheOldOwner", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			if _, err := repo.ClaimTask(ctx, "t1", "node-a", 10*time.Millisecond); err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+			time.Sleep(30 * time.Millisecond)
+			if _, err := repo.ClaimTask(ctx, "t1", "node-b", forever); err != nil {
+				t.Fatalf("usurping claim: %v", err)
+			}
+
+			// The usurped node's renewal fails loud - its cue to stop - and
+			// its release is a silent no-op that leaves the usurper's claim
+			// standing.
+			if err := repo.RenewClaim(ctx, "t1", "node-a", forever); !errors.Is(err, tasks.ErrStale) {
+				t.Fatalf("RenewClaim after usurpation: err = %v, want tasks.ErrStale", err)
+			}
+			if err := repo.ReleaseClaim(ctx, "t1", "node-a"); err != nil {
+				t.Fatalf("ReleaseClaim after usurpation: %v", err)
+			}
+			kept, err := repo.RecoverTask(ctx, "t1")
+			if err != nil {
+				t.Fatalf("RecoverTask: %v", err)
+			}
+			if kept.OwnerNode != "node-b" {
+				t.Fatalf("owner = %q after the loser's release, want node-b", kept.OwnerNode)
+			}
+		})
+
+		t.Run("ReleaseFreesTheClaim", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			if _, err := repo.ClaimTask(ctx, "t1", "node-a", forever); err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+			if err := repo.ReleaseClaim(ctx, "t1", "node-a"); err != nil {
+				t.Fatalf("ReleaseClaim: %v", err)
+			}
+
+			kept, err := repo.RecoverTask(ctx, "t1")
+			if err != nil {
+				t.Fatalf("RecoverTask: %v", err)
+			}
+			if kept.OwnerNode != "" || !kept.LeaseExpiresAt.IsZero() {
+				t.Fatalf("claim = %q %v after release, want cleared", kept.OwnerNode, kept.LeaseExpiresAt)
+			}
+			if _, err := repo.ClaimTask(ctx, "t1", "node-b", forever); err != nil {
+				t.Fatalf("ClaimTask after release: %v", err)
+			}
+		})
+
+		t.Run("CreateDropsClaimFields", func(t *testing.T) {
+			repo := open(t)
+			now := time.Now().UTC()
+			smuggled := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: tasks.GlobalGroup,
+				CreatedAt: now, UpdatedAt: now,
+				Version: 9, OwnerNode: "smuggler", LeaseExpiresAt: now.Add(time.Hour)}
+			if err := repo.CreateTask(ctx, smuggled); err != nil {
+				t.Fatalf("CreateTask: %v", err)
+			}
+			rec, err := repo.RecoverTask(ctx, "t1")
+			if err != nil {
+				t.Fatalf("RecoverTask: %v", err)
+			}
+			if rec.Version != 0 || rec.OwnerNode != "" || !rec.LeaseExpiresAt.IsZero() {
+				t.Fatalf("created record carries a claim: v%d %q %v; a task starts unclaimed at version 0",
+					rec.Version, rec.OwnerNode, rec.LeaseExpiresAt)
+			}
+		})
+
+		// Two nodes racing the same claim: exactly one wins each round, the
+		// other reads ErrClaimHeld.
+		t.Run("ClaimRace", func(t *testing.T) {
+			repo := open(t)
+			for round := range 10 {
+				id := fmt.Sprintf("race-%d", round)
+				seedTask(t, repo, id, "wf1")
+
+				errs := make([]error, 4)
+				var wg sync.WaitGroup
+				for i := range errs {
+					wg.Go(func() {
+						_, errs[i] = repo.ClaimTask(ctx, id, fmt.Sprintf("node-%d", i), forever)
+					})
+				}
+				wg.Wait()
+
+				winners := 0
+				for i, err := range errs {
+					switch {
+					case err == nil:
+						winners++
+					case !errors.Is(err, tasks.ErrClaimHeld):
+						t.Fatalf("round %d racer %d: err = %v, want nil or tasks.ErrClaimHeld", round, i, err)
+					}
+				}
+				if winners != 1 {
+					t.Fatalf("round %d: %d winners, want exactly 1", round, winners)
+				}
+			}
+		})
+	})
+
+	// The conditional writes: version and ownership decide whose checkpoint
+	// lands, so a usurped node's stale writes fail loud instead of clobbering
+	// the new owner's progress.
+	t.Run("ConditionalWrites", func(t *testing.T) {
+		const forever = time.Minute
+
+		t.Run("StaleVersionLoses", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			rec, err := repo.ClaimTask(ctx, "t1", "node-a", forever)
+			if err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+
+			v2, err := repo.SaveCheckpoint(ctx, "t1", rec.Version, "node-a", "running", "s1", []byte("one"))
+			if err != nil {
+				t.Fatalf("SaveCheckpoint: %v", err)
+			}
+			if v2 <= rec.Version {
+				t.Fatalf("version %d after checkpoint at %d, want a bump", v2, rec.Version)
+			}
+			if _, err := repo.SaveCheckpoint(ctx, "t1", rec.Version, "node-a", "running", "s2", []byte("two")); !errors.Is(err, tasks.ErrStale) {
+				t.Fatalf("stale SaveCheckpoint: err = %v, want tasks.ErrStale", err)
+			}
+
+			// The lost write left no trace.
+			kept, err := repo.RecoverTask(ctx, "t1")
+			if err != nil {
+				t.Fatalf("RecoverTask: %v", err)
+			}
+			if kept.State != "s1" || string(kept.Snapshot) != "one" {
+				t.Fatalf("record = %s/%s, want the winning checkpoint s1/one", kept.State, kept.Snapshot)
+			}
+		})
+
+		t.Run("NonOwnerLoses", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			rec, err := repo.ClaimTask(ctx, "t1", "node-a", forever)
+			if err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+
+			if _, err := repo.SaveCheckpoint(ctx, "t1", rec.Version, "node-b", "running", "s1", nil); !errors.Is(err, tasks.ErrStale) {
+				t.Fatalf("non-owner SaveCheckpoint: err = %v, want tasks.ErrStale", err)
+			}
+			if _, err := repo.MarkTerminal(ctx, "t1", rec.Version, "node-b", "done", nil); !errors.Is(err, tasks.ErrStale) {
+				t.Fatalf("non-owner MarkTerminal: err = %v, want tasks.ErrStale", err)
+			}
+		})
+
+		t.Run("VersionsClimbToTerminal", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			rec, err := repo.ClaimTask(ctx, "t1", "node-a", forever)
+			if err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+
+			v := rec.Version
+			for i, state := range []string{"s1", "s2"} {
+				next, err := repo.SaveCheckpoint(ctx, "t1", v, "node-a", "running", state, nil)
+				if err != nil {
+					t.Fatalf("SaveCheckpoint %d: %v", i, err)
+				}
+				if next <= v {
+					t.Fatalf("checkpoint %d: version %d after %d, want strictly climbing", i, next, v)
+				}
+				v = next
+			}
+			final, err := repo.MarkTerminal(ctx, "t1", v, "node-a", "done", []byte("out"))
+			if err != nil {
+				t.Fatalf("MarkTerminal: %v", err)
+			}
+			if final <= v {
+				t.Fatalf("terminal version %d after %d, want a bump", final, v)
+			}
+
+			// The terminal stamp cleared the claim: a finished task is
+			// nobody's to run.
+			kept, err := repo.RecoverTask(ctx, "t1")
+			if err != nil {
+				t.Fatalf("RecoverTask: %v", err)
+			}
+			if kept.OwnerNode != "" || !kept.LeaseExpiresAt.IsZero() {
+				t.Fatalf("terminal task still claimed by %q until %v", kept.OwnerNode, kept.LeaseExpiresAt)
+			}
+		})
+
+		t.Run("AnyVersionBypassesThePredicate", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			if _, err := repo.ClaimTask(ctx, "t1", "node-a", forever); err != nil {
+				t.Fatalf("ClaimTask: %v", err)
+			}
+
+			v, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "s1", nil)
+			if err != nil {
+				t.Fatalf("AnyVersion SaveCheckpoint: %v", err)
+			}
+			if v == 0 {
+				t.Fatal("AnyVersion write must still bump and report the version")
+			}
+		})
+	})
+
+	// ListClaimable is the recovery sweep's worklist: what any node may take.
+	t.Run("ListClaimable", func(t *testing.T) {
+		repo := open(t)
+		const forever = time.Minute
+		for _, id := range []string{"unclaimed", "live", "expired", "finished"} {
+			seedTask(t, repo, id, "wf1")
+		}
+		if _, err := repo.ClaimTask(ctx, "live", "node-a", forever); err != nil {
+			t.Fatalf("claim live: %v", err)
+		}
+		if _, err := repo.ClaimTask(ctx, "expired", "node-a", 10*time.Millisecond); err != nil {
+			t.Fatalf("claim expired: %v", err)
+		}
+		if _, err := repo.MarkTerminal(ctx, "finished", tasks.AnyVersion, "", "done", nil); err != nil {
+			t.Fatalf("finish finished: %v", err)
+		}
+		time.Sleep(30 * time.Millisecond)
+
+		listed, err := repo.ListClaimable(ctx)
+		if err != nil {
+			t.Fatalf("ListClaimable: %v", err)
+		}
+		ids := make([]string, 0, len(listed))
+		for _, rec := range listed {
+			ids = append(ids, rec.ID)
+		}
+		sort.Strings(ids)
+		if len(ids) != 2 || ids[0] != "expired" || ids[1] != "unclaimed" {
+			t.Fatalf("ListClaimable = %v, want [expired unclaimed]: live claims and terminal tasks are not for taking", ids)
 		}
 	})
 }

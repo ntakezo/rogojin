@@ -238,7 +238,9 @@ func (e *engine) checkpoint(ctx context.Context, status workflows.Status, state 
 	if err != nil {
 		return err
 	}
-	return e.repo.SaveCheckpoint(ctx, e.deps.TaskID, string(status), string(state), blob)
+	// AnyVersion until the manager threads real claims through the engine.
+	_, err = e.repo.SaveCheckpoint(ctx, e.deps.TaskID, AnyVersion, "", string(status), string(state), blob)
+	return err
 }
 
 // harvest captures the instance's result on clean completion via the optional
@@ -404,7 +406,7 @@ func (e *engine) finish(runErr error) error {
 	if e.repo == nil {
 		return nil
 	}
-	if err := e.repo.MarkTerminal(context.Background(), e.deps.TaskID, string(outcome), output); err != nil {
+	if _, err := e.repo.MarkTerminal(context.Background(), e.deps.TaskID, AnyVersion, "", string(outcome), output); err != nil {
 		return fmt.Errorf("mark terminal: %w", err)
 	}
 	return nil

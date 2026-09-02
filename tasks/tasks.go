@@ -60,6 +60,24 @@ var ErrDetached = errors.New("task detached from its suspended run")
 // without knowing which store they run over.
 var ErrTaskNotFound = errors.New("task not found")
 
+// ErrClaimHeld is returned by ClaimTask when another node holds a live claim
+// on the task: its lease has not expired, so the store still presumes that
+// node is running it.
+var ErrClaimHeld = errors.New("task claim held by another node")
+
+// ErrStale is returned by a conditional write that lost: the caller's version
+// is behind the store's, or the caller's node no longer owns the claim. It is
+// the signal to stop side-effecting — another writer owns the task now.
+var ErrStale = errors.New("stale task write")
+
+// AnyVersion, with an empty node, makes SaveCheckpoint and MarkTerminal
+// unconditional: the write skips the version and ownership predicate but
+// still bumps the version. It is transitional — it keeps the pre-claims
+// manager byte-identical while the port is widened underneath it — and is
+// removed by the claims-aware manager; it will not survive to adapters
+// beyond memory and sqlite.
+const AnyVersion int64 = -1
+
 // A Task is one task, whole: the durable record of its workflow, its
 // placement (task group, plus a per-kind resource assignment), its
 // last-checkpointed status and resume state with the snapshot taken there —
@@ -89,6 +107,16 @@ type Task struct {
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 
+	// Version is the record's write counter, bumped by the store on every
+	// conditional write; a writer carrying an old one fails with ErrStale.
+	// OwnerNode and LeaseExpiresAt are the claim: which node runs the task
+	// and until when the store presumes it alive. "" and the zero time mean
+	// unclaimed. All three are the store's to write — set through ClaimTask
+	// and the conditional writes, never by hand.
+	Version        int64     `json:"version,omitempty"`
+	OwnerNode      string    `json:"ownerNode,omitempty"`
+	LeaseExpiresAt time.Time `json:"leaseExpiresAt,omitzero"`
+
 	// The live run surface, attached by the Manager and absent on a bare
 	// record. input feeds a fresh run; resolved is the effective placement per
 	// kind with group inheritance applied; recovered marks a task rebuilt from
@@ -107,22 +135,55 @@ type Task struct {
 	recordMu *sync.Mutex
 }
 
-// Repository is the persistence port the consumer implements: a dumb store of
-// task records and task groups with no liveness logic (the manager infers
-// running tasks via IsRunning). Implementations must refresh the record's
-// UpdatedAt on every write, including checkpoints and terminal stamps. A nil
-// Repository is allowed and selects purely in-memory operation — see
-// NewManager.
+// Repository is the persistence port the consumer implements. The store is
+// the authority on ownership and liveness: claims decide which node runs a
+// task, leases decide for how long the store presumes it alive, and the
+// version column decides whose write wins — all against the store's own
+// clock, so node clock skew never decides ownership. Implementations must
+// refresh the record's UpdatedAt on every write, including checkpoints and
+// terminal stamps. A nil Repository is allowed and selects purely in-memory
+// operation — see NewManager.
 type Repository interface {
+	// CreateTask inserts the record unclaimed at version 0, dropping any
+	// checkpoint or claim fields smuggled in.
 	CreateTask(ctx context.Context, record Task) error
-	SaveCheckpoint(ctx context.Context, id string, status string, state string, snapshot []byte) error
-	MarkTerminal(ctx context.Context, id string, outcome string, output []byte) error
+	// ClaimTask atomically takes ownership for node: it succeeds iff the
+	// task is unclaimed, already owned by node, or its lease has expired,
+	// and returns the claimed record carrying the new version. ErrClaimHeld
+	// reports a live claim by another node. Claiming has no status
+	// predicate — the manager decides what is worth claiming, usually via
+	// ListClaimable.
+	ClaimTask(ctx context.Context, id, node string, ttl time.Duration) (Task, error)
+	// RenewClaim extends the lease iff node still owns the claim, expired
+	// or not — a late renewal that nobody usurped still wins. ErrStale
+	// reports the claim gone or another node's; it is how a paused node
+	// discovers it was usurped. Renewal moves only the lease clock and
+	// never bumps the version, so it cannot invalidate the owner's own
+	// in-flight conditional writes.
+	RenewClaim(ctx context.Context, id, node string, ttl time.Duration) error
+	// ReleaseClaim clears the claim iff node owns it, and is silently a
+	// no-op otherwise: a release racing its own usurpation is a shutdown
+	// path, not an error.
+	ReleaseClaim(ctx context.Context, id, node string) error
+	// SaveCheckpoint writes iff version matches and node owns the claim,
+	// bumps the version, and returns the new one; ErrStale reports the
+	// write lost. AnyVersion with an empty node skips the predicate
+	// (transitional — see AnyVersion).
+	SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error)
+	// MarkTerminal is SaveCheckpoint's conditionality for the terminal
+	// stamp, and additionally clears the claim: a finished task is
+	// nobody's to run.
+	MarkTerminal(ctx context.Context, id string, version int64, node, outcome string, output []byte) (int64, error)
 	RecoverTask(ctx context.Context, id string) (Task, error)
 	// SaveAssignment repoints a task's placement for one kind, leaving every
 	// other kind and the rest of the record untouched. A nil field clears the
 	// stored value.
 	SaveAssignment(ctx context.Context, id string, kind leasing.Kind, assignment Assignment) error
 	RecoverAll(ctx context.Context) ([]Task, error)
+	// ListClaimable returns the non-terminal tasks whose claim is free for
+	// the taking: unclaimed, or leased past expiry — the recovery sweep's
+	// worklist.
+	ListClaimable(ctx context.Context) ([]Task, error)
 	DeleteTask(ctx context.Context, id string) error
 	SaveGroup(ctx context.Context, group Group) error
 	// GetGroup reports the group and whether it exists, so a missing group is

@@ -137,23 +137,33 @@ func (m *memStore) CreateTask(ctx context.Context, rec Task) error {
 	return nil
 }
 
-func (m *memStore) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
+func (m *memStore) SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rec, ok := m.records[id]
 	if !ok {
-		return errors.New("not found")
+		return 0, errors.New("not found")
 	}
 	rec.Status, rec.State = status, state
 	rec.Snapshot = append([]byte(nil), snapshot...)
 	rec.UpdatedAt = time.Now().UTC()
+	rec.Version++
 	m.records[id] = rec
-	return nil
+	return rec.Version, nil
 }
 
-func (m *memStore) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
+func (m *memStore) MarkTerminal(ctx context.Context, id string, version int64, node, outcome string, output []byte) (int64, error) {
+	return 0, nil
+}
+
+func (m *memStore) ClaimTask(ctx context.Context, id, node string, ttl time.Duration) (Task, error) {
+	return Task{}, nil
+}
+func (m *memStore) RenewClaim(ctx context.Context, id, node string, ttl time.Duration) error {
 	return nil
 }
+func (m *memStore) ReleaseClaim(ctx context.Context, id, node string) error { return nil }
+func (m *memStore) ListClaimable(ctx context.Context) ([]Task, error)       { return nil, nil }
 
 // SaveAssignment writes one kind and copies the rest, the same per-kind
 // isolation the SQLite store gets from json_set.
@@ -1160,7 +1170,7 @@ func TestPinIsDurablePlacementThroughRecovery(t *testing.T) {
 	}
 
 	// Both pins survive the trip through the store.
-	if err := store.SaveCheckpoint(ctx, task.ID, "running", "s1", nil); err != nil {
+	if _, err := store.SaveCheckpoint(ctx, task.ID, AnyVersion, "", "running", "s1", nil); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 	recovered, err := svc.RecoverTask(ctx, task.ID)
@@ -1247,7 +1257,7 @@ func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 	// The live handle keeps the placement it was wired with; the move lands on
 	// the next recovery.
 	assertPlacement(t, task, proxyKind, "residential", "")
-	if err := store.SaveCheckpoint(ctx, task.ID, "running", "s1", nil); err != nil {
+	if _, err := store.SaveCheckpoint(ctx, task.ID, AnyVersion, "", "running", "s1", nil); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 	recovered, err := svc.RecoverTask(ctx, task.ID)
@@ -1284,7 +1294,7 @@ func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 		t.Fatalf("AssignResource: %v", err)
 	}
 
-	if err := store.SaveCheckpoint(ctx, task.ID, "running", "s1", nil); err != nil {
+	if _, err := store.SaveCheckpoint(ctx, task.ID, AnyVersion, "", "running", "s1", nil); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 	recovered, err := svc.RecoverTask(ctx, task.ID)

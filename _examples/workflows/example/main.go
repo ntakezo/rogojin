@@ -287,9 +287,9 @@ func (l logProxyStats) Save(ctx context.Context, p proxies.Proxy) error {
 // into the store.
 type logCheckpoints struct{ tasks.Repository }
 
-func (l logCheckpoints) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
+func (l logCheckpoints) SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error) {
 	fmt.Printf("  checkpoint %-16s [%s] snapshot=%s\n", state, status, snapshot)
-	return l.Repository.SaveCheckpoint(ctx, id, status, state, snapshot)
+	return l.Repository.SaveCheckpoint(ctx, id, version, node, status, state, snapshot)
 }
 
 // profileFields marshals this workflow's account shape into the opaque JSON the
