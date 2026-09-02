@@ -50,7 +50,7 @@ func newEngine(workflow workflows.Workflow, deps workflows.Deps, repo Repository
 }
 
 // Execute builds a fresh instance and runs it until completion or error.
-// It is a no-op if the engine has already started.
+// It refuses with ErrAlreadyStarted if the engine has already started.
 func (e *engine) Execute(ctx context.Context, input any) error {
 	instance, err := e.workflow.NewInstance(input, e.deps)
 	if err != nil {
@@ -61,7 +61,8 @@ func (e *engine) Execute(ctx context.Context, input any) error {
 
 // Rehydrate rebuilds an instance from a snapshot and runs it from start. With
 // suspended set it parks before start instead, honoring a persisted suspend
-// until Resume or Kill. It is a no-op if the engine has already started.
+// until Resume or Kill. It refuses with ErrAlreadyStarted if the engine has
+// already started.
 func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows.State, suspended bool) error {
 	pw, ok := e.workflow.(workflows.PersistableWorkflow)
 	if !ok {
@@ -92,7 +93,10 @@ func (e *engine) run(ctx context.Context, instance workflows.Instance, start *wo
 		if killed {
 			return context.Canceled
 		}
-		return nil
+		// Some Start already owns this engine — running, finished, or detached.
+		// Refusing loudly keeps a double dispatch from reading as an instant
+		// clean completion.
+		return ErrAlreadyStarted
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel

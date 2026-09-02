@@ -468,9 +468,11 @@ func TestRehydrateNonPersistableWorkflowErrors(t *testing.T) {
 	}
 }
 
-// TestRehydrateIsNoOpOnceStarted verifies an engine that already ran cannot be
-// rehydrated again, mirroring Execute's started-guard.
-func TestRehydrateIsNoOpOnceStarted(t *testing.T) {
+// TestRehydrateRefusesOnceStarted verifies an engine that already ran cannot be
+// rehydrated again, mirroring Execute's started-guard: the refusal names
+// ErrAlreadyStarted rather than reading as a clean completion, and re-runs
+// nothing.
+func TestRehydrateRefusesOnceStarted(t *testing.T) {
 	var log []workflows.State
 	store := &fakeStore{}
 	engine := newEngine(&testWorkflow{log: &log}, workflows.Deps{TaskID: "task-1"}, store)
@@ -480,8 +482,8 @@ func TestRehydrateIsNoOpOnceStarted(t *testing.T) {
 	}
 	before := len(log)
 
-	if err := engine.Rehydrate(context.Background(), store.snapshotFor(s2), s2, false); err != nil {
-		t.Fatalf("Rehydrate after completion: %v", err)
+	if err := engine.Rehydrate(context.Background(), store.snapshotFor(s2), s2, false); !errors.Is(err, ErrAlreadyStarted) {
+		t.Fatalf("Rehydrate after completion = %v, want ErrAlreadyStarted", err)
 	}
 	if len(log) != before {
 		t.Fatalf("Rehydrate re-ran states on a finished engine: %v", log)
