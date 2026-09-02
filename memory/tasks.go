@@ -126,9 +126,8 @@ func (s *Tasks) ReleaseClaim(ctx context.Context, id, node string) error {
 
 // SaveCheckpoint overwrites the task's last-checkpointed status, state, and
 // snapshot iff version matches and node owns the claim, bumping and
-// returning the version; ErrStale reports the write lost. tasks.AnyVersion
-// with an empty node skips the predicate. It fails with tasks.ErrTaskNotFound
-// if no record exists.
+// returning the version; ErrStale reports the write lost. It fails with
+// tasks.ErrTaskNotFound if no record exists.
 func (s *Tasks) SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -149,9 +148,6 @@ func (s *Tasks) SaveCheckpoint(ctx context.Context, id string, version int64, no
 // writeAllowed applies the conditional-write predicate shared by
 // SaveCheckpoint and MarkTerminal.
 func writeAllowed(rec tasks.Task, version int64, node string) error {
-	if version == tasks.AnyVersion && node == "" {
-		return nil
-	}
 	if rec.Version != version || rec.OwnerNode != node {
 		return tasks.ErrStale
 	}

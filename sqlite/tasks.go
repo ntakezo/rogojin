@@ -213,10 +213,9 @@ func (s *Tasks) ReleaseClaim(ctx context.Context, id, node string) error {
 
 // SaveCheckpoint overwrites the task's last-checkpointed status, state, and
 // snapshot iff version matches and node owns the claim, bumping and
-// returning the version; ErrStale reports the write lost. tasks.AnyVersion
-// with an empty node skips the predicate. It fails with ErrTaskNotFound if
-// no record exists: a checkpoint that lands nowhere must not report
-// durability the store does not have.
+// returning the version; ErrStale reports the write lost. It fails with
+// ErrTaskNotFound if no record exists: a checkpoint that lands nowhere must
+// not report durability the store does not have.
 func (s *Tasks) SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error) {
 	return s.conditionalWrite(ctx, "save checkpoint", id, version, node,
 		`status = ?, state = ?, snapshot = ?`, status, state, snapshot)
@@ -266,20 +265,15 @@ func (s *Tasks) MarkTerminal(ctx context.Context, id string, version int64, node
 		`status = ?, output = ?, owner_node = '', lease_expires_at = 0`, outcome, output)
 }
 
-// conditionalWrite runs one guarded UPDATE — the version and ownership
-// predicate appended unless the caller passed tasks.AnyVersion with an empty
-// node — bumping the version and returning it via RETURNING, so the write
-// and the version read are one statement even with another process on the
-// file. A write that matched no row is ErrStale if the record exists and
+// conditionalWrite runs one guarded UPDATE — version and ownership in the
+// predicate — bumping the version and returning it via RETURNING, so the
+// write and the version read are one statement even with another process on
+// the file. A write that matched no row is ErrStale if the record exists and
 // ErrTaskNotFound if it does not.
 func (s *Tasks) conditionalWrite(ctx context.Context, op, id string, version int64, node, sets string, args ...any) (int64, error) {
-	query := `UPDATE tasks SET ` + sets + `, version = version + 1, updated_at = ? WHERE id = ?`
-	args = append(args, formatTime(time.Now().UTC()), id)
-	if version != tasks.AnyVersion || node != "" {
-		query += ` AND version = ? AND owner_node = ?`
-		args = append(args, version, node)
-	}
-	query += ` RETURNING version`
+	query := `UPDATE tasks SET ` + sets + `, version = version + 1, updated_at = ?
+	 WHERE id = ? AND version = ? AND owner_node = ? RETURNING version`
+	args = append(args, formatTime(time.Now().UTC()), id, version, node)
 
 	var v int64
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(&v)

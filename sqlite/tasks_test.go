@@ -46,7 +46,11 @@ func TestTasksPersistsAcrossReopen(t *testing.T) {
 	if err := repo.CreateTask(ctx, rec); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "suspended", "wait", []byte("snap")); err != nil {
+	claimedRec, err := repo.ClaimTask(ctx, "t1", "node-a", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	if _, err := repo.SaveCheckpoint(ctx, "t1", claimedRec.Version, "node-a", "suspended", "wait", []byte("snap")); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 	repoDB.Close()
