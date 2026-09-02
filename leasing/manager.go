@@ -75,10 +75,54 @@ func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], o
 	}
 	m.cond = sync.NewCond(&m.mu)
 
-	listedGroups, err := repo.ListGroups(ctx)
+	// A task the store shows locked to several resources — two nodes' blind
+	// writes of an earlier era, or a crash between a release and its retry —
+	// is repaired rather than refused: the store is the authority, and the
+	// oldest lock is the one some run has been working against the longest,
+	// so the newer ones are released and the load re-reads what remains. The
+	// bound is for a store being written under the load; repair converging is
+	// the normal case in one pass.
+	for attempt := 0; ; attempt++ {
+		repairs, err := m.load(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(repairs) == 0 {
+			break
+		}
+		if attempt == 2 {
+			return nil, fmt.Errorf("lock repair did not converge; the store is being written during load")
+		}
+		for _, r := range repairs {
+			if err := repo.ReleaseLock(ctx, r.resourceID, r.taskID); err != nil {
+				return nil, fmt.Errorf("release duplicate lock on %s: %w", r.resourceID, err)
+			}
+		}
+	}
+	return m, nil
+}
+
+// A lockRepair names one duplicate lock load found: the newer of a task's
+// several bound resources, to be released.
+type lockRepair struct {
+	resourceID, taskID string
+}
+
+// load rebuilds the manager's caches — groups, strategies, pool, order,
+// bindings — from the store, persisting the global group if absent. A group
+// whose strategy is unchanged keeps its strategy instance, so a reload does
+// not reset rotation state. A task locked to several resources keeps its
+// oldest lock (earliest UpdatedAt, ties to the smaller id) in the bindings
+// cache; the others are returned for the caller to release. Callers hold
+// m.mu or are the constructor.
+func (m *Manager[R, P]) load(ctx context.Context) ([]lockRepair, error) {
+	listedGroups, err := m.repo.ListGroups(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load groups: %w", err)
 	}
+	kept := m.strategies
+	m.groups = make(map[string]Group, len(listedGroups))
+	m.strategies = make(map[string]Selection[R], len(listedGroups))
 	for _, g := range listedGroups {
 		if _, dup := m.groups[g.ID]; dup {
 			return nil, fmt.Errorf("duplicate group id %s", g.ID)
@@ -86,11 +130,14 @@ func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], o
 		if err := m.adoptGroup(g); err != nil {
 			return nil, err
 		}
+		if prior, ok := kept[g.ID]; ok {
+			m.strategies[g.ID] = prior
+		}
 	}
 	if _, ok := m.groups[GlobalGroup]; !ok {
 		now := time.Now().UTC()
 		g := Group{ID: GlobalGroup, Strategy: StrategyRoundRobin, CreatedAt: now, UpdatedAt: now}
-		if err := repo.SaveGroup(ctx, g); err != nil {
+		if err := m.repo.SaveGroup(ctx, g); err != nil {
 			return nil, fmt.Errorf("persist global group: %w", err)
 		}
 		if err := m.adoptGroup(g); err != nil {
@@ -98,10 +145,14 @@ func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], o
 		}
 	}
 
-	listed, err := repo.List(ctx)
+	listed, err := m.repo.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load pool: %w", err)
 	}
+	m.pool = make(map[string]R, len(listed))
+	m.order = m.order[:0]
+	m.bindings = make(map[string]string)
+	var repairs []lockRepair
 	for _, p := range listed {
 		c := m.core(&p)
 		if _, dup := m.pool[c.ID]; dup {
@@ -118,14 +169,32 @@ func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], o
 		}
 		m.pool[c.ID] = p
 		m.order = append(m.order, c.ID)
-		if c.OwnerID != "" {
-			if prior, bound := m.bindings[c.OwnerID]; bound {
-				return nil, fmt.Errorf("task %s locked to multiple resources (%s, %s)", c.OwnerID, prior, c.ID)
-			}
+		if c.OwnerID == "" {
+			continue
+		}
+		prior, bound := m.bindings[c.OwnerID]
+		if !bound {
+			m.bindings[c.OwnerID] = c.ID
+			continue
+		}
+		held := m.pool[prior]
+		if older(m.core(&held), c) {
+			repairs = append(repairs, lockRepair{resourceID: c.ID, taskID: c.OwnerID})
+		} else {
+			repairs = append(repairs, lockRepair{resourceID: prior, taskID: c.OwnerID})
 			m.bindings[c.OwnerID] = c.ID
 		}
 	}
-	return m, nil
+	return repairs, nil
+}
+
+// older reports whether a's lock predates b's: earlier UpdatedAt, ties to
+// the smaller resource id so both nodes repair the same way.
+func older(a, b *Resource) bool {
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		return a.UpdatedAt.Before(b.UpdatedAt)
+	}
+	return a.ID < b.ID
 }
 
 // core is the leasing record embedded in r: the fields this package reads and
