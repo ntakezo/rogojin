@@ -33,12 +33,16 @@ type DB struct {
 	db *sql.DB
 }
 
-// connSettings is what every connection opens with. WAL and the busy timeout
-// are what let a second handle on the file — another process, or a test —
-// queue behind a writer instead of failing with "database is locked", and
-// immediate transactions take the write lock at BEGIN, so two transactions
-// cannot both read a state and then fight over who writes it.
-const connSettings = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_foreign_keys=1&_txlock=immediate"
+// connSettings is what every connection opens with. The busy timeout is what
+// lets a second handle on the file — another process, or a test — queue
+// behind a writer instead of failing with "database is locked", and immediate
+// transactions take the write lock at BEGIN, so two transactions cannot both
+// read a state and then fight over who writes it. The journal mode is
+// deliberately not here: it is switched to WAL by Open, as an ordinary
+// statement under the already-live busy timeout, because two processes
+// creating the same fresh file race the WAL upgrade lock — an upgrade folded
+// into connection setup can meet that race before the timeout protects it.
+const connSettings = "_busy_timeout=5000&_synchronous=NORMAL&_foreign_keys=1&_txlock=immediate"
 
 // withSettings appends connSettings to dsn, after any parameters the caller
 // already carries.
@@ -51,15 +55,22 @@ func withSettings(dsn string) string {
 }
 
 // Open opens (creating if absent) the database at dsn. It holds a single
-// connection, so writes from one process queue in order, and opens in WAL
-// mode with a busy timeout, so a second process on the same file waits its
-// turn instead of erroring.
+// connection, so writes from one process queue in order, and switches the
+// file to WAL mode under a busy timeout, so a second process on the same
+// file waits its turn instead of erroring.
 func Open(dsn string) (*DB, error) {
 	db, err := sql.Open("sqlite3", withSettings(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	// WAL is a property of the file, not the connection, so this runs once
+	// per open rather than per connection; the busy timeout from the DSN is
+	// live by now, which is what lets two processes race the switch safely.
+	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("switch to WAL: %w", err)
+	}
 	return &DB{db: db}, nil
 }
 
