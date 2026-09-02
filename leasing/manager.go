@@ -371,8 +371,12 @@ func (m *Manager[R, P]) DeleteGroup(ctx context.Context, id string) (unbound []s
 		return nil, fmt.Errorf("delete group %s: %w", id, ErrGroupNotFound)
 	}
 	members := m.members(id)
+	held, err := m.storeHolders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("delete group %s: %w", id, err)
+	}
 	for _, resourceID := range members {
-		if holders := m.holderIDs(resourceID); len(holders) > 0 {
+		if holders := held[resourceID]; len(holders) > 0 {
 			return nil, fmt.Errorf("%w: %s is held by %s", ErrGroupInUse, resourceID, plural("task", holders))
 		}
 	}
@@ -795,11 +799,13 @@ func (m *Manager[R, P]) List() []R {
 	return out
 }
 
-// Held reports the assignment of every live lease — in acquire or lock mode —
-// whose record and group satisfy pred. It is one of the two facts this
-// package owns, offered raw: the predicate brings the meaning (which field of
-// the model, which ref), the manager brings who holds what. Results are sorted
-// by task then resource so refusals built on them read stably.
+// Held reports the assignment of every live lease this process holds — in
+// acquire or lock mode — whose record and group satisfy pred. The predicate
+// brings the meaning (which field of the model, which ref), the manager
+// brings who holds what. It reads the local cache, not the store: it is the
+// view of this manager's own leases, which is what its in-process callers
+// guard with; cross-node liveness is the deletion guards' concern. Results
+// are sorted by task then resource so refusals built on them read stably.
 func (m *Manager[R, P]) Held(pred func(R, Group) bool) []Assignment {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -913,15 +919,28 @@ func (m *Manager[R, P]) heldCount(resourceID string) int {
 	return n
 }
 
-// holderIDs lists the tasks holding a live lease on the resource, sorted so
-// refusals read stably. Callers hold m.mu.
-func (m *Manager[R, P]) holderIDs(resourceID string) []string {
-	ids := make([]string, 0, len(m.holders[resourceID]))
-	for taskID := range m.holders[resourceID] {
-		ids = append(ids, taskID)
+// storeHolders reads every unexpired hold from the store and groups the
+// holding tasks by resource, sorted so refusals read stably. Deletion guards
+// consult it, not the local holders cache, because the lease blocking a
+// delete may be held through another node's manager. Expiry is filtered on
+// this process's clock — close enough for a guard, whose answer a moment of
+// skew can only make more conservative. Callers hold m.mu.
+func (m *Manager[R, P]) storeHolders(ctx context.Context) (map[string][]string, error) {
+	holds, err := m.repo.ListHolds(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list holds: %w", err)
 	}
-	sort.Strings(ids)
-	return ids
+	now := time.Now()
+	held := make(map[string][]string)
+	for _, h := range holds {
+		if h.ExpiresAt.After(now) {
+			held[h.ResourceID] = append(held[h.ResourceID], h.TaskID)
+		}
+	}
+	for _, ids := range held {
+		sort.Strings(ids)
+	}
+	return held, nil
 }
 
 // eligible collects the assignment's acquirable candidates from the caches:
@@ -984,16 +1003,50 @@ func zero[R any]() R {
 }
 
 // Unlock removes taskID's durable lock, returning its resource to the rotating
-// pool. It is a no-op if taskID has no locked resource.
+// pool. It is a no-op if taskID has no locked resource. A miss in the local
+// bindings is checked against the store before it counts: the lock may have
+// been taken through another node's manager, and freeing a deleted task's
+// resources is exactly the moment that matters.
 func (m *Manager[R, P]) Unlock(ctx context.Context, taskID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	id, bound := m.bindings[taskID]
 	if !bound {
-		return nil
+		var err error
+		if id, bound, err = m.storedBinding(ctx, taskID); err != nil {
+			return err
+		}
+		if !bound {
+			return nil
+		}
 	}
 	return m.unlock(ctx, taskID, id)
+}
+
+// storedBinding scans the store for a resource locked to the task — the
+// cross-node fallback for a bindings-cache miss. Callers hold m.mu.
+func (m *Manager[R, P]) storedBinding(ctx context.Context, taskID string) (string, bool, error) {
+	rec, bound, err := m.storedBindingRecord(ctx, taskID)
+	if err != nil || !bound {
+		return "", bound, err
+	}
+	return m.core(&rec).ID, true, nil
+}
+
+// storedBindingRecord is storedBinding returning the whole record, for the
+// callers that need to evaluate the lock, not just name it.
+func (m *Manager[R, P]) storedBindingRecord(ctx context.Context, taskID string) (R, bool, error) {
+	listed, err := m.repo.List(ctx)
+	if err != nil {
+		return zero[R](), false, fmt.Errorf("find lock of task %s: %w", taskID, err)
+	}
+	for _, p := range listed {
+		if m.core(&p).OwnerID == taskID {
+			return p, true, nil
+		}
+	}
+	return zero[R](), false, nil
 }
 
 // ReleaseStaleLock drops a.TaskID's durable lock when its new placement no
@@ -1016,7 +1069,16 @@ func (m *Manager[R, P]) ReleaseStaleLock(ctx context.Context, a Assignment) erro
 
 	id, bound := m.bindings[a.TaskID]
 	if !bound {
-		return nil
+		// The lock may have been taken through another node's manager;
+		// evaluate the stored record the same way the cached one would be.
+		locked, stored, err := m.storedBindingRecord(ctx, a.TaskID)
+		if err != nil {
+			return err
+		}
+		if !stored || fits(a, m.core(&locked)) {
+			return nil
+		}
+		return m.unlock(ctx, a.TaskID, m.core(&locked).ID)
 	}
 	if locked, live := m.pool[id]; live && fits(a, m.core(&locked)) {
 		return nil
@@ -1063,14 +1125,18 @@ func (m *Manager[R, P]) Delete(ctx context.Context, id string) (unbound []string
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	held, err := m.storeHolders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("delete resource %s: %w", id, err)
+	}
+	if holders := held[id]; len(holders) > 0 {
+		return nil, fmt.Errorf("%w: %s is held by %s", ErrResourceInUse, id, plural("task", holders))
+	}
 	p, ok := m.pool[id]
 	if !ok {
-		// Nothing live to guard, but the store may still carry a row this
-		// manager never loaded.
+		// Nothing cached to guard, but the store may still carry a row this
+		// manager never loaded; its holds were checked above like any other's.
 		return nil, m.repo.Delete(ctx, id)
-	}
-	if holders := m.holderIDs(id); len(holders) > 0 {
-		return nil, fmt.Errorf("%w: %s is held by %s", ErrResourceInUse, id, plural("task", holders))
 	}
 
 	// The row goes before the binding: an aborted remove must leave the live
