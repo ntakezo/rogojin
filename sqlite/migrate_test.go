@@ -4,13 +4,14 @@ import (
 	"database/sql"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 // openRawDB opens a fresh temp-file database on a bare *sql.DB, with the
-// single-connection setting Open uses, so tests exercise migrations the way production does.
+// connection settings Open uses, so tests exercise migrations the way production does.
 func openRawDB(t *testing.T) *sql.DB {
 	t.Helper()
 	return openRawAt(t, filepath.Join(t.TempDir(), "m.db"))
@@ -20,7 +21,7 @@ func openRawDB(t *testing.T) *sql.DB {
 // close and reopen the same one.
 func openRawAt(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open("sqlite3", withSettings(dsn))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -139,9 +140,10 @@ func TestRunResumesFromPartialHistory(t *testing.T) {
 	}
 }
 
-// TestRunRollsBackFailedmigration verifies a failing migration leaves the ledger
-// unchanged and its effects rolled back, so a botched step can be fixed and
-// retried from a clean point instead of leaving a half-applied schema.
+// TestRunRollsBackFailedmigration verifies a failing migration rolls back the
+// whole sweep — its own effects and every step applied before it in the same
+// call — so a botched upgrade leaves the file at the last release's schema
+// instead of partway between two.
 func TestRunRollsBackFailedmigration(t *testing.T) {
 	db := openRawDB(t)
 	steps := []migration{
@@ -151,9 +153,53 @@ func TestRunRollsBackFailedmigration(t *testing.T) {
 	if err := migrate(db, "main", steps); err == nil {
 		t.Fatal("Run: want error from duplicate table, got nil")
 	}
-	// The first migration committed at version 1; the failed second did not record.
+	// On a fresh database the rollback takes everything with it — the ledger
+	// included — so the file looks never opened.
+	var tables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
+		t.Fatalf("count tables: %v", err)
+	}
+	if tables != 0 {
+		t.Fatalf("tables = %d, want none left by a failed sweep", tables)
+	}
+
+	// A sweep whose steps all succeed still lands whole.
+	if err := migrate(db, "main", steps[:1]); err != nil {
+		t.Fatalf("Run after the fix: %v", err)
+	}
 	if got := recorded(t, db, "main"); got != 1 {
-		t.Fatalf("recorded = %d, want 1 (a failed step must not record)", got)
+		t.Fatalf("recorded = %d, want 1", got)
+	}
+}
+
+// TestConcurrentOpensMigrateOnce verifies two handles on one file racing the
+// same migration list serialize instead of colliding: exactly one applies each
+// step, the other finds it recorded, and both return clean — the rolling-deploy
+// case, where two processes open the database at the same moment.
+func TestConcurrentOpensMigrateOnce(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "m.db")
+	handles := []*sql.DB{openRawAt(t, dsn), openRawAt(t, dsn)}
+
+	errs := make([]error, len(handles))
+	var wg sync.WaitGroup
+	for i, db := range handles {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = migrate(db, "main", twoSteps)
+		}()
+	}
+	wg.Wait()
+
+	// Both racers return clean; a loser that re-ran the ALTER would have
+	// surfaced "duplicate column" here.
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("racer %d: %v", i, err)
+		}
+	}
+	if got := recorded(t, handles[0], "main"); got != 2 {
+		t.Fatalf("recorded = %d, want 2", got)
 	}
 }
 

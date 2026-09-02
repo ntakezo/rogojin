@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -32,12 +33,29 @@ type DB struct {
 	db *sql.DB
 }
 
+// connSettings is what every connection opens with. WAL and the busy timeout
+// are what let a second handle on the file — another process, or a test —
+// queue behind a writer instead of failing with "database is locked", and
+// immediate transactions take the write lock at BEGIN, so two transactions
+// cannot both read a state and then fight over who writes it.
+const connSettings = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_foreign_keys=1&_txlock=immediate"
+
+// withSettings appends connSettings to dsn, after any parameters the caller
+// already carries.
+func withSettings(dsn string) string {
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + connSettings
+}
+
 // Open opens (creating if absent) the database at dsn. It holds a single
-// connection: SQLite serializes writes per file, and one connection is what
-// keeps concurrent saves, checkpoints, and lock writes from meeting
-// "database is locked" instead of queueing.
+// connection, so writes from one process queue in order, and opens in WAL
+// mode with a busy timeout, so a second process on the same file waits its
+// turn instead of erroring.
 func Open(dsn string) (*DB, error) {
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open("sqlite3", withSettings(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}

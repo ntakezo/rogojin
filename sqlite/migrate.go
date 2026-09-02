@@ -32,9 +32,17 @@ const ledger = `CREATE TABLE IF NOT EXISTS schema_migrations (
 )`
 
 // migrate applies every migration of store not yet recorded in the ledger,
-// in order, each in its own transaction. It is safe to call on every open:
+// in order, all inside one transaction. It is safe to call on every open:
 // already applied steps are skipped, so a database on the current schema is
 // untouched.
+//
+// The transaction begins immediate (see connSettings), so reading the
+// recorded history and applying what is missing is one atomic step: two
+// processes opening the same file concurrently serialize at BEGIN, and the
+// loser finds the winner's rows recorded instead of re-running its steps
+// into "duplicate column" errors. It also makes an upgrade all-or-nothing —
+// a failing step rolls back every step of the sweep, leaving the file at
+// the last release's schema rather than partway between two.
 //
 // store names the caller's migration list ("tasks", "proxies"). It is
 // recorded with every row and is the only thing separating one store's
@@ -48,14 +56,21 @@ func migrate(db *sql.DB, store string, migrations []migration) error {
 	if store == "" {
 		return errors.New("sqlite: store name is required")
 	}
-	if err := rejectPreLedger(db); err != nil {
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("sqlite: begin migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := rejectPreLedger(tx); err != nil {
 		return err
 	}
-	if _, err := db.Exec(ledger); err != nil {
+	if _, err := tx.Exec(ledger); err != nil {
 		return fmt.Errorf("sqlite: create ledger: %w", err)
 	}
 
-	current, err := applied(db, store)
+	current, err := applied(tx, store)
 	if err != nil {
 		return err
 	}
@@ -64,11 +79,19 @@ func migrate(db *sql.DB, store string, migrations []migration) error {
 	}
 	for i := current; i < len(migrations); i++ {
 		version := i + 1
-		if err := apply(db, store, migrations[i], version); err != nil {
+		if err := apply(tx, store, migrations[i], version); err != nil {
 			return fmt.Errorf("sqlite: %s migration %d (%s): %w", store, version, migrations[i].Name, err)
 		}
 	}
-	return nil
+	return tx.Commit()
+}
+
+// querier is the read surface shared by sql.DB and sql.Tx, so the history
+// helpers serve the migration transaction and a caller inspecting a database
+// outside one alike.
+type querier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
 }
 
 // rejectPreLedger refuses a database whose file-header counter is set. Before
@@ -78,7 +101,7 @@ func migrate(db *sql.DB, store string, migrations []migration) error {
 // only ways to quietly mismatch it. Nothing under the ledger scheme ever sets
 // the counter, so a nonzero value can only mean a pre-ledger file, and the
 // honest response is to stop before writing anything and ask for a fresh one.
-func rejectPreLedger(db *sql.DB) error {
+func rejectPreLedger(db querier) error {
 	var v int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("sqlite: read user_version: %w", err)
@@ -94,7 +117,7 @@ func rejectPreLedger(db *sql.DB) error {
 // list — 1, 2, 3 — so a missing one in the middle means the ledger was edited
 // or a step was undone by hand, and resuming from the count would skip whatever
 // is missing forever.
-func applied(db *sql.DB, store string) (int, error) {
+func applied(db querier, store string) (int, error) {
 	rows, err := db.Query(`SELECT version FROM schema_migrations WHERE store = ? ORDER BY version`, store)
 	if err != nil {
 		return 0, fmt.Errorf("sqlite: read %s history: %w", store, err)
@@ -118,24 +141,15 @@ func applied(db *sql.DB, store string) (int, error) {
 	return count, nil
 }
 
-// apply runs one migration and records it in the same transaction, so a step
-// that fails leaves neither its effects nor its ledger row behind.
-func apply(db *sql.DB, store string, m migration, version int) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
+// apply runs one migration and records it, inside the sweep's transaction.
+func apply(tx *sql.Tx, store string, m migration, version int) error {
 	if _, err := tx.Exec(m.SQL); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
+	_, err := tx.Exec(
 		`INSERT INTO schema_migrations (store, version, name, applied_at) VALUES (?, ?, ?, ?)`,
-		store, version, m.Name, now()); err != nil {
-		return err
-	}
-	return tx.Commit()
+		store, version, m.Name, now())
+	return err
 }
 
 // now stamps ledger rows the way the stores stamp their own timestamps.
