@@ -13,8 +13,10 @@
 //	--no-accounts   omit per-task site-account locking
 //	--no-payments   omit per-task payment-instrument leasing
 //	--no-email      omit inbox listening
-//	--repo          sqlite (default) persists everything; memory runs the
-//	                managers on nil repositories, nothing surviving the process
+//	--repo          sqlite (default) persists to a file; postgres persists to
+//	                a server, which is what several processes share; memory
+//	                runs the managers on nil repositories, nothing surviving
+//	                the process
 package main
 
 import (
@@ -54,7 +56,7 @@ func runNew(args []string) error {
 	noAccounts := fs.Bool("no-accounts", false, "omit per-task site-account locking")
 	noPayments := fs.Bool("no-payments", false, "omit per-task payment-instrument leasing")
 	noEmail := fs.Bool("no-email", false, "omit inbox listening")
-	repo := fs.String("repo", "sqlite", "repository behind the managers: sqlite or memory")
+	repo := fs.String("repo", "sqlite", "repository behind the managers: sqlite, postgres, or memory")
 
 	// Pull the workflow name out of the args so flags may appear on either side
 	// of it: the flag package stops at the first non-flag, and splitName knows
@@ -67,16 +69,6 @@ func runNew(args []string) error {
 		return fmt.Errorf("usage: rogojin new <name> [flags]")
 	}
 
-	var persist bool
-	switch *repo {
-	case "sqlite":
-		persist = true
-	case "memory":
-		persist = false
-	default:
-		return fmt.Errorf("unknown repository %q: --repo takes sqlite or memory", *repo)
-	}
-
 	opts := scaffold.Options{
 		Name:     name,
 		Package:  scaffold.PackageName(name),
@@ -85,7 +77,7 @@ func runNew(args []string) error {
 		Accounts: !*noAccounts,
 		Payments: !*noPayments,
 		Email:    !*noEmail,
-		Persist:  persist,
+		Repo:     *repo,
 	}
 
 	cwd, err := os.Getwd()
@@ -143,7 +135,9 @@ Flags:
   --no-accounts   omit per-task site-account locking
   --no-payments   omit per-task payment-instrument leasing
   --no-email      omit inbox listening
-  --repo          sqlite (default) persists everything; memory runs the
-                  managers on nil repositories, nothing surviving the process
+  --repo          sqlite (default) persists to a file; postgres persists to
+                  a server, which is what several processes share; memory
+                  runs the managers on nil repositories, nothing surviving
+                  the process
 `)
 }
