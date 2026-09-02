@@ -112,7 +112,10 @@ type Manager struct {
 // removing an email: which tasks hold a live lease on — and which merely
 // durably lock — an account forwarding to it. accounts.NewManager installs
 // this when handed the email manager; consumers never call it. Without a
-// guard, Delete checks only active subscriptions.
+// guard, Delete checks only active subscriptions. The guard reads the
+// installing manager's process-local view: a lease held through another
+// node's account manager is not consulted, so fleet deployments delete
+// emails from the node whose accounts reference them.
 func (m *Manager) GuardDeletes(guard func(emailID string) (held, locked []string)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
