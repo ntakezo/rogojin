@@ -29,43 +29,27 @@ func NewProxies(db *DB) (proxies.Repository, error) {
 var proxyMigrations = []migration{
 	{
 		Name: "create proxies table",
-		SQL: `CREATE TABLE IF NOT EXISTS proxies (
-			id        TEXT PRIMARY KEY,
-			url       TEXT NOT NULL DEFAULT '',
-			owner_id  TEXT NOT NULL DEFAULT '',
-			successes INTEGER NOT NULL DEFAULT 0,
-			failures  INTEGER NOT NULL DEFAULT 0
-		)`,
-	},
-	{
-		Name: "add group_id column placing existing proxies in the global group",
-		SQL:  `ALTER TABLE proxies ADD COLUMN group_id TEXT NOT NULL DEFAULT 'global'`,
-	},
-	{
-		Name: "add max_holders column for per-proxy holder policies",
-		SQL:  `ALTER TABLE proxies ADD COLUMN max_holders INTEGER NOT NULL DEFAULT 0`,
-	},
-	{
-		Name: "add created_at column to proxies",
-		SQL:  `ALTER TABLE proxies ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "add updated_at column to proxies",
-		SQL:  `ALTER TABLE proxies ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "create proxy_groups table",
-		SQL: `CREATE TABLE IF NOT EXISTS proxy_groups (
+		SQL: `CREATE TABLE proxies (
 			id          TEXT PRIMARY KEY,
-			strategy    TEXT NOT NULL DEFAULT '',
+			url         TEXT NOT NULL DEFAULT '',
+			group_id    TEXT NOT NULL DEFAULT 'global',
+			owner_id    TEXT NOT NULL DEFAULT '',
 			max_holders INTEGER NOT NULL DEFAULT 0,
+			successes   INTEGER NOT NULL DEFAULT 0,
+			failures    INTEGER NOT NULL DEFAULT 0,
 			created_at  TEXT NOT NULL DEFAULT '',
 			updated_at  TEXT NOT NULL DEFAULT ''
 		)`,
 	},
 	{
-		Name: "add refs column to proxy_groups",
-		SQL:  `ALTER TABLE proxy_groups ADD COLUMN refs TEXT NOT NULL DEFAULT ''`,
+		Name: "create proxy_groups table",
+		SQL: `CREATE TABLE proxy_groups (
+			id         TEXT PRIMARY KEY,
+			strategy   TEXT NOT NULL DEFAULT '',
+			refs       TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL DEFAULT ''
+		)`,
 	},
 }
 
@@ -129,9 +113,7 @@ func (s *Proxies) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListGroups returns every stored proxy group in stable id order. The
-// max_holders column is legacy — holder policy lives on the proxy — and is
-// left unread.
+// ListGroups returns every stored proxy group in stable id order.
 func (s *Proxies) ListGroups(ctx context.Context) ([]proxies.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, strategy, refs, created_at, updated_at FROM proxy_groups ORDER BY id`)

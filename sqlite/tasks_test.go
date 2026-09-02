@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -253,66 +252,6 @@ func TestTasksPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// TestTasksMigratesLegacyDatabaseAddingOutput verifies opening a pre-output database
-// (the original tasks schema, with no output column and no recorded version)
-// migrates it in place: the output column is added and existing task rows survive
-// untouched, because a version upgrade must never drop a consumer's durable tasks.
-func TestTasksMigratesLegacyDatabaseAddingOutput(t *testing.T) {
-	ctx := context.Background()
-	dsn := filepath.Join(t.TempDir(), "legacy.db")
-
-	// Hand-build the old schema (no output column, user_version stays 0) with a row,
-	// exactly as a database created before the output migration would look.
-	raw, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	if _, err := raw.Exec(`CREATE TABLE tasks (
-		id          TEXT PRIMARY KEY,
-		workflow_id TEXT NOT NULL,
-		state       TEXT NOT NULL DEFAULT '',
-		status      TEXT NOT NULL DEFAULT '',
-		snapshot    BLOB
-	)`); err != nil {
-		t.Fatalf("create legacy schema: %v", err)
-	}
-	if _, err := raw.Exec(`INSERT INTO tasks (id, workflow_id, state, status, snapshot)
-		VALUES ('t1', 'wf1', 'submit', 'running', 'snap')`); err != nil {
-		t.Fatalf("seed legacy row: %v", err)
-	}
-	raw.Close()
-
-	// Opening through NewTasks must migrate the existing file in place.
-	repoDB := openAt(t, dsn)
-	repo, err := NewTasks(repoDB)
-	if err != nil {
-		t.Fatalf("NewTasks on legacy db: %v", err)
-	}
-	t.Cleanup(func() { repoDB.Close() })
-
-	// The legacy row survives the migration, now reporting a nil output.
-	rec, err := repo.RecoverTask(ctx, "t1")
-	if err != nil {
-		t.Fatalf("RecoverTask: %v", err)
-	}
-	if rec.WorkflowID != "wf1" || rec.State != "submit" || rec.Status != "running" || string(rec.Snapshot) != "snap" {
-		t.Fatalf("legacy row not preserved across migration: %+v", rec)
-	}
-	if rec.Output != nil {
-		t.Fatalf("legacy row output = %q, want nil", rec.Output)
-	}
-
-	// The newly added output column is writable end to end.
-	out := []byte(`{"orderID":"order-1"}`)
-	if err := repo.MarkTerminal(ctx, "t1", "done", out); err != nil {
-		t.Fatalf("MarkTerminal after migration: %v", err)
-	}
-	rec, _ = repo.RecoverTask(ctx, "t1")
-	if string(rec.Output) != string(out) {
-		t.Fatalf("output after migration = %q, want %q", rec.Output, out)
-	}
-}
-
 // TestTasksAssignmentTriStateRoundTrips verifies the three distinct assignments a
 // task can carry survive storage as JSON: nil (inherit the task group's), ""
 // (lease none of the kind), and a named group. JSON has one null but two empty
@@ -490,57 +429,6 @@ func TestTasksTasksInGroup(t *testing.T) {
 	}
 	if empty, err := repo.TasksInGroup(ctx, "ghost"); err != nil || len(empty) != 0 {
 		t.Fatalf("TasksInGroup(ghost) = %v, err %v; want empty, nil", empty, err)
-	}
-}
-
-// TestTasksLegacyRowsLandInGlobalGroup verifies the group migration places
-// pre-group tasks in the global namespace rather than an empty one, so an
-// upgraded database's tasks stay addressable as a group.
-func TestTasksLegacyRowsLandInGlobalGroup(t *testing.T) {
-	ctx := context.Background()
-	dsn := filepath.Join(t.TempDir(), "legacy.db")
-
-	raw, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	if _, err := raw.Exec(`CREATE TABLE tasks (
-		id          TEXT PRIMARY KEY,
-		workflow_id TEXT NOT NULL,
-		state       TEXT NOT NULL DEFAULT '',
-		status      TEXT NOT NULL DEFAULT '',
-		snapshot    BLOB
-	)`); err != nil {
-		t.Fatalf("create legacy schema: %v", err)
-	}
-	if _, err := raw.Exec(`INSERT INTO tasks (id, workflow_id) VALUES ('t1', 'wf1')`); err != nil {
-		t.Fatalf("seed legacy row: %v", err)
-	}
-	raw.Close()
-
-	repoDB := openAt(t, dsn)
-	repo, err := NewTasks(repoDB)
-	if err != nil {
-		t.Fatalf("NewTasks on legacy db: %v", err)
-	}
-	t.Cleanup(func() { repoDB.Close() })
-
-	rec, err := repo.RecoverTask(ctx, "t1")
-	if err != nil {
-		t.Fatalf("RecoverTask: %v", err)
-	}
-	if rec.GroupID != tasks.GlobalGroup {
-		t.Fatalf("GroupID = %q, want %q", rec.GroupID, tasks.GlobalGroup)
-	}
-	if len(rec.Assignments) != 0 {
-		t.Fatalf("Assignments = %v, want none (inherit every kind)", rec.Assignments)
-	}
-	if !rec.CreatedAt.IsZero() || !rec.UpdatedAt.IsZero() {
-		t.Fatalf("legacy timestamps = %v/%v, want zero", rec.CreatedAt, rec.UpdatedAt)
-	}
-	ids, err := repo.TasksInGroup(ctx, tasks.GlobalGroup)
-	if err != nil || len(ids) != 1 || ids[0] != "t1" {
-		t.Fatalf("TasksInGroup(global) = %v, err %v; want [t1], nil", ids, err)
 	}
 }
 

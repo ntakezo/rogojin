@@ -41,17 +41,18 @@ const ledger = `CREATE TABLE IF NOT EXISTS schema_migrations (
 // history from another's in a shared file, so it must be stable across
 // releases — renaming it presents an already-migrated store as a fresh one.
 //
-// Databases written before the ledger are adopted on their next open, taking
-// the old counter as that store's own progress — see adopt.
+// The ledger is the sole authority on progress. A file carrying a nonzero
+// PRAGMA user_version was written before the ledger existed, by a schema this
+// release no longer describes, and is refused outright — see rejectPreLedger.
 func migrate(db *sql.DB, store string, migrations []migration) error {
 	if store == "" {
 		return errors.New("sqlite: store name is required")
 	}
+	if err := rejectPreLedger(db); err != nil {
+		return err
+	}
 	if _, err := db.Exec(ledger); err != nil {
 		return fmt.Errorf("sqlite: create ledger: %w", err)
-	}
-	if err := adopt(db, store, migrations); err != nil {
-		return err
 	}
 
 	current, err := applied(db, store)
@@ -70,60 +71,20 @@ func migrate(db *sql.DB, store string, migrations []migration) error {
 	return nil
 }
 
-// adopt moves a database written before the ledger onto it. Such a database
-// carries its progress in PRAGMA user_version, which is per-file and so could
-// only ever describe one store: the store opening it is therefore the store
-// that wrote it, and the counter's worth of migrations is recorded as its own.
-//
-// The counter is then cleared, so adoption happens exactly once and a second
-// store joining the file afterwards starts from nothing rather than inheriting
-// a count that was never about it. An empty ledger is the signal — once any
-// store has recorded a row, the file is under the new scheme and the counter is
-// no longer consulted.
-//
-// A counter larger than the adopting store's whole history did not come from
-// this store, so adoption refuses it and writes nothing: the file is left as it
-// was found, for the store that owns it to adopt properly. A counter that fits
-// is taken at face value, which is the one thing adoption cannot verify: a
-// pre-ledger file was only ever reachable by the single store that wrote it,
-// so the store opening it is that store. Pointing a different one at an
-// un-adopted legacy file breaks the assumption — it is refused outright when
-// the counter exceeds that store's history, and otherwise fails when the
-// migrations it then runs meet tables it did not create.
-func adopt(db *sql.DB, store string, migrations []migration) error {
-	var rows int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&rows); err != nil {
-		return fmt.Errorf("sqlite: read ledger: %w", err)
+// rejectPreLedger refuses a database whose file-header counter is set. Before
+// the ledger, progress lived in PRAGMA user_version, and the migration lists
+// of that era were retired when the histories were collapsed to their current
+// baselines — there is no sequence of known steps that upgrades such a file,
+// only ways to quietly mismatch it. Nothing under the ledger scheme ever sets
+// the counter, so a nonzero value can only mean a pre-ledger file, and the
+// honest response is to stop before writing anything and ask for a fresh one.
+func rejectPreLedger(db *sql.DB) error {
+	var v int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		return fmt.Errorf("sqlite: read user_version: %w", err)
 	}
-	if rows > 0 {
-		return nil
-	}
-	legacy, err := userVersion(db)
-	if err != nil || legacy == 0 {
-		return err
-	}
-	if legacy > len(migrations) {
-		return fmt.Errorf("sqlite: cannot adopt %q: the database counts %d applied migrations but %s knows only %d, so the counter belongs to another store", store, legacy, store, len(migrations))
-	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("sqlite: adopt %s: %w", store, err)
-	}
-	defer tx.Rollback()
-
-	for version := 1; version <= legacy; version++ {
-		if _, err := tx.Exec(
-			`INSERT INTO schema_migrations (store, version, name, applied_at) VALUES (?, ?, ?, ?)`,
-			store, version, migrations[version-1].Name, now()); err != nil {
-			return fmt.Errorf("sqlite: adopt %s: %w", store, err)
-		}
-	}
-	if _, err := tx.Exec(`PRAGMA user_version = 0`); err != nil {
-		return fmt.Errorf("sqlite: adopt %s: %w", store, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite: adopt %s: %w", store, err)
+	if v != 0 {
+		return fmt.Errorf("sqlite: the database predates the migration ledger (user_version = %d) and this release cannot upgrade it; recreate the database file", v)
 	}
 	return nil
 }
@@ -155,16 +116,6 @@ func applied(db *sql.DB, store string) (int, error) {
 		return 0, fmt.Errorf("sqlite: read %s history: %w", store, err)
 	}
 	return count, nil
-}
-
-// userVersion reads the pre-ledger counter from the SQLite file header. It is
-// consulted only by adopt.
-func userVersion(db *sql.DB) (int, error) {
-	var v int
-	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
-		return 0, fmt.Errorf("sqlite: read user_version: %w", err)
-	}
-	return v, nil
 }
 
 // apply runs one migration and records it in the same transaction, so a step

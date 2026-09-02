@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"github.com/ntakezo/rogojin/leasing"
 	"path/filepath"
 	"testing"
@@ -257,58 +256,6 @@ func TestProxiesGroupCRUD(t *testing.T) {
 	listed, _ = repo.ListGroups(ctx)
 	if len(listed) != 1 || listed[0].ID != "datacenter" {
 		t.Fatalf("after delete: %+v, want [datacenter]", listed)
-	}
-}
-
-// TestProxiesLegacyProxiesLandInGlobalGroup verifies the group migration places
-// pre-group proxies in the global namespace, so an upgraded pool keeps
-// rotating instead of referencing a group that does not exist.
-func TestProxiesLegacyProxiesLandInGlobalGroup(t *testing.T) {
-	ctx := context.Background()
-	dsn := filepath.Join(t.TempDir(), "legacy.db")
-
-	raw, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	if _, err := raw.Exec(`CREATE TABLE proxies (
-		id        TEXT PRIMARY KEY,
-		url       TEXT NOT NULL DEFAULT '',
-		owner_id  TEXT NOT NULL DEFAULT '',
-		successes INTEGER NOT NULL DEFAULT 0,
-		failures  INTEGER NOT NULL DEFAULT 0
-	)`); err != nil {
-		t.Fatalf("create legacy schema: %v", err)
-	}
-	if _, err := raw.Exec(`INSERT INTO proxies (id, url, owner_id, successes, failures)
-		VALUES ('p1', 'http://h:80', 't1', 7, 3)`); err != nil {
-		t.Fatalf("seed legacy row: %v", err)
-	}
-	raw.Close()
-
-	repoDB := openAt(t, dsn)
-	repo, err := NewProxies(repoDB)
-	if err != nil {
-		t.Fatalf("NewProxies on legacy db: %v", err)
-	}
-	t.Cleanup(func() { repoDB.Close() })
-
-	listed, err := repo.List(ctx)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(listed) != 1 {
-		t.Fatalf("got %d proxies, want 1", len(listed))
-	}
-	got := listed[0]
-	if got.GroupID != proxies.GlobalGroup {
-		t.Fatalf("GroupID = %q, want %q", got.GroupID, proxies.GlobalGroup)
-	}
-	if got.OwnerID != "t1" || got.Successes != 7 || got.Failures != 3 || got.URL != "http://h:80" {
-		t.Fatalf("legacy row not preserved: %+v", got)
-	}
-	if got.MaxHolders != 0 {
-		t.Fatalf("MaxHolders = %d, want 0 (inherit the group's policy)", got.MaxHolders)
 	}
 }
 

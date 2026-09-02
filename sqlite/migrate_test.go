@@ -39,17 +39,8 @@ func recorded(t *testing.T, db *sql.DB, store string) int {
 	return n
 }
 
-func version(t *testing.T, db *sql.DB) int {
-	t.Helper()
-	v, err := userVersion(db)
-	if err != nil {
-		t.Fatalf("userVersion: %v", err)
-	}
-	return v
-}
-
 // twoSteps is a representative history: create a table, then add a column — the
-// same shape as the tasks store's real output migration.
+// shape a store's history takes as it grows past its baseline.
 var twoSteps = []migration{
 	{Name: "create t", SQL: `CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)`},
 	{Name: "add col", SQL: `ALTER TABLE t ADD COLUMN extra TEXT`},
@@ -255,94 +246,35 @@ func TestSharedFileUpgradesIndependently(t *testing.T) {
 	}
 }
 
-// TestAdoptsPreLedgerDatabase verifies an existing database — one written when
-// progress lived in PRAGMA user_version — is carried onto the ledger rather than
-// re-migrated. Re-running its ALTER would fail as a duplicate column, so a clean
-// open is the proof the counter was honored.
-func TestAdoptsPreLedgerDatabase(t *testing.T) {
+// TestRejectsPreLedgerDatabase verifies a database carrying the retired
+// file-header counter is refused before anything is written. The migration
+// lists that counter described no longer ship, so there is no upgrade for such
+// a file — only quiet mismatches — and the refusal has to leave it untouched
+// for whoever wants to salvage it by hand.
+func TestRejectsPreLedgerDatabase(t *testing.T) {
 	db := openRawDB(t)
-	// Hand-build the pre-ledger state: both steps applied, counter at 2, no ledger.
-	for _, m := range twoSteps {
-		if _, err := db.Exec(m.SQL); err != nil {
-			t.Fatalf("seed %s: %v", m.Name, err)
-		}
-	}
 	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
 		t.Fatalf("seed counter: %v", err)
 	}
 
-	if err := migrate(db, "main", twoSteps); err != nil {
-		t.Fatalf("Run on a pre-ledger database: %v", err)
+	err := migrate(db, "main", twoSteps)
+	if err == nil {
+		t.Fatal("Run: want a pre-ledger database to be refused, got nil")
 	}
-	if got := recorded(t, db, "main"); got != 2 {
-		t.Fatalf("recorded = %d, want the counter's 2 carried over", got)
+	if !strings.Contains(err.Error(), "recreate") {
+		t.Fatalf("err = %v, want it to say the file must be recreated", err)
 	}
-	// The counter is cleared, so a second store joining this file later starts
-	// from nothing rather than inheriting a count that was never about it.
-	if got := version(t, db); got != 0 {
-		t.Fatalf("user_version = %d, want it cleared after adoption", got)
+	// The refusal writes nothing: no ledger, no tables, counter untouched.
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != 2 {
+		t.Fatalf("user_version = %d (err %v), want the counter left at 2", v, err)
 	}
-	if err := migrate(db, "second", otherSteps); err != nil {
-		t.Fatalf("second store joining an adopted file: %v", err)
+	var tables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
+		t.Fatalf("count tables: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO u (id) VALUES ('a')`); err != nil {
-		t.Fatalf("second store's table after adoption: %v", err)
-	}
-}
-
-// TestAdoptsPartiallyMigratedDatabase verifies adoption carries a counter that
-// stops short of the current schema, and that the remaining steps then run.
-func TestAdoptsPartiallyMigratedDatabase(t *testing.T) {
-	db := openRawDB(t)
-	if _, err := db.Exec(twoSteps[0].SQL); err != nil {
-		t.Fatalf("seed table: %v", err)
-	}
-	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
-		t.Fatalf("seed counter: %v", err)
-	}
-
-	if err := migrate(db, "main", twoSteps); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got := recorded(t, db, "main"); got != 2 {
-		t.Fatalf("recorded = %d, want 2", got)
-	}
-	if _, err := db.Exec(`INSERT INTO t (id, extra) VALUES ('a', 'b')`); err != nil {
-		t.Fatalf("the pending step did not run: %v", err)
-	}
-}
-
-// TestAdoptionRefusesAForeignCounter verifies a pre-ledger file whose counter
-// exceeds the opening store's whole history is refused — the counter came from
-// some other store — and that the refusal writes nothing. Leaving the counter
-// intact is the point: the store that actually owns the file must still be able
-// to adopt it afterwards.
-func TestAdoptionRefusesAForeignCounter(t *testing.T) {
-	db := openRawDB(t)
-	if _, err := db.Exec(`PRAGMA user_version = 8`); err != nil {
-		t.Fatalf("seed counter: %v", err)
-	}
-
-	if err := migrate(db, "main", twoSteps); err == nil {
-		t.Fatal("Run: want a foreign counter to be refused, got nil")
-	}
-	if got := version(t, db); got != 8 {
-		t.Fatalf("user_version = %d, want the refused counter left at 8", got)
-	}
-	if got := recorded(t, db, "main"); got != 0 {
-		t.Fatalf("recorded = %d, want nothing written by a refused adoption", got)
-	}
-
-	// The store that owns the file — eight migrations deep — still adopts it.
-	owner := make([]migration, 8)
-	for i := range owner {
-		owner[i] = migration{Name: "step", SQL: `SELECT 1`}
-	}
-	if err := migrate(db, "owner", owner); err != nil {
-		t.Fatalf("the owning store must still adopt: %v", err)
-	}
-	if got := recorded(t, db, "owner"); got != 8 {
-		t.Fatalf("owner recorded = %d, want 8", got)
+	if tables != 0 {
+		t.Fatalf("tables = %d, want none created by a refused open", tables)
 	}
 }
 
