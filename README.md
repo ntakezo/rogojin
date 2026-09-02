@@ -1,79 +1,89 @@
-<div class="title-block" style="text-align: center;" align="center">
+<div align="center">
 
-# Rogojin — durable web automation workflows
+# rogojin
+
+rogojin is an end-to-end web automation framework in Go, written to be written by agents.
+
+<h3>
+
+[API Reference](https://pkg.go.dev/github.com/ntakezo/rogojin) | [Contributing](./CONTRIBUTING.md) | [Example](_examples/workflows/example)
+
+</h3>
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/ntakezo/rogojin.svg)](https://pkg.go.dev/github.com/ntakezo/rogojin)
+[![Tests](https://github.com/ntakezo/rogojin/actions/workflows/test.yml/badge.svg)](https://github.com/ntakezo/rogojin/actions/workflows/test.yml)
 [![GitHub License](https://img.shields.io/github/license/ntakezo/rogojin)](./LICENSE)
-
-**[Introduction](#introduction) &nbsp;&nbsp;&bull;&nbsp;&nbsp;**
-**[Getting Started](#getting-started) &nbsp;&nbsp;&bull;&nbsp;&nbsp;**
-**[Contributing](#contributing) &nbsp;&nbsp;&bull;&nbsp;&nbsp;**
-**[API Reference](https://pkg.go.dev/github.com/ntakezo/rogojin)**
 
 </div>
 
-## Introduction
+## FAQ
 
-Rogojin is a Go framework for building durable, resumable automation workflows against websites.
+### Whats it for?
 
-A state is just a method:
+The portal to the internet is built for humans. Bots are excluded from that interface by websites -- but they don't have to be. Rogojin gives you all the tools to perform actions as a bot while presenting yourself as a human in a browser.
 
-```go
-func (r *run) fetch(ctx context.Context) (*workflows.State, error) {
-	// fetch the page, stash the result on r...
-	return workflows.Next(process), nil
-}
-```
+usecases:
 
-Built-in modules cover the unglamorous parts of site automation:
+- ecommerce automation(ACO)
+- web scraping
 
-- **Durability** — every transition checkpointed; suspend, resume, kill, and recover at state boundaries. An external side effect a re-run must not repeat rides in a durable effect log (`workflows.Do`), so a retried or recovered state replays a submitted order instead of resubmitting it.
-- **Policy** — retries with backoff and timeouts are declared per state on the graph (`workflows.On(state, handler, workflows.Retry(3, workflows.ExpBackoff(…)))`), never implemented inside handlers.
-- **Typed results** — a module declares its output once (`.Returns[Order]()`), and `tasks.Create` returns a handle whose `Start` and `Output` carry a decoded `Order` — input and output types both inferred, no type arguments at the call site.
-- **Proxies** — per-task leasing with round-robin or Thompson-sampling selection, per-proxy and per-group holder caps, and sticky locks that outlive the process.
-- **Accounts** — the same leasing, groups, holder caps, and sticky locks for site logins. What an account _is_ belongs to the workflow: its fields travel as JSON, so a new workflow needs no schema change.
-- **Payments** — the same leasing again, for the payment instruments a checkout settles against: one holder at a time by default, so no two tasks charge the same instrument at once, and a sticky lock so a resumed checkout comes back to the instrument it started on. Payment data travels as JSON the library never reads; encrypting it at rest is the store's job.
-- **Groups** — named sets of proxies, of accounts, of payments, and of tasks. A task carries one assignment per resource kind and inherits its task group's for any kind it names none of, so a pool is assigned once and every member follows; each proxy group rotates through its own selection strategy. When seeding a repository directly, save groups before the resources that name them — a resource pointing at a group the store doesn't hold fails the manager's construction.
-- **Comms** — typed pub/sub bus for inter-task coordination.
-- **Persistence** — a small byte-store interface; SQLite adapters ship in the box, swap in anything else. Each adapter records its migrations under its own name, so they can share one database file or take one each.
+### Why not just use a browser agent?
 
-## Getting Started
+inference and browsers at scale are costly. if speed and/or cost is a concern, request based automation is often the answer. moreover, rogojin lends itself nicely to generating request based bots on top of your existing browser fleet or hybrid workflow approaches.
 
-### Install
+### Can i use a browser agent with Rogojin?
 
-Requires Go 1.27+ (typed task results use generic methods).
+yes. although we provide many primitives and tooling for request based automation, we intentionally leave it up to the user to decide what medium they prefer to drive an automation with. You can still benefit from the task orchestration, identity primitives, session management and more.
+
+## Isn't maintaining request based bots laborious?
+
+Before agents this task was very costly in labor. Now with agents you can build and maintain multiple platforms at once.
+
+---
+
+## Installation
+
+Requires Go 1.27+; the SQLite adapter needs cgo.
 
 ```sh
 go get github.com/ntakezo/rogojin
+go install github.com/ntakezo/rogojin/cmd/rogojin@latest
 ```
 
-### Scaffold a workflow
+## Getting started
 
-Generate a runnable skeleton from inside your module:
+From inside the module that will own the workflow:
 
 ```sh
-go install github.com/ntakezo/rogojin/cmd/rogojin@latest
 rogojin new checkout
 go run ./checkout/cmd/run
 ```
 
-`rogojin new <name>` emits a full workflow package — proxy leasing, site accounts, payment instruments, inbox listening, crash recovery — wired onto a SQLite-backed task service. Flags subtract the pieces you don't need (`--no-proxy`, `--no-accounts`, `--no-payments`, `--no-email`, `--no-durable`), and `--repo memory` swaps SQLite for nil repositories so everything runs in memory.
+That is a running task, not a skeleton — edit it into the site you actually mean. `rogojin help` lists the flags that subtract what you don't need.
 
-### Run the example
-
-A complete workflow — proxy leasing, durable snapshots, recovery, and inter-task coordination against a canned site:
+To watch the whole thing work first:
 
 ```sh
 cd _examples && go run ./workflows/example
 ```
 
-### Learn the API
+## Documentation
 
-The [API reference](https://pkg.go.dev/github.com/ntakezo/rogojin) documents each package: `workflows` (the programming model), `tasks` (the runtime), `comms`, `proxies`, `accounts`, `payments`, `email`, and `sqlite`. `proxies`, `accounts`, and `payments` are all thin layers over `leasing`, which owns the pooling, grouping, and locking they share — build a fourth resource kind on it the same way.
+The [API reference](https://pkg.go.dev/github.com/ntakezo/rogojin) is the documentation — start with `workflows` for the model, `tasks` for the runtime. Every package stands alone and carries a doc comment saying what it owns and why.
+
+## Versioning
+
+[SemVer](https://semver.org), pre-1.0: minor releases may break API, patch releases won't.
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for how to build, test, and propose changes.
+Read [CONTRIBUTING.md](./CONTRIBUTING.md) first; [`good first issue`](https://github.com/ntakezo/rogojin/labels/good%20first%20issue) is scoped to be approachable. Short version: no speculative code, no unrelated churn, a failing test for every behavior change, and `internal/scaffold` templates updated in the same PR as the surface they reproduce. Writing a PR with an agent is fine; shipping a diff you haven't read is not.
+
+```sh
+gofmt -l .          # must print nothing
+go vet ./...
+go test -race ./...
+```
 
 ## License
 
