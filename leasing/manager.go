@@ -16,9 +16,16 @@ import (
 type Option[R any, P Leasable[R]] func(*Manager[R, P])
 
 // WithStrategy registers factory under name, so groups may reference custom
-// selection algorithms beyond round robin (or override it under its own name).
+// selection algorithms beyond round robin (or override it under its own name,
+// which also turns off the store-side rotation cursor in favor of the
+// override's own state).
 func WithStrategy[R any, P Leasable[R]](name string, factory StrategyFactory[R]) Option[R, P] {
-	return func(m *Manager[R, P]) { m.factories[name] = factory }
+	return func(m *Manager[R, P]) {
+		m.factories[name] = factory
+		if name == StrategyRoundRobin {
+			m.rrOverridden = true
+		}
+	}
 }
 
 // WithNotifier sets the Notifier acquires park on while they wait for
@@ -63,11 +70,12 @@ func WithLeaseTTL[R any, P Leasable[R]](d time.Duration) Option[R, P] {
 // struct embedding Resource; P is its pointer, inferred everywhere but a type
 // alias. A Manager is safe for concurrent use.
 type Manager[R any, P Leasable[R]] struct {
-	repo      Repository[R]
-	factories map[string]StrategyFactory[R]
-	notifier  comms.Notifier
-	topic     string
-	ttl       time.Duration
+	repo         Repository[R]
+	factories    map[string]StrategyFactory[R]
+	notifier     comms.Notifier
+	topic        string
+	ttl          time.Duration
+	rrOverridden bool // a WithStrategy("roundrobin", …) supplied its own state
 
 	closing   chan struct{}
 	done      chan struct{}
@@ -1036,6 +1044,17 @@ func (m *Manager[R, P]) eligible(a Assignment, requireIdle bool) ([]R, error) {
 func (m *Manager[R, P]) pick(ctx context.Context, a Assignment, candidates []R) (R, error) {
 	if a.ResourceID != "" {
 		return candidates[0], nil
+	}
+	// Round robin rotates through a store-side cursor, so every node of a
+	// deployment advances the same rotation. The modulo is over the local
+	// candidate order, stable across nodes because pools load in the store's
+	// id order; an overridden round robin keeps its own state instead.
+	if g := m.groups[a.GroupID]; strategyName(g) == StrategyRoundRobin && !m.rrOverridden {
+		idx, err := m.repo.Increment(ctx, g.ID, "cursor", 1)
+		if err != nil {
+			return zero[R](), fmt.Errorf("advance rotation cursor of group %s: %w", g.ID, err)
+		}
+		return candidates[int((idx-1)%int64(len(candidates)))], nil
 	}
 	picked, err := m.strategies[a.GroupID].Select(candidates)
 	if err != nil {
