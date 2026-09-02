@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ntakezo/rogojin/leasing"
@@ -72,38 +73,29 @@ func TestProxiesPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// TestBackfillCarriesLegacyStatsIntoCounters verifies the upgrade path: a
-// database whose proxies still carry row-borne stats — written before the
-// counters existed — surfaces them unchanged once the backfill migrations run.
-func TestBackfillCarriesLegacyStatsIntoCounters(t *testing.T) {
-	ctx := context.Background()
+// TestPreCollapseDatabaseIsRefused verifies a database recorded past the
+// collapsed history — one written by a pre-baseline release — is refused by
+// the ledger rather than run against a schema this release no longer
+// describes. Recreating the file is the upgrade path.
+func TestPreCollapseDatabaseIsRefused(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "legacy.db")
 
-	// A pre-counters database: the history up to the counters table, with a
-	// row whose stats live in the legacy columns.
+	// A pre-collapse database records more proxies migrations than the
+	// baseline history knows.
 	legacy := openRawAt(t, dsn)
-	preBackfill := proxyMigrations[:len(proxyMigrations)-2]
-	if err := migrate(legacy, "proxies", preBackfill); err != nil {
+	longer := append(append([]migration{}, proxyMigrations...), migration{
+		Name: "a step from the pre-baseline era",
+		SQL:  `CREATE TABLE retired (id TEXT PRIMARY KEY)`,
+	})
+	if err := migrate(legacy, "proxies", longer); err != nil {
 		t.Fatalf("migrate legacy: %v", err)
-	}
-	if _, err := legacy.Exec(
-		`INSERT INTO proxies (id, url, successes, failures, version) VALUES ('p1', 'http://h:80', 9, 4, 1)`); err != nil {
-		t.Fatalf("seed legacy row: %v", err)
 	}
 	if err := legacy.Close(); err != nil {
 		t.Fatalf("close legacy: %v", err)
 	}
 
-	upgradedDB := openAt(t, dsn)
-	upgraded, err := NewProxies(upgradedDB)
-	if err != nil {
-		t.Fatalf("NewProxies on legacy database: %v", err)
-	}
-	listed, err := upgraded.List(ctx)
-	if err != nil {
-		t.Fatalf("list after upgrade: %v", err)
-	}
-	if len(listed) != 1 || listed[0].Successes != 9 || listed[0].Failures != 4 {
-		t.Fatalf("got %+v, want the legacy stats projected from the backfilled counters", listed)
+	db := openAt(t, dsn)
+	if _, err := NewProxies(db); err == nil || !strings.Contains(err.Error(), "newer than") {
+		t.Fatalf("NewProxies = %v, want the ledger to refuse the newer database", err)
 	}
 }

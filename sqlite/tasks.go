@@ -39,16 +39,19 @@ var taskMigrations = []migration{
 	{
 		Name: "create tasks table",
 		SQL: `CREATE TABLE tasks (
-			id          TEXT PRIMARY KEY,
-			workflow_id TEXT NOT NULL,
-			group_id    TEXT NOT NULL DEFAULT 'global',
-			assignments TEXT NOT NULL DEFAULT '',
-			state       TEXT NOT NULL DEFAULT '',
-			status      TEXT NOT NULL DEFAULT '',
-			snapshot    BLOB,
-			output      BLOB,
-			created_at  TEXT NOT NULL DEFAULT '',
-			updated_at  TEXT NOT NULL DEFAULT ''
+			id               TEXT PRIMARY KEY,
+			workflow_id      TEXT NOT NULL,
+			group_id         TEXT NOT NULL DEFAULT 'global',
+			assignments      TEXT NOT NULL DEFAULT '',
+			state            TEXT NOT NULL DEFAULT '',
+			status           TEXT NOT NULL DEFAULT '',
+			snapshot         BLOB,
+			output           BLOB,
+			version          INTEGER NOT NULL DEFAULT 0,
+			owner_node       TEXT NOT NULL DEFAULT '',
+			lease_expires_at INTEGER NOT NULL DEFAULT 0,
+			created_at       TEXT NOT NULL DEFAULT '',
+			updated_at       TEXT NOT NULL DEFAULT ''
 		)`,
 	},
 	{
@@ -59,18 +62,6 @@ var taskMigrations = []migration{
 			created_at      TEXT NOT NULL DEFAULT '',
 			updated_at      TEXT NOT NULL DEFAULT ''
 		)`,
-	},
-	{
-		Name: "add version column",
-		SQL:  `ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0`,
-	},
-	{
-		Name: "add owner_node column",
-		SQL:  `ALTER TABLE tasks ADD COLUMN owner_node TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "add lease_expires_at column",
-		SQL:  `ALTER TABLE tasks ADD COLUMN lease_expires_at INTEGER NOT NULL DEFAULT 0`,
 	},
 	{
 		Name: "create task_effects table",

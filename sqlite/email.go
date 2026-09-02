@@ -32,28 +32,23 @@ func NewEmails(db *DB) (email.Repository, error) {
 // which of them have already run on existing databases by position.
 var emailMigrations = []migration{
 	{
+		// listener_expires_at is unix milliseconds, not RFC3339Nano text like
+		// the other timestamps: expiry is a comparison column, and
+		// variable-width fractional-second text does not compare correctly.
+		// 0 means unclaimed.
 		Name: "create emails table",
 		SQL: `CREATE TABLE emails (
-			id           TEXT PRIMARY KEY,
-			address      TEXT NOT NULL DEFAULT '',
-			vendor       TEXT NOT NULL DEFAULT '',
-			auth         TEXT NOT NULL DEFAULT '',
-			last_uid     INTEGER NOT NULL DEFAULT 0,
-			uid_validity INTEGER NOT NULL DEFAULT 0,
-			created_at   TEXT NOT NULL DEFAULT '',
-			updated_at   TEXT NOT NULL DEFAULT ''
+			id                  TEXT PRIMARY KEY,
+			address             TEXT NOT NULL DEFAULT '',
+			vendor              TEXT NOT NULL DEFAULT '',
+			auth                TEXT NOT NULL DEFAULT '',
+			last_uid            INTEGER NOT NULL DEFAULT 0,
+			uid_validity        INTEGER NOT NULL DEFAULT 0,
+			listener_node       TEXT NOT NULL DEFAULT '',
+			listener_expires_at INTEGER NOT NULL DEFAULT 0,
+			created_at          TEXT NOT NULL DEFAULT '',
+			updated_at          TEXT NOT NULL DEFAULT ''
 		)`,
-	},
-	{
-		Name: "add listener claim node",
-		SQL:  `ALTER TABLE emails ADD COLUMN listener_node TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		// Unix milliseconds, not RFC3339Nano text like the other timestamps:
-		// expiry is a comparison column, and variable-width fractional-second
-		// text does not compare correctly. 0 means unclaimed.
-		Name: "add listener claim expiry",
-		SQL:  `ALTER TABLE emails ADD COLUMN listener_expires_at INTEGER NOT NULL DEFAULT 0`,
 	},
 }
 
