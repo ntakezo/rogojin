@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/leasing"
@@ -45,14 +46,37 @@ func (r *fakeRepo) List(ctx context.Context) ([]Account, error) {
 	return out, nil
 }
 
-func (r *fakeRepo) Save(ctx context.Context, a Account) error {
+// Save is a blind upsert handing back a bumped version; the conditional-write
+// rules are storetest's to verify against the real adapters.
+func (r *fakeRepo) Save(ctx context.Context, a Account) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.records[a.ID]; !ok {
+	if kept, ok := r.records[a.ID]; ok {
+		a.Version = kept.Version + 1
+	} else {
 		r.order = append(r.order, a.ID)
+		a.Version = 1
 	}
 	r.records[a.ID] = a
+	return a.Version, nil
+}
+
+func (r *fakeRepo) Acquire(ctx context.Context, resourceID, taskID string, cap int, ttl time.Duration) (leasing.Hold, error) {
+	return leasing.Hold{ResourceID: resourceID, TaskID: taskID, Count: 1, ExpiresAt: time.Now().Add(ttl)}, nil
+}
+func (r *fakeRepo) ReleaseHold(ctx context.Context, resourceID, taskID string) error { return nil }
+func (r *fakeRepo) RenewHolds(ctx context.Context, taskID string, ttl time.Duration) error {
 	return nil
+}
+func (r *fakeRepo) ListHolds(ctx context.Context) ([]leasing.Hold, error) { return nil, nil }
+func (r *fakeRepo) ClaimLock(ctx context.Context, resourceID, taskID string) error {
+	return nil
+}
+func (r *fakeRepo) ReleaseLock(ctx context.Context, resourceID, taskID string) error {
+	return nil
+}
+func (r *fakeRepo) Increment(ctx context.Context, scope, name string, delta int64) (int64, error) {
+	return delta, nil
 }
 
 func (r *fakeRepo) Delete(ctx context.Context, id string) error {

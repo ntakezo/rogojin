@@ -41,9 +41,10 @@ func TestProxiesPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("NewProxies: %v", err)
 	}
 	saved := proxies.Proxy{Resource: leasing.Resource{ID: "p1", OwnerID: "t1"}, Successes: 7, Failures: 3, URL: "http://h:80"}
-	if err := repo.Save(ctx, saved); err != nil {
+	if _, err := repo.Save(ctx, saved); err != nil {
 		t.Fatalf("save: %v", err)
 	}
+	saved.Version = 1 // the create landed the record at version 1
 	repoDB.Close()
 
 	reopenedDB := openAt(t, dsn)

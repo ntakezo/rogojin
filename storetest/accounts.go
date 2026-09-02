@@ -33,7 +33,7 @@ func Accounts(t *testing.T, open func(t *testing.T) accounts.Repository) {
 		}
 		want := checkout{Email: "buyer@example.com", Card: "4111"}
 		a := accounts.Account{Resource: leasing.Resource{ID: "a1"}, EmailID: "inbox-1", Fields: mustJSON(t, want)}
-		if err := repo.Save(ctx, a); err != nil {
+		if _, err := repo.Save(ctx, a); err != nil {
 			t.Fatalf("Save: %v", err)
 		}
 
@@ -57,7 +57,7 @@ func Accounts(t *testing.T, open func(t *testing.T) accounts.Repository) {
 	// nothing.
 	t.Run("FieldsMustBeJSON", func(t *testing.T) {
 		repo := open(t)
-		err := repo.Save(ctx, accounts.Account{
+		_, err := repo.Save(ctx, accounts.Account{
 			Resource: leasing.Resource{ID: "a1"},
 			Fields:   json.RawMessage(`not json`),
 		})

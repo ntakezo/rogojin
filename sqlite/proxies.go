@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
+	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/proxies"
 )
 
@@ -51,13 +53,28 @@ var proxyMigrations = []migration{
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
 	},
+	{
+		Name: "add version column",
+		SQL:  `ALTER TABLE proxies ADD COLUMN version INTEGER NOT NULL DEFAULT 0`,
+	},
+	{
+		Name: "create proxy_holds table",
+		SQL:  holdsSchema("proxy_holds"),
+	},
+	{
+		Name: "create proxy_counters table",
+		SQL:  countersSchema("proxy_counters"),
+	},
 }
+
+// proxyTables wires the shared leasing mechanics to this store's tables.
+var proxyTables = leaseTables{noun: "proxy", records: "proxies", holds: "proxy_holds", counters: "proxy_counters"}
 
 // List returns every stored proxy in stable id order, so the manager's pool
 // order is deterministic.
 func (s *Proxies) List(ctx context.Context) ([]proxies.Proxy, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, url, group_id, owner_id, max_holders, successes, failures, created_at, updated_at
+		`SELECT id, url, group_id, owner_id, max_holders, version, successes, failures, created_at, updated_at
 		 FROM proxies ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list proxies: %w", err)
@@ -68,7 +85,7 @@ func (s *Proxies) List(ctx context.Context) ([]proxies.Proxy, error) {
 	for rows.Next() {
 		var p proxies.Proxy
 		var created, updated string
-		if err := rows.Scan(&p.ID, &p.URL, &p.GroupID, &p.OwnerID, &p.MaxHolders, &p.Successes, &p.Failures, &created, &updated); err != nil {
+		if err := rows.Scan(&p.ID, &p.URL, &p.GroupID, &p.OwnerID, &p.MaxHolders, &p.Version, &p.Successes, &p.Failures, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list proxies: %w", err)
 		}
 		if p.CreatedAt, err = parseTime(created); err != nil {
@@ -85,32 +102,81 @@ func (s *Proxies) List(ctx context.Context) ([]proxies.Proxy, error) {
 	return listed, nil
 }
 
-// Save upserts the proxy's record: URL, group, holder policy, lock owner,
-// stats, and updated_at. created_at is written on insert and never
-// overwritten, so a lock or a stat update cannot revise it.
-func (s *Proxies) Save(ctx context.Context, p proxies.Proxy) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO proxies (id, url, group_id, owner_id, max_holders, successes, failures, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET url = excluded.url, group_id = excluded.group_id,
-		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
-		 successes = excluded.successes, failures = excluded.failures,
-		 updated_at = excluded.updated_at`,
-		p.ID, p.URL, p.GroupID, p.OwnerID, p.MaxHolders, p.Successes, p.Failures,
-		formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
+// Save writes the proxy's record conditionally on its Version — see
+// leasing.Repository. created_at is written on insert and never overwritten,
+// so a lock or a stat update cannot revise it.
+func (s *Proxies) Save(ctx context.Context, p proxies.Proxy) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("save proxy %s: %w", p.ID, err)
+		return 0, fmt.Errorf("save proxy %s: %w", p.ID, err)
 	}
-	return nil
+	defer tx.Rollback()
+
+	insert, next, err := versionGate(ctx, tx, proxyTables, p.ID, p.Version)
+	if err != nil {
+		return 0, err
+	}
+	if insert {
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO proxies (id, url, group_id, owner_id, max_holders, version, successes, failures, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			p.ID, p.URL, p.GroupID, p.OwnerID, p.MaxHolders, next, p.Successes, p.Failures,
+			formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
+	} else {
+		_, err = tx.ExecContext(ctx,
+			`UPDATE proxies SET url = ?, group_id = ?, owner_id = ?, max_holders = ?, version = ?,
+			 successes = ?, failures = ?, updated_at = ? WHERE id = ?`,
+			p.URL, p.GroupID, p.OwnerID, p.MaxHolders, next, p.Successes, p.Failures,
+			formatTime(p.UpdatedAt), p.ID)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("save proxy %s: %w", p.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("save proxy %s: %w", p.ID, err)
+	}
+	return next, nil
 }
 
-// Delete removes the proxy's record; absent rows are a no-op.
+// Acquire takes or re-enters a hold on the proxy under cap — see
+// leasing.Repository.
+func (s *Proxies) Acquire(ctx context.Context, resourceID, taskID string, cap int, ttl time.Duration) (leasing.Hold, error) {
+	return acquireHold(ctx, s.db, proxyTables, resourceID, taskID, cap, ttl)
+}
+
+// ReleaseHold decrements the task's hold, removing it at zero.
+func (s *Proxies) ReleaseHold(ctx context.Context, resourceID, taskID string) error {
+	return releaseHold(ctx, s.db, proxyTables, resourceID, taskID)
+}
+
+// RenewHolds extends every unexpired hold the task has.
+func (s *Proxies) RenewHolds(ctx context.Context, taskID string, ttl time.Duration) error {
+	return renewHolds(ctx, s.db, proxyTables, taskID, ttl)
+}
+
+// ListHolds returns every hold row, expired ones included.
+func (s *Proxies) ListHolds(ctx context.Context) ([]leasing.Hold, error) {
+	return listHolds(ctx, s.db, proxyTables)
+}
+
+// ClaimLock binds the proxy to the task iff unlocked or already its own.
+func (s *Proxies) ClaimLock(ctx context.Context, resourceID, taskID string) error {
+	return claimLock(ctx, s.db, proxyTables, resourceID, taskID)
+}
+
+// ReleaseLock clears the lock iff the task owns it.
+func (s *Proxies) ReleaseLock(ctx context.Context, resourceID, taskID string) error {
+	return releaseLock(ctx, s.db, proxyTables, resourceID, taskID)
+}
+
+// Increment atomically adds delta to the counter under (scope, name).
+func (s *Proxies) Increment(ctx context.Context, scope, name string, delta int64) (int64, error) {
+	return incrementCounter(ctx, s.db, proxyTables, scope, name, delta)
+}
+
+// Delete removes the proxy's record and its holds; absent rows are a no-op.
 func (s *Proxies) Delete(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM proxies WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete proxy %s: %w", id, err)
-	}
-	return nil
+	return deleteWithHolds(ctx, s.db, proxyTables, id)
 }
 
 // ListGroups returns every stored proxy group in stable id order.

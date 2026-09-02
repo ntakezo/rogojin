@@ -63,14 +63,36 @@ func (r *fakeRepo) List(ctx context.Context) ([]res, error) {
 	return out, nil
 }
 
-func (r *fakeRepo) Save(ctx context.Context, p res) error {
+// Save is a blind upsert that still hands back a bumped version: the manager
+// tests exercise its flows, not the store's conditional-write rules, which
+// storetest owns against the real adapters.
+func (r *fakeRepo) Save(ctx context.Context, p res) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.records[p.ID]; !ok {
+	if kept, ok := r.records[p.ID]; ok {
+		p.Version = kept.Version + 1
+	} else {
 		r.order = append(r.order, p.ID)
+		p.Version = 1
 	}
 	r.records[p.ID] = p
+	return p.Version, nil
+}
+
+func (r *fakeRepo) Acquire(ctx context.Context, resourceID, taskID string, cap int, ttl time.Duration) (Hold, error) {
+	return Hold{ResourceID: resourceID, TaskID: taskID, Count: 1, ExpiresAt: time.Now().Add(ttl)}, nil
+}
+func (r *fakeRepo) ReleaseHold(ctx context.Context, resourceID, taskID string) error { return nil }
+func (r *fakeRepo) RenewHolds(ctx context.Context, taskID string, ttl time.Duration) error {
 	return nil
+}
+func (r *fakeRepo) ListHolds(ctx context.Context) ([]Hold, error)                  { return nil, nil }
+func (r *fakeRepo) ClaimLock(ctx context.Context, resourceID, taskID string) error { return nil }
+func (r *fakeRepo) ReleaseLock(ctx context.Context, resourceID, taskID string) error {
+	return nil
+}
+func (r *fakeRepo) Increment(ctx context.Context, scope, name string, delta int64) (int64, error) {
+	return delta, nil
 }
 
 func (r *fakeRepo) Delete(ctx context.Context, id string) error {
@@ -1130,7 +1152,7 @@ type gateRepo struct {
 	gate    chan struct{}
 }
 
-func (r *gateRepo) Save(ctx context.Context, p res) error {
+func (r *gateRepo) Save(ctx context.Context, p res) (int64, error) {
 	if r.arm.CompareAndSwap(true, false) {
 		close(r.entered)
 		<-r.gate
