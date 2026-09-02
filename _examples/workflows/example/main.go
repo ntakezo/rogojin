@@ -210,7 +210,7 @@ func (s *memMailServer) deliver(msg email.Message) {
 	s.mu.Unlock()
 }
 
-func (s *memMailServer) dial(e email.Email) (email.Mailbox, error) {
+func (s *memMailServer) dial(ctx context.Context, e email.Email) (email.Mailbox, error) {
 	wake := make(chan struct{}, 1)
 	s.mu.Lock()
 	s.wakes[wake] = struct{}{}
