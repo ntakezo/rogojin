@@ -12,9 +12,9 @@ import (
 	"github.com/ntakezo/rogojin/tasks"
 )
 
-// ErrTaskNotFound is returned when no record exists for the id, so the task
-// manager can tell a missing task apart from a store failure.
-var ErrTaskNotFound = errors.New("task not found")
+// ErrTaskNotFound is returned when no record exists for the id. It is the
+// port-wide tasks.ErrTaskNotFound, kept under its old name here.
+var ErrTaskNotFound = tasks.ErrTaskNotFound
 
 // Tasks is the tasks.Repository: one row per task carrying its placement,
 // last checkpoint, and terminal outcome, and one per task group.
