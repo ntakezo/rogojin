@@ -31,7 +31,9 @@ The portal to the internet is built for humans. Websites exclude bots from that 
 
 ## Installation
 
-Requires Go 1.27+; the SQLite adapter needs cgo.
+Requires Go 1.27+; the SQLite adapter needs cgo. The Postgres adapter
+(`postgres.Open` on a `postgres://` DSN, pure Go) is the store several nodes
+share when one process is not enough.
 
 ```sh
 go get github.com/ntakezo/rogojin
