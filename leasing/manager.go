@@ -558,6 +558,39 @@ func (m *Manager[R, P]) Update(ctx context.Context, id string, fn func(*R)) erro
 	return nil
 }
 
+// Increment atomically adds delta to the store counter under (scope, name)
+// and returns the new value — the write path for state that is a tally, not
+// a record: outcome stats, rotation cursors. Counters live beside the records
+// and survive them being re-saved; a delta of zero reads the current value.
+// Unlike Update, nothing here touches the cached records — a model whose
+// listed records project a counter pairs this with Amend so its local view
+// keeps pace between refreshes.
+func (m *Manager[R, P]) Increment(ctx context.Context, scope, name string, delta int64) (int64, error) {
+	return m.repo.Increment(ctx, scope, name, delta)
+}
+
+// Amend edits the cached copy of one resource without writing the store — for
+// fields whose durable truth is a counter the store projects into listed
+// records, where a Save would clobber nothing but a plain cache edit keeps
+// the local pool as current as the increment that just landed. The edit is
+// process-local and provisional: the next refresh replaces it with the
+// store's projection. fn runs under the manager lock and must not block; the
+// leasing fields are not fn's to change and are restored before the write.
+// Amending an id not in the pool is a no-op.
+func (m *Manager[R, P]) Amend(id string, fn func(*R)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	p, ok := m.pool[id]
+	if !ok {
+		return
+	}
+	kept := *m.core(&p)
+	fn(&p)
+	*m.core(&p) = kept
+	m.pool[id] = p
+}
+
 // Acquire leases a resource under a: its locked resource if it has one — a
 // durable binding outranks the requested group — otherwise the pinned member,
 // else one rotated from the group's unlocked members. It blocks until a
