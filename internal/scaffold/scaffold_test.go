@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -137,6 +138,16 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read repo go.sum: %v", err)
 	}
+	rootMod, err := os.ReadFile(filepath.Join(repoRoot, "go.mod"))
+	if err != nil {
+		t.Fatalf("read repo go.mod: %v", err)
+	}
+	// The throwaway module restates every requirement of the root module at
+	// the root's selected versions. With only the rogojin require, resolving
+	// the graph would traverse into each dependency's own go.mod and meet
+	// versions the root build never downloads — absent from a cold module
+	// cache, and unfetchable under GOPROXY=off.
+	requires := requireLines(t, string(rootMod))
 
 	for _, o := range validCombos() {
 		t.Run(comboName(o), func(t *testing.T) {
@@ -152,8 +163,11 @@ go 1.25.0
 
 require github.com/ntakezo/rogojin v0.0.0
 
+require (
+%s)
+
 replace github.com/ntakezo/rogojin => %s
-`, repoRoot)
+`, requires, repoRoot)
 			if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -169,6 +183,31 @@ replace github.com/ntakezo/rogojin => %s
 			}
 		})
 	}
+}
+
+// requireLines extracts every "path version" requirement from a go.mod, block
+// and single-line forms alike, as lines ready for a require block.
+func requireLines(t *testing.T, gomod string) string {
+	t.Helper()
+	var out strings.Builder
+	inBlock := false
+	for _, line := range strings.Split(gomod, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "require (":
+			inBlock = true
+		case inBlock && trimmed == ")":
+			inBlock = false
+		case inBlock && trimmed != "":
+			fmt.Fprintf(&out, "\t%s\n", trimmed)
+		case strings.HasPrefix(trimmed, "require "):
+			fmt.Fprintf(&out, "\t%s\n", strings.TrimPrefix(trimmed, "require "))
+		}
+	}
+	if out.Len() == 0 {
+		t.Fatal("no requirements found in the root go.mod")
+	}
+	return out.String()
 }
 
 func comboName(o Options) string {
