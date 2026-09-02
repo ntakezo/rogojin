@@ -7,7 +7,7 @@ New to the project (or to open source)? You're explicitly welcome here. Issues l
 ## Getting started
 
 1. Fork and clone the repository.
-2. Install [Go 1.25+](https://go.dev/dl/). The SQLite adapter tests need cgo, so make sure a C compiler is available (`CGO_ENABLED=1` is Go's default).
+2. Install [Go 1.27+](https://go.dev/dl/). The SQLite adapter tests need cgo, so make sure a C compiler is available (`CGO_ENABLED=1` is Go's default).
 3. Verify your setup:
 
    ```sh

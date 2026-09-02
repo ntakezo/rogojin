@@ -18,11 +18,13 @@ Work through these questions — from what the user already said where possible,
 | Does it pay for anything — checkout, subscription, top-up? | keep | `--no-payments` |
 | Does it wait on mail — verification links, OTP codes, order confirmations? | keep | `--no-email` |
 | Should inventory (proxies, accounts, …) and task history survive the process? | `--repo sqlite` (default) | `--repo memory` |
+| Will several processes share the work — a fleet over one database? | `--repo postgres` | `--repo sqlite` (default) |
 | Must a crashed task resume mid-run instead of restarting? | keep (durable) | `--no-durable` |
 
 Constraints and defaults:
 
-- **Durable requires sqlite.** `--repo memory --no-durable` go together; the CLI rejects durable-in-memory with an error saying so.
+- **Durable requires a repository.** `--repo memory --no-durable` go together; the CLI rejects durable-in-memory with an error saying so.
+- **Postgres is the fleet profile.** The generated main takes `-db` (a DSN for postgres, a file path for sqlite) and reads `ROGOJIN_NODE` for a stable node name; every process pointed at one database coordinates through it.
 - **Email and accounts are independent.** Together, the workflow reaches its inbox through the locked account's forwarding email; email alone listens on an inbox named in the task's `Input.EmailID`.
 - **Quick experiment / throwaway:** `--repo memory --no-durable`, and subtract whatever the experiment doesn't touch.
 - **Not sure?** Keep the feature. Subtracting later means deleting generated code you can see; adding later means re-scaffolding.

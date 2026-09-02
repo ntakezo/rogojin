@@ -57,6 +57,16 @@ To watch the whole thing work first:
 cd _examples && go run ./workflows/example
 ```
 
+## Deployment profiles
+
+One codebase, three ways to run it — the difference is only which repository the managers open:
+
+- **Embedded** (`--repo memory`) — everything in one process, nothing survives it. Experiments and tests.
+- **Single node** (`--repo sqlite`, the default) — one file holds every store; tasks, locks, and inventory survive restarts.
+- **Fleet** (`--repo postgres`) — N processes over one database. The store is the authority: task claims decide who runs what, leases and locks decide who holds what, and the effect log makes a side effect happen once fleet-wide, so two nodes can't run the same task or charge the same instrument. Kill a node and its work is claimable the moment its lease lapses — `_examples/workflows/fleet` is that story in one file, runnable on a shared sqlite file.
+
+Pre-1.0 note: this release collapsed the schema histories; a database file from an earlier release is refused at open — recreate it.
+
 ## Documentation
 
 The [API reference](https://pkg.go.dev/github.com/ntakezo/rogojin) is the documentation — start with `workflows` for the model, `tasks` for the runtime. Every package stands alone and carries a doc comment saying what it owns and why.

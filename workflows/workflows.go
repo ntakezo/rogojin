@@ -132,7 +132,9 @@ type PersistableWorkflow interface {
 // missing or mistyped one, so a wiring hole is a boot error, not a mid-run
 // one. Receiving managers here rather than at construction guarantees the
 // manager a workflow leases from is the same instance the task manager
-// unlocks through — two instances over one store silently strand locks.
+// unlocks through. One manager instance per kind per process is the
+// contract; instances in other processes coordinate through the shared
+// store, which is the authority on every lease and lock.
 type ResourceReceiver interface {
 	UseResources(managers map[leasing.Kind]any) error
 }

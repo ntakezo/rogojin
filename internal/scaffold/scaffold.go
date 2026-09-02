@@ -1,9 +1,9 @@
 // Package scaffold renders a runnable rogojin workflow package from a small set
 // of embedded templates. The feature flags on Options gate the durability hooks,
 // the leased resource kinds (proxies, accounts, payments), the email inbox
-// wiring, and whether the generated main persists to SQLite or runs the
-// managers in memory, so a generated tree always compiles and never carries
-// code it cannot use.
+// wiring, and which repository the generated main persists through — SQLite,
+// Postgres, or none, running the managers in memory — so a generated tree
+// always compiles and never carries code it cannot use.
 //
 // The templates reproduce framework surface (the workflows interfaces, the opt-in
 // capabilities, the manager constructors), so they drift when that
@@ -50,10 +50,44 @@ type Options struct {
 	// locked account's forwarding inbox; without, the workflow listens on an
 	// email ID named in its Input.
 	Email bool
-	// Persist wires SQLite repositories behind every manager in main; false
-	// passes nil repositories, running everything in memory with seeded
-	// placeholder records.
-	Persist bool
+	// Repo names the repository wired behind every manager in main: RepoSQLite
+	// or RepoPostgres persist through the named adapter; RepoMemory passes nil
+	// repositories, running everything in memory with seeded placeholder
+	// records.
+	Repo string
+}
+
+// The repositories a generated main can wire.
+const (
+	RepoSQLite   = "sqlite"
+	RepoPostgres = "postgres"
+	RepoMemory   = "memory"
+)
+
+// Persist reports whether the generated main opens a database at all. The
+// templates branch on it wherever sqlite and postgres read the same.
+func (o Options) Persist() bool {
+	return o.Repo != RepoMemory
+}
+
+// RepoPkg names the adapter package the generated main imports and calls. The
+// sqlite and postgres adapters share their constructor surface — Open, Close,
+// NewTasks, NewProxies, and the rest — which is what lets one template serve
+// both by swapping the package name.
+func (o Options) RepoPkg() string {
+	if o.Persist() {
+		return o.Repo
+	}
+	return ""
+}
+
+// DBDefault is the generated -db flag's default: a file beside the binary for
+// sqlite, a local DSN for postgres.
+func (o Options) DBDefault() string {
+	if o.Repo == RepoPostgres {
+		return "postgres://localhost:5432/" + o.Package + "?sslmode=disable"
+	}
+	return o.Package + ".db"
 }
 
 // Helpers names the lazy context helpers the enabled features emit, joined
@@ -108,8 +142,13 @@ func (o Options) Validate() error {
 	if token.IsKeyword(o.Package) || o.Package == "main" {
 		return fmt.Errorf("workflow name %q yields package %q, which is not usable as an importable package name — choose another name", o.Name, o.Package)
 	}
-	if o.Durable && !o.Persist {
-		return fmt.Errorf("a durable workflow needs a sqlite repository: an in-memory task repository never writes the snapshots the durability hooks produce — pass --no-durable or --repo sqlite")
+	switch o.Repo {
+	case RepoSQLite, RepoPostgres, RepoMemory:
+	default:
+		return fmt.Errorf("unknown repository %q: --repo takes sqlite, postgres, or memory", o.Repo)
+	}
+	if o.Durable && !o.Persist() {
+		return fmt.Errorf("a durable workflow needs a repository: an in-memory task repository never writes the snapshots the durability hooks produce — pass --no-durable, or --repo sqlite or postgres")
 	}
 	return nil
 }

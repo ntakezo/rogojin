@@ -42,6 +42,7 @@ var paymentMigrations = []migration{
 			group_id    TEXT NOT NULL DEFAULT 'global',
 			owner_id    TEXT NOT NULL DEFAULT '',
 			max_holders INTEGER NOT NULL DEFAULT 0,
+			version     INTEGER NOT NULL DEFAULT 0,
 			fields      TEXT NOT NULL DEFAULT '',
 			created_at  TEXT NOT NULL DEFAULT '',
 			updated_at  TEXT NOT NULL DEFAULT ''
@@ -56,10 +57,6 @@ var paymentMigrations = []migration{
 			created_at TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
-	},
-	{
-		Name: "add version column",
-		SQL:  `ALTER TABLE payments ADD COLUMN version INTEGER NOT NULL DEFAULT 0`,
 	},
 	{
 		Name: "create payment_holds table",
