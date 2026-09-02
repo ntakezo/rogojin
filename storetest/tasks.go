@@ -30,6 +30,18 @@ func seedTask(t *testing.T, repo tasks.Repository, id, workflowID string) {
 	}
 }
 
+// claimed takes node's claim on the task and returns the version its next
+// conditional write must carry — every write is conditional, so cases whose
+// subject is something else still claim like a run would.
+func claimed(t *testing.T, repo tasks.Repository, id, node string) int64 {
+	t.Helper()
+	rec, err := repo.ClaimTask(context.Background(), id, node, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimTask %s: %v", id, err)
+	}
+	return rec.Version
+}
+
 // Tasks exercises the full tasks.Repository contract against the store the
 // factory opens. The factory runs once per subtest; use t.Cleanup to close.
 func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
@@ -75,7 +87,9 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		repo := open(t)
 		seedTask(t, repo, "t1", "wf1")
 
-		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "add_to_cart", []byte(`{"cart":"abc"}`)); err != nil {
+		v := claimed(t, repo, "t1", "node-a")
+		v, err := repo.SaveCheckpoint(ctx, "t1", v, "node-a", "running", "add_to_cart", []byte(`{"cart":"abc"}`))
+		if err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 		rec, err := repo.RecoverTask(ctx, "t1")
@@ -86,7 +100,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 			t.Fatalf("got %+v, want running/add_to_cart checkpoint", rec)
 		}
 
-		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "suspended", "s2", []byte("b")); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", v, "node-a", "suspended", "s2", []byte("b")); err != nil {
 			t.Fatalf("SaveCheckpoint 2: %v", err)
 		}
 		rec, _ = repo.RecoverTask(ctx, "t1")
@@ -100,11 +114,13 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 	t.Run("MarkTerminal", func(t *testing.T) {
 		repo := open(t)
 		seedTask(t, repo, "t1", "wf1")
-		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "submit", []byte("snap")); err != nil {
+		v := claimed(t, repo, "t1", "node-a")
+		v, err := repo.SaveCheckpoint(ctx, "t1", v, "node-a", "running", "submit", []byte("snap"))
+		if err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 		out := []byte(`{"orderID":"order-1"}`)
-		if _, err := repo.MarkTerminal(ctx, "t1", tasks.AnyVersion, "", "done", out); err != nil {
+		if _, err := repo.MarkTerminal(ctx, "t1", v, "node-a", "done", out); err != nil {
 			t.Fatalf("MarkTerminal: %v", err)
 		}
 
@@ -124,10 +140,10 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		if _, err := repo.RecoverTask(ctx, "nope"); !errors.Is(err, tasks.ErrTaskNotFound) {
 			t.Fatalf("RecoverTask: err = %v, want tasks.ErrTaskNotFound", err)
 		}
-		if _, err := repo.SaveCheckpoint(ctx, "ghost", tasks.AnyVersion, "", "running", "s1", nil); !errors.Is(err, tasks.ErrTaskNotFound) {
+		if _, err := repo.SaveCheckpoint(ctx, "ghost", 1, "node-a", "running", "s1", nil); !errors.Is(err, tasks.ErrTaskNotFound) {
 			t.Fatalf("SaveCheckpoint: err = %v, want tasks.ErrTaskNotFound", err)
 		}
-		if _, err := repo.MarkTerminal(ctx, "ghost", tasks.AnyVersion, "", "done", nil); !errors.Is(err, tasks.ErrTaskNotFound) {
+		if _, err := repo.MarkTerminal(ctx, "ghost", 1, "node-a", "done", nil); !errors.Is(err, tasks.ErrTaskNotFound) {
 			t.Fatalf("MarkTerminal: err = %v, want tasks.ErrTaskNotFound", err)
 		}
 	})
@@ -142,7 +158,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 
 		seedTask(t, repo, "t1", "wf1")
 		seedTask(t, repo, "t2", "wf2")
-		if _, err := repo.MarkTerminal(ctx, "t2", tasks.AnyVersion, "", "done", nil); err != nil {
+		if _, err := repo.MarkTerminal(ctx, "t2", claimed(t, repo, "t2", "node-a"), "node-a", "done", nil); err != nil {
 			t.Fatalf("MarkTerminal: %v", err)
 		}
 
@@ -285,7 +301,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask: %v", err)
 		}
-		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "s1", []byte(`{"v":1}`)); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", claimed(t, repo, "t1", "node-a"), "node-a", "running", "s1", []byte(`{"v":1}`)); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 
@@ -383,7 +399,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 			t.Fatalf("timestamps = %v/%v, want both %v", got.CreatedAt, got.UpdatedAt, created)
 		}
 
-		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "s1", nil); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", claimed(t, repo, "t1", "node-a"), "node-a", "running", "s1", nil); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 		got, _ = repo.RecoverTask(ctx, "t1")
@@ -481,7 +497,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 			t.Fatalf("CreateTask: %v", err)
 		}
 		snap := []byte("snap")
-		if _, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "s1", snap); err != nil {
+		if _, err := repo.SaveCheckpoint(ctx, "t1", claimed(t, repo, "t1", "node-a"), "node-a", "running", "s1", snap); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 
@@ -519,7 +535,12 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 					t.Errorf("CreateTask %s: %v", id, err)
 					return
 				}
-				if _, err := repo.SaveCheckpoint(ctx, id, tasks.AnyVersion, "", "running", "s1", []byte(id)); err != nil {
+				claimedRec, err := repo.ClaimTask(ctx, id, "node-"+id, time.Minute)
+				if err != nil {
+					t.Errorf("ClaimTask %s: %v", id, err)
+					return
+				}
+				if _, err := repo.SaveCheckpoint(ctx, id, claimedRec.Version, "node-"+id, "running", "s1", []byte(id)); err != nil {
 					t.Errorf("SaveCheckpoint %s: %v", id, err)
 				}
 				if _, err := repo.RecoverAll(ctx); err != nil {
@@ -827,19 +848,16 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 			}
 		})
 
-		t.Run("AnyVersionBypassesThePredicate", func(t *testing.T) {
+		// There is no unconditional write: a caller without the claim and
+		// its version cannot write at all.
+		t.Run("NoUnconditionalWrite", func(t *testing.T) {
 			repo := open(t)
 			seedTask(t, repo, "t1", "wf1")
 			if _, err := repo.ClaimTask(ctx, "t1", "node-a", forever); err != nil {
 				t.Fatalf("ClaimTask: %v", err)
 			}
-
-			v, err := repo.SaveCheckpoint(ctx, "t1", tasks.AnyVersion, "", "running", "s1", nil)
-			if err != nil {
-				t.Fatalf("AnyVersion SaveCheckpoint: %v", err)
-			}
-			if v == 0 {
-				t.Fatal("AnyVersion write must still bump and report the version")
+			if _, err := repo.SaveCheckpoint(ctx, "t1", 0, "", "running", "s1", nil); !errors.Is(err, tasks.ErrStale) {
+				t.Fatalf("claimless SaveCheckpoint: err = %v, want tasks.ErrStale", err)
 			}
 		})
 	})
@@ -857,7 +875,7 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		if _, err := repo.ClaimTask(ctx, "expired", "node-a", 10*time.Millisecond); err != nil {
 			t.Fatalf("claim expired: %v", err)
 		}
-		if _, err := repo.MarkTerminal(ctx, "finished", tasks.AnyVersion, "", "done", nil); err != nil {
+		if _, err := repo.MarkTerminal(ctx, "finished", claimed(t, repo, "finished", "node-a"), "node-a", "done", nil); err != nil {
 			t.Fatalf("finish finished: %v", err)
 		}
 		time.Sleep(30 * time.Millisecond)

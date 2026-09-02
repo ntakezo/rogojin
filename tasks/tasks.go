@@ -70,14 +70,6 @@ var ErrClaimHeld = errors.New("task claim held by another node")
 // the signal to stop side-effecting — another writer owns the task now.
 var ErrStale = errors.New("stale task write")
 
-// AnyVersion, with an empty node, makes SaveCheckpoint and MarkTerminal
-// unconditional: the write skips the version and ownership predicate but
-// still bumps the version. It is transitional — it keeps the pre-claims
-// manager byte-identical while the port is widened underneath it — and is
-// removed by the claims-aware manager; it will not survive to adapters
-// beyond memory and sqlite.
-const AnyVersion int64 = -1
-
 // A Task is one task, whole: the durable record of its workflow, its
 // placement (task group, plus a per-kind resource assignment), its
 // last-checkpointed status and resume state with the snapshot taken there —
@@ -121,11 +113,14 @@ type Task struct {
 	// record. input feeds a fresh run; resolved is the effective placement per
 	// kind with group inheritance applied; recovered marks a task rebuilt from
 	// its record, so Start resumes at State from Snapshot instead of executing
-	// input from the beginning.
+	// input from the beginning. node and ttl are the manager's claim identity
+	// and lease length, which Start claims the task under.
 	input     any
 	resolved  map[leasing.Kind]workflows.Assignment
 	engine    *engine
 	recovered bool
+	node      string
+	ttl       time.Duration
 	// recordMu guards the exported record fields once a runtime is attached:
 	// Start's epilogue writes Status, Output, and UpdatedAt from whatever
 	// goroutine drives the run, and Record takes its copy under the same
@@ -167,8 +162,7 @@ type Repository interface {
 	ReleaseClaim(ctx context.Context, id, node string) error
 	// SaveCheckpoint writes iff version matches and node owns the claim,
 	// bumps the version, and returns the new one; ErrStale reports the
-	// write lost. AnyVersion with an empty node skips the predicate
-	// (transitional — see AnyVersion).
+	// write lost.
 	SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error)
 	// MarkTerminal is SaveCheckpoint's conditionality for the terminal
 	// stamp, and additionally clears the claim: a finished task is
@@ -296,26 +290,50 @@ func (t *Task) unseal() {
 // workflow produces none, or if the run errors or is killed. A run whose
 // terminal stamp fails to persist returns its output alongside the error.
 // A handle from Create shadows this with a Start decoded into the workflow's
-// declared output type. A recovered task resumes from its persisted
-// checkpoint instead of the graph's initial state; one recovered from a
-// suspended checkpoint starts parked there until Resume or Kill. A task built
-// from a bare record has no runtime and refuses; create or recover it
-// through a Manager. A handle drives at most one run: a second Start — the
-// first still in flight, finished, or detached — refuses with
+// declared output type. With a repository wired, Start first claims the task
+// for the manager's node — refusing with ErrClaimHeld when another node holds
+// a live claim — and a recovered task resumes from the claimed record's
+// checkpoint, which may be fresher than the one it was recovered with; one
+// resuming a suspended checkpoint starts parked there until Resume or Kill.
+// A task built from a bare record has no runtime and refuses; create or
+// recover it through a Manager. A handle drives at most one run: a second
+// Start — the first still in flight, finished, or detached — refuses with
 // ErrAlreadyStarted and leaves the record untouched.
 func (t *Task) Start(ctx context.Context) ([]byte, error) {
 	if t.engine == nil {
 		return nil, fmt.Errorf("task %s has no runtime: create or recover it through a Manager to start it", t.ID)
 	}
 
-	var err error
+	// The claim comes first: the store decides which node runs the task, and
+	// a Start that loses to a live claim never touches the workflow. The
+	// claimed record is fresher than a recovered handle's — another node may
+	// have advanced or finished the task since recovery — so it, not the
+	// rehydrated copy, is what the run resumes from.
+	record, err := t.engine.claim(ctx, t.node, t.ttl)
+	if err != nil {
+		// A record that no longer exists is a deletion, whichever node did it.
+		if errors.Is(err, ErrTaskNotFound) {
+			return nil, fmt.Errorf("task %s: %w", t.ID, ErrTaskDeleted)
+		}
+		return nil, fmt.Errorf("task %s: claim: %w", t.ID, err)
+	}
+
 	if t.recovered {
+		// The claim always bumps the version, so a strictly newer record is
+		// every claim's — and its checkpoint supersedes the recovered copy.
+		if record.Version > t.Version {
+			t.Version = record.Version
+			t.Status, t.State, t.Snapshot = record.Status, record.State, record.Snapshot
+			t.UpdatedAt = record.UpdatedAt
+		}
 		status := workflows.Status(t.Status)
+		// A refusal that runs nothing releases the claim it just took, so the
+		// task is immediately claimable elsewhere instead of after the lease.
 		if status == workflows.StatusNotStarted {
-			return nil, fmt.Errorf("task %s: %w", t.ID, ErrNoCheckpoint)
+			return nil, errors.Join(fmt.Errorf("task %s: %w", t.ID, ErrNoCheckpoint), t.engine.releaseClaim())
 		}
 		if status.Terminal() {
-			return nil, fmt.Errorf("task %s is %s: %w", t.ID, status, ErrAlreadyTerminal)
+			return nil, errors.Join(fmt.Errorf("task %s is %s: %w", t.ID, status, ErrAlreadyTerminal), t.engine.releaseClaim())
 		}
 		err = t.engine.Rehydrate(ctx, t.Snapshot, workflows.State(t.State), status == workflows.StatusSuspended)
 	} else {

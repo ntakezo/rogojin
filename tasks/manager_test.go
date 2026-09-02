@@ -90,6 +90,15 @@ func (r *recordStore) RecoverTask(ctx context.Context, id string) (Task, error) 
 	return r.record, nil
 }
 
+// ClaimTask honors the port's contract of returning the claimed record, so a
+// Start that refreshes from it sees the canned record, not a zero one.
+func (r *recordStore) ClaimTask(ctx context.Context, id, node string, ttl time.Duration) (Task, error) {
+	rec := r.record
+	rec.Version++
+	rec.OwnerNode = node
+	return rec, nil
+}
+
 // TestRecoverNeverCheckpointedTaskFailsLoud verifies a task that was created
 // but never checkpointed recovers into a task whose Start fails with
 // ErrNoCheckpoint. Its input was never persisted, so nothing can actually
@@ -156,8 +165,20 @@ func (m *memStore) MarkTerminal(ctx context.Context, id string, version int64, n
 	return 0, nil
 }
 
+// ClaimTask returns the claimed record per the port's contract — Start
+// refreshes a recovered handle from it — without enforcing lease exclusivity,
+// which the memory adapter covers where a test needs it.
 func (m *memStore) ClaimTask(ctx context.Context, id, node string, ttl time.Duration) (Task, error) {
-	return Task{}, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.records[id]
+	if !ok {
+		return Task{}, ErrTaskNotFound
+	}
+	rec.OwnerNode = node
+	rec.Version++
+	m.records[id] = rec
+	return rec, nil
 }
 func (m *memStore) RenewClaim(ctx context.Context, id, node string, ttl time.Duration) error {
 	return nil
@@ -1176,7 +1197,7 @@ func TestPinIsDurablePlacementThroughRecovery(t *testing.T) {
 	}
 
 	// Both pins survive the trip through the store.
-	if _, err := store.SaveCheckpoint(ctx, task.ID, AnyVersion, "", "running", "s1", nil); err != nil {
+	if _, err := store.SaveCheckpoint(ctx, task.ID, 1, "seed-node", "running", "s1", nil); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 	recovered, err := svc.RecoverTask(ctx, task.ID)
@@ -1263,7 +1284,7 @@ func TestAssignResourceRepointsAndReleasesStaleLock(t *testing.T) {
 	// The live handle keeps the placement it was wired with; the move lands on
 	// the next recovery.
 	assertPlacement(t, task, proxyKind, "residential", "")
-	if _, err := store.SaveCheckpoint(ctx, task.ID, AnyVersion, "", "running", "s1", nil); err != nil {
+	if _, err := store.SaveCheckpoint(ctx, task.ID, 1, "seed-node", "running", "s1", nil); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 	recovered, err := svc.RecoverTask(ctx, task.ID)
@@ -1300,7 +1321,7 @@ func TestAssignResourceLeavesOtherKindsAlone(t *testing.T) {
 		t.Fatalf("AssignResource: %v", err)
 	}
 
-	if _, err := store.SaveCheckpoint(ctx, task.ID, AnyVersion, "", "running", "s1", nil); err != nil {
+	if _, err := store.SaveCheckpoint(ctx, task.ID, 1, "seed-node", "running", "s1", nil); err != nil {
 		t.Fatalf("SaveCheckpoint: %v", err)
 	}
 	recovered, err := svc.RecoverTask(ctx, task.ID)
