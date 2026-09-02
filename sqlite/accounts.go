@@ -31,13 +31,12 @@ func NewAccounts(db *DB) (accounts.Repository, error) {
 var accountMigrations = []migration{
 	{
 		Name: "create accounts table",
-		SQL: `CREATE TABLE IF NOT EXISTS accounts (
+		SQL: `CREATE TABLE accounts (
 			id          TEXT PRIMARY KEY,
 			group_id    TEXT NOT NULL DEFAULT 'global',
 			owner_id    TEXT NOT NULL DEFAULT '',
 			max_holders INTEGER NOT NULL DEFAULT 0,
-			successes   INTEGER NOT NULL DEFAULT 0,
-			failures    INTEGER NOT NULL DEFAULT 0,
+			email_id    TEXT NOT NULL DEFAULT '',
 			fields      TEXT NOT NULL DEFAULT '',
 			created_at  TEXT NOT NULL DEFAULT '',
 			updated_at  TEXT NOT NULL DEFAULT ''
@@ -45,30 +44,18 @@ var accountMigrations = []migration{
 	},
 	{
 		Name: "create account_groups table",
-		SQL: `CREATE TABLE IF NOT EXISTS account_groups (
-			id          TEXT PRIMARY KEY,
-			max_holders INTEGER NOT NULL DEFAULT 0,
-			created_at  TEXT NOT NULL DEFAULT '',
-			updated_at  TEXT NOT NULL DEFAULT ''
+		SQL: `CREATE TABLE account_groups (
+			id         TEXT PRIMARY KEY,
+			strategy   TEXT NOT NULL DEFAULT '',
+			refs       TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
-	},
-	{
-		Name: "add strategy column to account_groups",
-		SQL:  `ALTER TABLE account_groups ADD COLUMN strategy TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "add email_id column to accounts",
-		SQL:  `ALTER TABLE accounts ADD COLUMN email_id TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "add refs column to account_groups",
-		SQL:  `ALTER TABLE account_groups ADD COLUMN refs TEXT NOT NULL DEFAULT ''`,
 	},
 }
 
 // List returns every stored account in stable id order, so the manager's pool
-// order is deterministic. The successes and failures columns are legacy —
-// accounts keep no lease outcomes — and are left unread.
+// order is deterministic.
 func (s *Accounts) List(ctx context.Context) ([]accounts.Account, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, group_id, owner_id, max_holders, email_id, fields, created_at, updated_at
@@ -132,9 +119,7 @@ func (s *Accounts) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListGroups returns every stored account group in stable id order. The
-// max_holders column is legacy — holder policy lives on the account — and is
-// left unread.
+// ListGroups returns every stored account group in stable id order.
 func (s *Accounts) ListGroups(ctx context.Context) ([]accounts.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, strategy, refs, created_at, updated_at FROM account_groups ORDER BY id`)

@@ -31,7 +31,7 @@ func NewEmails(db *DB) (email.Repository, error) {
 var emailMigrations = []migration{
 	{
 		Name: "create emails table",
-		SQL: `CREATE TABLE IF NOT EXISTS emails (
+		SQL: `CREATE TABLE emails (
 			id           TEXT PRIMARY KEY,
 			address      TEXT NOT NULL DEFAULT '',
 			vendor       TEXT NOT NULL DEFAULT '',

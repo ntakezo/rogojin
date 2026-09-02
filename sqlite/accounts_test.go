@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"github.com/ntakezo/rogojin/leasing"
 	"path/filepath"
@@ -222,54 +221,6 @@ func TestAccountsGroupRoundTrip(t *testing.T) {
 	}
 	if listed, err = repo.ListGroups(ctx); err != nil || len(listed) != 0 {
 		t.Fatalf("after delete: %v, %v", listed, err)
-	}
-}
-
-// TestAccountsAdoptsAPreLedgerDatabase verifies the upgrade path for a database written
-// before migrations were recorded in a ledger, when progress lived in the
-// file-header counter. Its rows must survive and its schema must not be
-// re-migrated, since the store is opened by the same code on every start.
-func TestAccountsAdoptsAPreLedgerDatabase(t *testing.T) {
-	dsn := filepath.Join(t.TempDir(), "accounts.db")
-	ctx := context.Background()
-
-	// Hand-build what the old code left behind: both tables as they stood at
-	// counter 2 — before the strategy column existed — and no ledger.
-	raw, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	for _, m := range accountMigrations[:2] {
-		if _, err := raw.Exec(m.SQL); err != nil {
-			t.Fatalf("seed %s: %v", m.Name, err)
-		}
-	}
-	if _, err := raw.Exec(`INSERT INTO accounts (id, group_id) VALUES ('a1', 'site')`); err != nil {
-		t.Fatalf("seed row: %v", err)
-	}
-	if _, err := raw.Exec(`PRAGMA user_version = 2`); err != nil {
-		t.Fatalf("seed counter: %v", err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("close raw: %v", err)
-	}
-
-	repoDB := openAt(t, dsn)
-	repo, err := NewAccounts(repoDB)
-	if err != nil {
-		t.Fatalf("open a pre-ledger database: %v", err)
-	}
-	defer repoDB.Close()
-
-	listed, err := repo.List(ctx)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(listed) != 1 || listed[0].ID != "a1" {
-		t.Fatalf("got %+v, want the row the old database held", listed)
-	}
-	if err := repo.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a2"}}); err != nil {
-		t.Fatalf("save after adoption: %v", err)
 	}
 }
 

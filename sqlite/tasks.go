@@ -37,45 +37,27 @@ func NewTasks(db *DB) (tasks.Repository, error) {
 var taskMigrations = []migration{
 	{
 		Name: "create tasks table",
-		SQL: `CREATE TABLE IF NOT EXISTS tasks (
+		SQL: `CREATE TABLE tasks (
 			id          TEXT PRIMARY KEY,
 			workflow_id TEXT NOT NULL,
+			group_id    TEXT NOT NULL DEFAULT 'global',
+			assignments TEXT NOT NULL DEFAULT '',
 			state       TEXT NOT NULL DEFAULT '',
 			status      TEXT NOT NULL DEFAULT '',
-			snapshot    BLOB
+			snapshot    BLOB,
+			output      BLOB,
+			created_at  TEXT NOT NULL DEFAULT '',
+			updated_at  TEXT NOT NULL DEFAULT ''
 		)`,
-	},
-	{
-		Name: "add output column for task results",
-		SQL:  `ALTER TABLE tasks ADD COLUMN output BLOB`,
-	},
-	{
-		Name: "add group_id column placing existing tasks in the global group",
-		SQL:  `ALTER TABLE tasks ADD COLUMN group_id TEXT NOT NULL DEFAULT 'global'`,
-	},
-	{
-		Name: "add created_at column to tasks",
-		SQL:  `ALTER TABLE tasks ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "add updated_at column to tasks",
-		SQL:  `ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
 	},
 	{
 		Name: "create task_groups table",
-		SQL: `CREATE TABLE IF NOT EXISTS task_groups (
-			id         TEXT PRIMARY KEY,
-			created_at TEXT NOT NULL DEFAULT '',
-			updated_at TEXT NOT NULL DEFAULT ''
+		SQL: `CREATE TABLE task_groups (
+			id              TEXT PRIMARY KEY,
+			resource_groups TEXT NOT NULL DEFAULT '',
+			created_at      TEXT NOT NULL DEFAULT '',
+			updated_at      TEXT NOT NULL DEFAULT ''
 		)`,
-	},
-	{
-		Name: "add assignments column generalizing placement to any resource kind",
-		SQL:  `ALTER TABLE tasks ADD COLUMN assignments TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "add resource_groups column generalizing task group assignment",
-		SQL:  `ALTER TABLE task_groups ADD COLUMN resource_groups TEXT NOT NULL DEFAULT ''`,
 	},
 }
 

@@ -35,13 +35,11 @@ func NewPayments(db *DB) (payments.Repository, error) {
 var paymentMigrations = []migration{
 	{
 		Name: "create payments table",
-		SQL: `CREATE TABLE IF NOT EXISTS payments (
+		SQL: `CREATE TABLE payments (
 			id          TEXT PRIMARY KEY,
 			group_id    TEXT NOT NULL DEFAULT 'global',
 			owner_id    TEXT NOT NULL DEFAULT '',
 			max_holders INTEGER NOT NULL DEFAULT 0,
-			successes   INTEGER NOT NULL DEFAULT 0,
-			failures    INTEGER NOT NULL DEFAULT 0,
 			fields      TEXT NOT NULL DEFAULT '',
 			created_at  TEXT NOT NULL DEFAULT '',
 			updated_at  TEXT NOT NULL DEFAULT ''
@@ -49,26 +47,18 @@ var paymentMigrations = []migration{
 	},
 	{
 		Name: "create payment_groups table",
-		SQL: `CREATE TABLE IF NOT EXISTS payment_groups (
-			id          TEXT PRIMARY KEY,
-			max_holders INTEGER NOT NULL DEFAULT 0,
-			created_at  TEXT NOT NULL DEFAULT '',
-			updated_at  TEXT NOT NULL DEFAULT ''
+		SQL: `CREATE TABLE payment_groups (
+			id         TEXT PRIMARY KEY,
+			strategy   TEXT NOT NULL DEFAULT '',
+			refs       TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
-	},
-	{
-		Name: "add strategy column to payment_groups",
-		SQL:  `ALTER TABLE payment_groups ADD COLUMN strategy TEXT NOT NULL DEFAULT ''`,
-	},
-	{
-		Name: "add refs column to payment_groups",
-		SQL:  `ALTER TABLE payment_groups ADD COLUMN refs TEXT NOT NULL DEFAULT ''`,
 	},
 }
 
 // List returns every stored payment in stable id order, so the manager's pool
-// order is deterministic. The successes and failures columns are legacy —
-// payments keep no lease outcomes — and are left unread.
+// order is deterministic.
 func (s *Payments) List(ctx context.Context) ([]payments.Payment, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, group_id, owner_id, max_holders, fields, created_at, updated_at
@@ -132,9 +122,7 @@ func (s *Payments) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListGroups returns every stored payment group in stable id order. The
-// max_holders column is legacy — holder policy lives on the payment — and is
-// left unread.
+// ListGroups returns every stored payment group in stable id order.
 func (s *Payments) ListGroups(ctx context.Context) ([]payments.Group, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, strategy, refs, created_at, updated_at FROM payment_groups ORDER BY id`)
