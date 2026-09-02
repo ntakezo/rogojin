@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +33,14 @@ var ErrNoCheckpoint = errors.New("task has no checkpoint to resume from")
 // in the middle of deleting. Its record is gone, so a run would checkpoint into
 // nothing; the handle is dead and the task must be re-created.
 var ErrTaskDeleted = errors.New("task deleted")
+
+// ErrAlreadyStarted is returned by Start on a task whose run has already begun
+// — still in flight, finished, or ended by Detach. A handle drives at most one
+// run, and only that run's Start brings the record current on exit; a second
+// call refuses loudly rather than reading as an instant clean completion, and
+// leaves the record alone. The first Start's return is the run's outcome —
+// watch it through IsRunning and LiveStatus instead.
+var ErrAlreadyStarted = errors.New("task already started")
 
 // ErrAlreadyTerminal is returned by Start on a task recovered with a terminal
 // outcome (done or killed): its run is over, and re-executing the final state
@@ -57,8 +66,9 @@ var ErrDetached = errors.New("task detached from its suspended run")
 // Repositories store and return the record alone — a Task built from a bare
 // record has no runtime, and only a Manager attaches one. The exported fields
 // are written at creation, at recovery, and by Start when the run exits, and
-// belong to the goroutine driving the task; Suspend, Resume, Kill, and
-// IsRunning are live and safe from any goroutine.
+// belong to the goroutine driving the task; any other goroutine reads them
+// through Record, which synchronizes with that exit. Suspend, Resume, Kill,
+// and IsRunning are live and safe from any goroutine.
 type Task struct {
 	ID          string                      `json:"id"`
 	WorkflowID  string                      `json:"workflowId"`
@@ -82,6 +92,13 @@ type Task struct {
 	resolved  map[leasing.Kind]workflows.Assignment
 	engine    *engine
 	recovered bool
+	// recordMu guards the exported record fields once a runtime is attached:
+	// Start's epilogue writes Status, Output, and UpdatedAt from whatever
+	// goroutine drives the run, and Record takes its copy under the same
+	// lock. It is a pointer so the value copies record() and the repositories
+	// traffic in never carry a lock; a bare record has no runtime, no writer
+	// to race, and no mutex.
+	recordMu *sync.Mutex
 }
 
 // Repository is the persistence port the consumer implements: a dumb store of
@@ -129,6 +146,7 @@ func createTask(workflow workflows.Workflow, workflowID string, input any, bus c
 		UpdatedAt:   now,
 		input:       input,
 		resolved:    resolved,
+		recordMu:    &sync.Mutex{},
 	}
 	t.engine = newEngine(workflow, workflows.Deps{TaskID: t.ID, Bus: bus, Assignments: resolved}, repo)
 	return t, nil
@@ -143,15 +161,32 @@ func rehydrateTask(workflow workflows.Workflow, record Task, bus comms.Bus, repo
 	t.resolved = resolved
 	t.engine = newEngine(workflow, workflows.Deps{TaskID: t.ID, Bus: bus, Assignments: resolved}, repo)
 	t.recovered = true
+	t.recordMu = &sync.Mutex{}
 	return &t
 }
 
 // record returns the task's durable record alone, the run surface stripped, so
-// a repository never holds live engine state.
+// a repository never holds live engine state. It reads the record fields
+// unsynchronized; callers race Start's exit unless they hold recordMu or the
+// task is not yet shared — Record is the safe surface.
 func (t *Task) record() Task {
 	rec := *t
-	rec.input, rec.resolved, rec.engine, rec.recovered = nil, nil, nil, false
+	rec.input, rec.resolved, rec.engine, rec.recovered, rec.recordMu = nil, nil, nil, false, nil
 	return rec
+}
+
+// Record returns a point-in-time copy of the task's durable record, the run
+// surface stripped — exactly what a repository stores. Start brings the record
+// current from the goroutine driving the run, so any other goroutine wanting
+// the record takes its copy here, where the read synchronizes with that write,
+// rather than off the exported fields directly. A task built from a bare
+// record has no runtime and no writer to race, and reads as-is.
+func (t *Task) Record() Task {
+	if t.recordMu != nil {
+		t.recordMu.Lock()
+		defer t.recordMu.Unlock()
+	}
+	return t.record()
 }
 
 // Assignment reports the placement this task leases the kind under: the group,
@@ -183,7 +218,9 @@ func (t *Task) unseal() {
 // checkpoint instead of the graph's initial state; one recovered from a
 // suspended checkpoint starts parked there until Resume or Kill. A task built
 // from a bare record has no runtime and refuses; create or recover it
-// through a Manager.
+// through a Manager. A handle drives at most one run: a second Start — the
+// first still in flight, finished, or detached — refuses with
+// ErrAlreadyStarted and leaves the record untouched.
 func (t *Task) Start(ctx context.Context) ([]byte, error) {
 	if t.engine == nil {
 		return nil, fmt.Errorf("task %s has no runtime: create or recover it through a Manager to start it", t.ID)
@@ -203,17 +240,28 @@ func (t *Task) Start(ctx context.Context) ([]byte, error) {
 		err = t.engine.Execute(ctx, t.input)
 	}
 
+	// Another Start owns this run. Its exit — not this refusal — is what
+	// brings the record current, so the epilogue must not run here: rewriting
+	// Status or Output now would race the goroutine the run belongs to.
+	if errors.Is(err, ErrAlreadyStarted) {
+		return nil, fmt.Errorf("task %s: %w", t.ID, err)
+	}
+
 	// The run is over (or refused before starting): bring the record current so
-	// the caller reads the outcome off the task itself. Output is harvested
-	// only on clean completion, so error exits still yield nil — except a
-	// failed terminal stamp, where the result exists and is returned alongside
-	// the error.
+	// the caller reads the outcome off the task itself, under the record lock
+	// so a concurrent Record never reads the exit half-written. Output is
+	// harvested only on clean completion, so error exits still yield nil —
+	// except a failed terminal stamp, where the result exists and is returned
+	// alongside the error.
+	t.recordMu.Lock()
 	if status := t.engine.Status(); status != workflows.StatusNotStarted {
 		t.Status = string(status)
 		t.UpdatedAt = time.Now().UTC()
 	}
 	t.Output = t.engine.Output()
-	return t.Output, err
+	output := t.Output
+	t.recordMu.Unlock()
+	return output, err
 }
 
 // IsRunning reports whether the task is started and not yet terminal. A
@@ -262,7 +310,7 @@ func (t *Task) Resume() error {
 // ErrDetached after Teardown runs (releasing the run's leases); afterwards
 // the task is no longer live: IsRunning reports false, it may be deleted, and
 // Manager.RecoverTask returns a fresh handle rehydrated from the checkpoint.
-// This handle is spent — a further Start on it is a no-op.
+// This handle is spent — a further Start on it refuses with ErrAlreadyStarted.
 func (t *Task) Detach() error {
 	if t.engine == nil {
 		return errors.New("task has no runtime")

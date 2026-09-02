@@ -268,7 +268,9 @@ func (m *manager) TasksInGroup(ctx context.Context, groupID string) ([]string, e
 		defer m.taskRegistryMu.RUnlock()
 		ids := make([]string, 0)
 		for id, t := range m.taskRegistry {
-			if groupOf(t.record()) == groupID {
+			// Record, not record: a member's Start may be exiting right now,
+			// and this read must synchronize with that write.
+			if groupOf(t.Record()) == groupID {
 				ids = append(ids, id)
 			}
 		}

@@ -1585,3 +1585,106 @@ func TestUpdateGroupGlobal(t *testing.T) {
 		t.Fatalf("global task wired to proxy group %q, want residential", got)
 	}
 }
+
+// TestTasksInGroupDoesNotRaceStart verifies the manager reads a live task's
+// record through the locked Record accessor: in nil-repository mode
+// TasksInGroup walks the registry while Start's epilogue is bringing records
+// current, and an unsynchronized read there is a data race — this test fails
+// under -race with a direct field read, not with a wrong answer.
+func TestTasksInGroupDoesNotRaceStart(t *testing.T) {
+	svc := mustManager(t, nil, comms.NewBus())
+	var log []workflows.State
+	wf := &gatedWorkflow{log: &log, entered: make(chan struct{}), release: make(chan struct{})}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(ctx); done <- serr }()
+	<-wf.entered
+
+	// Hammer the group listing across the run's exit, so the registry read
+	// overlaps the epilogue's record write.
+	stop := make(chan struct{})
+	listed := make(chan struct{})
+	go func() {
+		defer close(listed)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if _, lerr := svc.TasksInGroup(ctx, GlobalGroup); lerr != nil {
+					return
+				}
+			}
+		}
+	}()
+	close(wf.release)
+	if err := <-done; err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	close(stop)
+	<-listed
+
+	ids, err := svc.TasksInGroup(ctx, GlobalGroup)
+	if err != nil {
+		t.Fatalf("TasksInGroup: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != task.ID {
+		t.Fatalf("TasksInGroup = %v, want [%s]", ids, task.ID)
+	}
+}
+
+// TestSecondStartRefuses verifies a handle drives at most one run: a Start
+// issued while the first is in flight, and another after it finishes, both
+// refuse with ErrAlreadyStarted instead of reading as an instant clean
+// completion — and neither touches the record the first run's exit wrote.
+func TestSecondStartRefuses(t *testing.T) {
+	svc := mustManager(t, newMemStore(), comms.NewBus())
+	var log []workflows.State
+	wf := &gatedWorkflow{log: &log, entered: make(chan struct{}), release: make(chan struct{})}
+	if err := svc.RegisterWorkflow(wf.ID(), wf); err != nil {
+		t.Fatalf("RegisterWorkflow: %v", err)
+	}
+	ctx := context.Background()
+
+	task, err := svc.CreateTask(ctx, wf.ID(), nil)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, serr := task.Start(ctx); done <- serr }()
+	<-wf.entered
+
+	// Against the live run: refuse, don't queue and don't report completion.
+	if out, serr := task.Start(ctx); !errors.Is(serr, ErrAlreadyStarted) {
+		t.Fatalf("Start on a live run = (%v, %v), want ErrAlreadyStarted", out, serr)
+	}
+
+	close(wf.release)
+	if serr := <-done; serr != nil {
+		t.Fatalf("first Start: %v", serr)
+	}
+	first := task.Record()
+	if workflows.Status(first.Status) != workflows.StatusDone {
+		t.Fatalf("Status after first run = %q, want done", first.Status)
+	}
+
+	// Against the finished run: still ErrAlreadyStarted, record untouched.
+	out, serr := task.Start(ctx)
+	if !errors.Is(serr, ErrAlreadyStarted) {
+		t.Fatalf("Start on a finished run = %v, want ErrAlreadyStarted", serr)
+	}
+	if out != nil {
+		t.Fatalf("second Start output = %v, want nil", out)
+	}
+	if second := task.Record(); !reflect.DeepEqual(first, second) {
+		t.Fatalf("second Start rewrote the record:\nbefore %+v\nafter  %+v", first, second)
+	}
+}
