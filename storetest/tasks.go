@@ -875,4 +875,128 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 			t.Fatalf("ListClaimable = %v, want [expired unclaimed]: live claims and terminal tasks are not for taking", ids)
 		}
 	})
+
+	t.Run("Effects", func(t *testing.T) {
+		t.Run("FirstRecordWins", func(t *testing.T) {
+			repo := open(t)
+			stored, first, err := repo.RecordEffect(ctx, "t1", "mint", []byte(`"ours"`))
+			if err != nil || !first || string(stored) != `"ours"` {
+				t.Fatalf("first record = %q/%v/%v, want ours/true/nil", stored, first, err)
+			}
+			stored, first, err = repo.RecordEffect(ctx, "t1", "mint", []byte(`"theirs"`))
+			if err != nil || first || string(stored) != `"ours"` {
+				t.Fatalf("second record = %q/%v/%v, want the first record back with first=false", stored, first, err)
+			}
+		})
+
+		t.Run("KeysAreScopedToTheTask", func(t *testing.T) {
+			repo := open(t)
+			if _, _, err := repo.RecordEffect(ctx, "t1", "mint", []byte(`1`)); err != nil {
+				t.Fatalf("record t1: %v", err)
+			}
+			stored, first, err := repo.RecordEffect(ctx, "t2", "mint", []byte(`2`))
+			if err != nil || !first || string(stored) != `2` {
+				t.Fatalf("t2 record = %q/%v/%v, want its own first record", stored, first, err)
+			}
+		})
+
+		t.Run("EmptyResultRoundTrips", func(t *testing.T) {
+			repo := open(t)
+			if _, first, err := repo.RecordEffect(ctx, "t1", "ping", nil); err != nil || !first {
+				t.Fatalf("record nil result: first=%v err=%v", first, err)
+			}
+			effects, err := repo.ListEffects(ctx, "t1")
+			if err != nil {
+				t.Fatalf("ListEffects: %v", err)
+			}
+			result, ok := effects["ping"]
+			if !ok || len(result) != 0 {
+				t.Fatalf("effects[ping] = %q/%v, want a present empty record", result, ok)
+			}
+		})
+
+		t.Run("ListRoundTrip", func(t *testing.T) {
+			repo := open(t)
+			want := map[string][]byte{"a": []byte(`{"n":1}`), "b": []byte(`"x"`)}
+			for key, result := range want {
+				if _, _, err := repo.RecordEffect(ctx, "t1", key, result); err != nil {
+					t.Fatalf("record %s: %v", key, err)
+				}
+			}
+			effects, err := repo.ListEffects(ctx, "t1")
+			if err != nil {
+				t.Fatalf("ListEffects: %v", err)
+			}
+			if len(effects) != len(want) {
+				t.Fatalf("effects = %d entries, want %d", len(effects), len(want))
+			}
+			for key, result := range want {
+				if string(effects[key]) != string(result) {
+					t.Fatalf("effects[%s] = %q, want %q", key, effects[key], result)
+				}
+			}
+			// A task with no effects lists empty, not an error.
+			effects, err = repo.ListEffects(ctx, "t2")
+			if err != nil || len(effects) != 0 {
+				t.Fatalf("ListEffects of an effectless task = %v/%v, want empty/nil", effects, err)
+			}
+		})
+
+		t.Run("DeleteTaskCascades", func(t *testing.T) {
+			repo := open(t)
+			seedTask(t, repo, "t1", "wf1")
+			if _, _, err := repo.RecordEffect(ctx, "t1", "mint", []byte(`1`)); err != nil {
+				t.Fatalf("record: %v", err)
+			}
+			if err := repo.DeleteTask(ctx, "t1"); err != nil {
+				t.Fatalf("DeleteTask: %v", err)
+			}
+			effects, err := repo.ListEffects(ctx, "t1")
+			if err != nil || len(effects) != 0 {
+				t.Fatalf("effects after delete = %v/%v, want empty/nil", effects, err)
+			}
+		})
+
+		t.Run("RecordRace", func(t *testing.T) {
+			// Racing recorders on one key must resolve to exactly one first
+			// and one recorded result — the loser reads the winner's bytes.
+			repo := open(t)
+			for round := range 10 {
+				key := fmt.Sprintf("effect-%d", round)
+				const racers = 4
+				var wg sync.WaitGroup
+				firsts := make([]bool, racers)
+				results := make([][]byte, racers)
+				for i := range racers {
+					wg.Go(func() {
+						mine := []byte(fmt.Sprintf(`"racer-%d"`, i))
+						stored, first, err := repo.RecordEffect(ctx, "t1", key, mine)
+						if err != nil {
+							t.Errorf("round %d racer %d: %v", round, i, err)
+							return
+						}
+						firsts[i], results[i] = first, stored
+					})
+				}
+				wg.Wait()
+				if t.Failed() {
+					return
+				}
+				winners := 0
+				for _, first := range firsts {
+					if first {
+						winners++
+					}
+				}
+				if winners != 1 {
+					t.Fatalf("round %d: %d firsts, want exactly 1", round, winners)
+				}
+				for i := 1; i < racers; i++ {
+					if string(results[i]) != string(results[0]) {
+						t.Fatalf("round %d: racers saw different results: %q vs %q", round, results[0], results[i])
+					}
+				}
+			}
+		})
+	})
 }

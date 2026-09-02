@@ -174,6 +174,19 @@ type Repository interface {
 	// stamp, and additionally clears the claim: a finished task is
 	// nobody's to run.
 	MarkTerminal(ctx context.Context, id string, version int64, node, outcome string, output []byte) (int64, error)
+	// RecordEffect stores result under (taskID, key) if no record exists,
+	// and returns the stored result either way; first reports whether this
+	// call created it. It is the at-most-once guard for workflow effects:
+	// durable the moment the effect lands, and keyed so two runs racing
+	// the same task resolve to one recorded result — the loser reads the
+	// winner's bytes back instead of double-recording. The store does not
+	// require the task row to exist; the manager guarantees task
+	// existence, and the store stays dumb.
+	RecordEffect(ctx context.Context, taskID, key string, result []byte) (stored []byte, first bool, err error)
+	// ListEffects returns every effect recorded for the task, keyed by
+	// effect key — what recovery seeds a rebuilt instance's effect cache
+	// from.
+	ListEffects(ctx context.Context, taskID string) (map[string][]byte, error)
 	RecoverTask(ctx context.Context, id string) (Task, error)
 	// SaveAssignment repoints a task's placement for one kind, leaving every
 	// other kind and the rest of the record untouched. A nil field clears the
@@ -184,6 +197,8 @@ type Repository interface {
 	// the taking: unclaimed, or leased past expiry — the recovery sweep's
 	// worklist.
 	ListClaimable(ctx context.Context) ([]Task, error)
+	// DeleteTask removes the task's record and its recorded effects;
+	// absent ids are a no-op.
 	DeleteTask(ctx context.Context, id string) error
 	SaveGroup(ctx context.Context, group Group) error
 	// GetGroup reports the group and whether it exists, so a missing group is

@@ -162,6 +162,12 @@ func (m *memStore) ClaimTask(ctx context.Context, id, node string, ttl time.Dura
 func (m *memStore) RenewClaim(ctx context.Context, id, node string, ttl time.Duration) error {
 	return nil
 }
+func (m *memStore) RecordEffect(ctx context.Context, taskID, key string, result []byte) ([]byte, bool, error) {
+	return result, true, nil
+}
+func (m *memStore) ListEffects(ctx context.Context, taskID string) (map[string][]byte, error) {
+	return nil, nil
+}
 func (m *memStore) ReleaseClaim(ctx context.Context, id, node string) error { return nil }
 func (m *memStore) ListClaimable(ctx context.Context) ([]Task, error)       { return nil, nil }
 

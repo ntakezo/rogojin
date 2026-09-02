@@ -72,6 +72,16 @@ var taskMigrations = []migration{
 		Name: "add lease_expires_at column",
 		SQL:  `ALTER TABLE tasks ADD COLUMN lease_expires_at INTEGER NOT NULL DEFAULT 0`,
 	},
+	{
+		Name: "create task_effects table",
+		SQL: `CREATE TABLE task_effects (
+			task_id    TEXT NOT NULL,
+			key        TEXT NOT NULL,
+			result     BLOB,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (task_id, key)
+		)`,
+	},
 }
 
 // The lease expiry is stored as unix milliseconds, not RFC3339Nano text like
@@ -338,13 +348,70 @@ func (s *Tasks) listTasks(ctx context.Context, op, query string, args ...any) ([
 	return records, nil
 }
 
-// DeleteTask removes the task's record; absent rows are a no-op.
+// DeleteTask removes the task's record and its recorded effects; absent rows
+// are a no-op. Effects go first: task ids are never reused, so a crash
+// between the deletes leaves either an intact task or nothing referencing
+// the gone one, never orphaned effects a future task could read.
 func (s *Tasks) DeleteTask(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, id)
-	if err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM task_effects WHERE task_id = ?`, id); err != nil {
+		return fmt.Errorf("delete task %s: %w", id, err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("delete task %s: %w", id, err)
 	}
 	return nil
+}
+
+// RecordEffect stores result under (taskID, key) if no record exists, and
+// returns the stored result either way; first reports whether this call
+// created it. The insert-or-ignore and the read-back are two statements, but
+// the primary key makes the pair correct under any interleaving: whoever
+// inserted, the read returns the one recorded result.
+func (s *Tasks) RecordEffect(ctx context.Context, taskID, key string, result []byte) ([]byte, bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO task_effects (task_id, key, result, created_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(task_id, key) DO NOTHING`,
+		taskID, key, result, formatTime(time.Now().UTC()))
+	if err != nil {
+		return nil, false, fmt.Errorf("record effect %s/%s: %w", taskID, key, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("record effect %s/%s: %w", taskID, key, err)
+	}
+	if n == 1 {
+		return result, true, nil
+	}
+	var stored []byte
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT result FROM task_effects WHERE task_id = ? AND key = ?`, taskID, key).Scan(&stored); err != nil {
+		return nil, false, fmt.Errorf("record effect %s/%s: %w", taskID, key, err)
+	}
+	return stored, false, nil
+}
+
+// ListEffects returns every effect recorded for the task, keyed by effect key.
+func (s *Tasks) ListEffects(ctx context.Context, taskID string) (map[string][]byte, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT key, result FROM task_effects WHERE task_id = ?`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("list effects %s: %w", taskID, err)
+	}
+	defer rows.Close()
+
+	effects := make(map[string][]byte)
+	for rows.Next() {
+		var key string
+		var result []byte
+		if err := rows.Scan(&key, &result); err != nil {
+			return nil, fmt.Errorf("list effects %s: %w", taskID, err)
+		}
+		effects[key] = result
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list effects %s: %w", taskID, err)
+	}
+	return effects, nil
 }
 
 // SaveGroup upserts the task group's record. created_at is written on insert
