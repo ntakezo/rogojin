@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ntakezo/rogojin/email"
 	"github.com/ntakezo/rogojin/leasing"
@@ -223,6 +224,19 @@ func (r *memEmailRepo) Delete(ctx context.Context, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.rows, id)
+	return nil
+}
+
+// The listener-claim half of the port is irrelevant to these tests — no
+// inbox is listened to — so the claim methods are permissive stubs.
+func (r *memEmailRepo) ClaimListener(context.Context, string, string, time.Duration) error {
+	return nil
+}
+func (r *memEmailRepo) RenewListener(context.Context, string, string, time.Duration) error {
+	return nil
+}
+func (r *memEmailRepo) ReleaseListener(context.Context, string, string) error { return nil }
+func (r *memEmailRepo) AdvanceCursor(context.Context, string, string, uint32, uint32) error {
 	return nil
 }
 

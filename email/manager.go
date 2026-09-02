@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // An Option configures a Manager at construction.
@@ -35,6 +38,46 @@ func WithDialer(d Dialer) Option {
 	return func(m *Manager) { m.dial = d }
 }
 
+// WithNode names this process in listener claims. Left alone, the manager
+// generates an id unique to this process start, so a restarted process never
+// inherits its dead predecessor's claims. Set it only to make claim rows
+// legible under a fleet's own naming.
+func WithNode(id string) Option {
+	return func(m *Manager) {
+		if id != "" {
+			m.node = id
+		}
+	}
+}
+
+// WithListenerTTL sets how long a listener claim outlives its last renewal
+// (default 30s). Renewal runs at a third of the TTL; the TTL is how long an
+// inbox stays deaf after the node holding it dies without releasing, so
+// shorter means faster takeover and chattier heartbeats.
+func WithListenerTTL(d time.Duration) Option {
+	return func(m *Manager) {
+		if d > 0 {
+			m.listenerTTL = d
+		}
+	}
+}
+
+// defaultListenerTTL is the claim lifetime between renewals.
+const defaultListenerTTL = 30 * time.Second
+
+// defaultNode identifies this process in claims: host and pid for the
+// operator reading a row, a random suffix so a recycled pid is never
+// mistaken for its predecessor. One place on purpose — a shared
+// internal/nodeid package arrives with the task claims manager, and this is
+// the one line that will swap to it.
+func defaultNode() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "node"
+	}
+	return fmt.Sprintf("%s/%d/%s", host, os.Getpid(), uuid.NewString()[:8])
+}
+
 // A Manager owns the email inventory and every live listener. Listeners are
 // established lazily by the first Listen covering an inbox and torn down by
 // the last Close; every message fans out to every attached subscription
@@ -42,13 +85,20 @@ func WithDialer(d Dialer) Option {
 type Manager struct {
 	repo        Repository
 	dial        Dialer
+	node        string
+	listenerTTL time.Duration
 	dropHandler func(emailID, taskID string, dropped uint64)
 	errHandler  func(emailID string, err error)
 
 	// backfills tracks every live backfill goroutine; closing, closed at
 	// shutdown, is what cancels their contexts so Close never waits on a
-	// fetch still in flight against a real server.
+	// fetch still in flight against a real server. runners tracks listener
+	// goroutines the same way — including ones already unhooked by a last
+	// unsubscribe but still draining — because a claim is only released on a
+	// runner's way out, and Close promises every claim is settled when it
+	// returns.
 	backfills sync.WaitGroup
+	runners   sync.WaitGroup
 	closing   chan struct{}
 
 	mu        sync.Mutex
@@ -72,12 +122,24 @@ func (m *Manager) GuardDeletes(guard func(emailID string) (held, locked []string
 // noopRepository is the Repository a nil one is swapped for: it loads nothing
 // and drops every write, leaving the manager's inventory as the only copy.
 // The one durable field, the listener cursor, is simply never stored — a
-// restart re-reads from the backfill window instead.
+// restart re-reads from the backfill window instead. Listener claims always
+// succeed: with no shared store there is no second node to hold one.
 type noopRepository struct{}
 
 func (noopRepository) List(context.Context) ([]Email, error) { return nil, nil }
 func (noopRepository) Save(context.Context, Email) error     { return nil }
 func (noopRepository) Delete(context.Context, string) error  { return nil }
+
+func (noopRepository) ClaimListener(context.Context, string, string, time.Duration) error {
+	return nil
+}
+func (noopRepository) RenewListener(context.Context, string, string, time.Duration) error {
+	return nil
+}
+func (noopRepository) ReleaseListener(context.Context, string, string) error { return nil }
+func (noopRepository) AdvanceCursor(context.Context, string, string, uint32, uint32) error {
+	return nil
+}
 
 // NewManager loads the inventory from the repository. The inventory changes
 // afterwards only through Add and Delete; listener cursors are the one field
@@ -91,11 +153,13 @@ func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager,
 		repo = noopRepository{}
 	}
 	m := &Manager{
-		repo:      repo,
-		dial:      dialIMAP,
-		closing:   make(chan struct{}),
-		inventory: make(map[string]Email),
-		listeners: make(map[string]*listener),
+		repo:        repo,
+		dial:        dialIMAP,
+		node:        defaultNode(),
+		listenerTTL: defaultListenerTTL,
+		closing:     make(chan struct{}),
+		inventory:   make(map[string]Email),
+		listeners:   make(map[string]*listener),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -222,6 +286,7 @@ func (m *Manager) Close() error {
 	for _, l := range stopped {
 		<-l.done
 	}
+	m.runners.Wait()
 	m.backfills.Wait()
 	return nil
 }
@@ -264,10 +329,14 @@ type Subscription interface {
 }
 
 // Listen subscribes taskID to the email's inbox, lazily establishing the
-// one listener per inbox on first use. It fails fast — ErrEmailNotFound for
-// an unknown id (including a dangling account reference), ErrNoInbox for an
-// address-only email — because waiting on an inbox that cannot exist would
-// hide the misconfiguration as a hang.
+// one listener per inbox on first use — claiming the inbox in the store
+// first, so of all nodes sharing it exactly one opens a session. It fails
+// fast — ErrEmailNotFound for an unknown id (including a dangling account
+// reference), ErrNoInbox for an address-only email, ErrListenerHeld while
+// another node holds the inbox — because waiting on an inbox that cannot
+// exist, or that this node cannot serve, would hide the situation as a
+// hang. Cross-node subscribers arrive with a distributed bus; until then a
+// refused Listen names the node problem honestly.
 func (m *Manager) Listen(ctx context.Context, taskID, emailID string, opts ...ListenOption) (Subscription, error) {
 	if taskID == "" {
 		return nil, errors.New("task id is required")
@@ -295,18 +364,29 @@ func (m *Manager) Listen(ctx context.Context, taskID, emailID string, opts ...Li
 		return nil, fmt.Errorf("listen to email %s (%s): %w", emailID, e.Address, ErrNoInbox)
 	}
 
+	l, live := m.listeners[emailID]
+	if !live {
+		// Claim before dialing, under the lock like every other store write
+		// here: the claim and the listener registration must be one step, or
+		// a concurrent exiting listener could release the claim between them.
+		if err := m.repo.ClaimListener(ctx, emailID, m.node, m.listenerTTL); err != nil {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("listen to email %s: %w", emailID, err)
+		}
+		l = newListener(e)
+		m.listeners[emailID] = l
+		m.runners.Add(1)
+		go func() {
+			defer m.runners.Done()
+			m.run(l)
+		}()
+	}
 	s := &subscription{
 		manager: m,
 		emailID: emailID,
 		taskID:  taskID,
 		from:    cfg.from,
 		ch:      make(chan Message, cfg.buffer),
-	}
-	l, live := m.listeners[emailID]
-	if !live {
-		l = newListener(e)
-		m.listeners[emailID] = l
-		go m.run(l)
 	}
 	l.subs[s] = struct{}{}
 	if !cfg.backfill.IsZero() {
