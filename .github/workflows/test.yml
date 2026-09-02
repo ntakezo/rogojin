@@ -36,3 +36,8 @@ jobs:
       # go commands skip it; build it explicitly or the example rots silently.
       - run: go build ./... && go vet ./...
         working-directory: _examples
+      # bus/redis is its own module too — a sub-module keeps go-redis out of
+      # the core dependency list. Its contract tests run on an in-process
+      # miniredis, so no service container is needed.
+      - run: go vet ./... && go test -race ./...
+        working-directory: bus/redis
