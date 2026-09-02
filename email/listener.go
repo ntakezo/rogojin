@@ -22,8 +22,11 @@ type Mailbox interface {
 	Close() error
 }
 
-// A Dialer opens an authenticated Mailbox session for one email.
-type Dialer func(e Email) (Mailbox, error)
+// A Dialer opens an authenticated Mailbox session for one email. The context
+// bounds establishment only — dial, token mint, authenticate — not the
+// session's life: a listener hangs up by closing the Mailbox, and a dial that
+// cannot honor cancellation would otherwise hold up manager shutdown.
+type Dialer func(ctx context.Context, e Email) (Mailbox, error)
 
 // Reconnect backoff bounds: doubling from backoffFloor, capped at
 // backoffCeil, reset after a serve that stayed up healthyAfter.
@@ -108,10 +111,14 @@ func (m *Manager) run(l *listener) {
 }
 
 // serveOnce runs one session: dial, reconcile the cursor, then alternate
-// fetch and IDLE until the session errors or the listener stops.
+// fetch and IDLE until the session errors, the listener stops, or another
+// listener supersedes this one.
 func (m *Manager) serveOnce(ctx context.Context, l *listener) error {
-	mb, err := m.dial(l.email)
+	mb, err := m.dial(ctx, l.email)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return fmt.Errorf("dial inbox %s: %w", l.emailID, err)
 	}
 	defer mb.Close()
@@ -120,20 +127,20 @@ func (m *Manager) serveOnce(ctx context.Context, l *listener) error {
 	if err != nil {
 		return fmt.Errorf("select inbox %s: %w", l.emailID, err)
 	}
-	cursor, ok := m.cursor(l.emailID)
+	cursor, ok := m.cursor(l)
 	if !ok {
-		return nil // deleted out from under the session; the stop follows
+		return nil // deleted or superseded under the session; the stop follows
 	}
 	if uidValidity != cursor.UIDValidity {
 		// History renumbered: jump to the mailbox's present rather than
 		// replaying it whole under new numbers.
-		if err := m.advanceCursor(l.emailID, uidValidity, lastUID, true); err != nil {
+		if err := m.advanceCursor(l, uidValidity, lastUID, true); err != nil {
 			return err
 		}
 	}
 
 	for {
-		cursor, ok := m.cursor(l.emailID)
+		cursor, ok := m.cursor(l)
 		if !ok {
 			return nil
 		}
@@ -141,10 +148,17 @@ func (m *Manager) serveOnce(ctx context.Context, l *listener) error {
 		if err != nil {
 			return fmt.Errorf("fetch inbox %s: %w", l.emailID, err)
 		}
-		if maxUID := m.fanout(l, msgs); maxUID > cursor.LastUID {
+		maxUID, owned := m.fanout(l, msgs)
+		if !owned {
+			// Superseded mid-fetch: the mail went to nobody, so the cursor
+			// must not move past it — the inbox's current listener will fetch
+			// it again and deliver it.
+			return nil
+		}
+		if maxUID > cursor.LastUID {
 			// After fan-out, not before: a crash between fetch and persist
 			// re-delivers on restart. At-least-once, deduped by MessageID.
-			if err := m.advanceCursor(l.emailID, uidValidity, maxUID, false); err != nil {
+			if err := m.advanceCursor(l, uidValidity, maxUID, false); err != nil {
 				return err
 			}
 		}
@@ -157,14 +171,22 @@ func (m *Manager) serveOnce(ctx context.Context, l *listener) error {
 	}
 }
 
+// owns reports whether l is still the inbox's registered listener. A stopped
+// or replaced listener keeps running until its goroutine notices, and in that
+// window it must neither deliver nor write the cursor: only the current
+// listener speaks for the inbox. Callers hold m.mu.
+func (m *Manager) owns(l *listener) bool {
+	return m.listeners[l.emailID] == l
+}
+
 // cursor reads the email's durable cursor; ok is false once the email is
-// gone from the inventory.
-func (m *Manager) cursor(emailID string) (Inbox, bool) {
+// gone from the inventory or l is no longer its listener.
+func (m *Manager) cursor(l *listener) (Inbox, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	e, ok := m.inventory[emailID]
-	if !ok || e.Inbox == nil {
+	e, ok := m.inventory[l.emailID]
+	if !ok || e.Inbox == nil || !m.owns(l) {
 		return Inbox{}, false
 	}
 	return *e.Inbox, true
@@ -172,13 +194,15 @@ func (m *Manager) cursor(emailID string) (Inbox, bool) {
 
 // advanceCursor persists and installs the cursor, store first like every
 // other write here. reset moves LastUID backwards too, for UIDVALIDITY
-// changes; ordinary advances only ever move it forward.
-func (m *Manager) advanceCursor(emailID string, uidValidity, uid uint32, reset bool) error {
+// changes; ordinary advances only ever move it forward. A listener that lost
+// its inbox writes nothing — its successor owns the cursor now, and a stale
+// reset landing over the successor's fresh one would replay or skip mail.
+func (m *Manager) advanceCursor(l *listener, uidValidity, uid uint32, reset bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	e, ok := m.inventory[emailID]
-	if !ok || e.Inbox == nil {
+	e, ok := m.inventory[l.emailID]
+	if !ok || e.Inbox == nil || !m.owns(l) {
 		return nil
 	}
 	inbox := *e.Inbox
@@ -188,11 +212,11 @@ func (m *Manager) advanceCursor(emailID string, uidValidity, uid uint32, reset b
 	}
 	e.Inbox = &inbox
 	e.UpdatedAt = time.Now().UTC()
-	// Background, not the session context: a cursor that made it through
-	// fan-out should land even while the listener is being torn down.
+	// Background, not the session context: a cursor whose mail was fanned out
+	// should land even as the listener is being cancelled.
 	if err := m.repo.Save(context.Background(), e); err != nil {
-		return fmt.Errorf("persist cursor of email %s: %w", emailID, err)
+		return fmt.Errorf("persist cursor of email %s: %w", l.emailID, err)
 	}
-	m.inventory[emailID] = e
+	m.inventory[l.emailID] = e
 	return nil
 }

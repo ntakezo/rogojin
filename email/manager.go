@@ -45,6 +45,12 @@ type Manager struct {
 	dropHandler func(emailID, taskID string, dropped uint64)
 	errHandler  func(emailID string, err error)
 
+	// backfills tracks every live backfill goroutine; closing, closed at
+	// shutdown, is what cancels their contexts so Close never waits on a
+	// fetch still in flight against a real server.
+	backfills sync.WaitGroup
+	closing   chan struct{}
+
 	mu        sync.Mutex
 	guard     func(emailID string) (held, locked []string)
 	inventory map[string]Email
@@ -87,6 +93,7 @@ func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager,
 	m := &Manager{
 		repo:      repo,
 		dial:      dialIMAP,
+		closing:   make(chan struct{}),
 		inventory: make(map[string]Email),
 		listeners: make(map[string]*listener),
 	}
@@ -189,18 +196,22 @@ func (m *Manager) Delete(ctx context.Context, id string) (stranded []string, err
 	return stranded, nil
 }
 
-// Close stops every listener and closes every subscription, waiting for the
-// listener goroutines to exit. For process shutdown; not part of the task
-// path.
+// Close stops every listener, cancels every backfill, and closes every
+// subscription, waiting for their goroutines to exit. For process shutdown;
+// not part of the task path. Safe to call more than once, and safe to
+// interleave with subscription Closes: both routes retire a subscription
+// through the same guarded close, so neither panics on the other's work.
 func (m *Manager) Close() error {
 	m.mu.Lock()
-	m.closed = true
+	if !m.closed {
+		m.closed = true
+		close(m.closing)
+	}
 	stopped := make([]*listener, 0, len(m.listeners))
 	for id, l := range m.listeners {
 		close(l.stop)
 		for s := range l.subs {
-			s.closed = true
-			close(s.ch)
+			s.retire()
 		}
 		l.subs = make(map[*subscription]struct{})
 		stopped = append(stopped, l)
@@ -211,6 +222,7 @@ func (m *Manager) Close() error {
 	for _, l := range stopped {
 		<-l.done
 	}
+	m.backfills.Wait()
 	return nil
 }
 
@@ -297,11 +309,25 @@ func (m *Manager) Listen(ctx context.Context, taskID, emailID string, opts ...Li
 		go m.run(l)
 	}
 	l.subs[s] = struct{}{}
-	m.mu.Unlock()
-
 	if !cfg.backfill.IsZero() {
-		go m.backfill(ctx, e, s, cfg.backfill)
+		// Registered under the lock, while closed is known false: Close sets
+		// closed first, so it can never miss a backfill it must wait for.
+		m.backfills.Add(1)
+		go func() {
+			defer m.backfills.Done()
+			bctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			go func() {
+				select {
+				case <-m.closing:
+					cancel()
+				case <-bctx.Done():
+				}
+			}()
+			m.backfill(bctx, e, s, cfg.backfill)
+		}()
 	}
+	m.mu.Unlock()
 	return s, nil
 }
 
@@ -316,28 +342,35 @@ type subscription struct {
 	ch      chan Message
 	dropped uint64
 	closed  bool
-	once    sync.Once
 }
 
 func (s *subscription) C() <-chan Message { return s.ch }
 
+// retire marks the subscription closed and closes its channel. It is the one
+// place the channel closes, shared by Close and Manager.Close so the two
+// routes cannot double-close it whichever runs first. Callers hold m.mu.
+func (s *subscription) retire() {
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.ch)
+}
+
 // Close detaches the subscription; the last one covering an inbox stops its
-// listener. Only the first call acts.
+// listener. Only the first close acts, whether it was this or the manager's.
 func (s *subscription) Close() error {
-	s.once.Do(func() {
-		m := s.manager
-		m.mu.Lock()
-		if l, ok := m.listeners[s.emailID]; ok {
-			delete(l.subs, s)
-			if len(l.subs) == 0 {
-				close(l.stop)
-				delete(m.listeners, s.emailID)
-			}
+	m := s.manager
+	m.mu.Lock()
+	if l, ok := m.listeners[s.emailID]; ok {
+		delete(l.subs, s)
+		if len(l.subs) == 0 {
+			close(l.stop)
+			delete(m.listeners, s.emailID)
 		}
-		s.closed = true
-		close(s.ch)
-		m.mu.Unlock()
-	})
+	}
+	s.retire()
+	m.mu.Unlock()
 	return nil
 }
 
@@ -371,12 +404,18 @@ func offer(s *subscription, msg Message) (drop, bool) {
 
 // fanout offers every message to every subscription of the listener — all
 // of them, never only the first — and returns the highest UID seen so the
-// cursor advances only after delivery was attempted.
-func (m *Manager) fanout(l *listener, msgs []Message) uint32 {
-	var maxUID uint32
+// cursor advances only after delivery was attempted. owned is false when l
+// has been stopped or replaced since the fetch: its subs set is empty by
+// then, so delivering would deliver to nobody, and the caller must not let
+// the cursor move past mail the inbox's current listener still owes.
+func (m *Manager) fanout(l *listener, msgs []Message) (maxUID uint32, owned bool) {
 	var drops []drop
 
 	m.mu.Lock()
+	if !m.owns(l) {
+		m.mu.Unlock()
+		return 0, false
+	}
 	for _, msg := range msgs {
 		msg.EmailID = l.emailID
 		for s := range l.subs {
@@ -391,7 +430,7 @@ func (m *Manager) fanout(l *listener, msgs []Message) uint32 {
 	m.mu.Unlock()
 
 	m.reportDrops(drops)
-	return maxUID
+	return maxUID, true
 }
 
 // backfill re-fetches server-side history for one new subscription on its
@@ -399,9 +438,11 @@ func (m *Manager) fanout(l *listener, msgs []Message) uint32 {
 // interrupted. Duplicates with live delivery are possible and documented:
 // subscribers deduplicate by MessageID.
 func (m *Manager) backfill(ctx context.Context, e Email, s *subscription, since time.Time) {
-	mb, err := m.dial(e)
+	mb, err := m.dial(ctx, e)
 	if err != nil {
-		m.reportError(e.ID, fmt.Errorf("backfill dial: %w", err))
+		if ctx.Err() == nil {
+			m.reportError(e.ID, fmt.Errorf("backfill dial: %w", err))
+		}
 		return
 	}
 	defer mb.Close()

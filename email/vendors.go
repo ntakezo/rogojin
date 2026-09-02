@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,6 +16,24 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-message/mail"
 )
+
+// Network bounds on the vendor path. Every establishment step is finite —
+// a wedged endpoint must surface as an error the reconnect loop can back off
+// on, never as a listener parked forever — and IDLE is re-issued well under
+// RFC 2177's 29-minute ceiling (and the shorter cutoffs NATs and Gmail
+// enforce in practice), so a silently dropped connection is discovered
+// instead of waited on. The dialer's keepalive is the other half of that
+// discovery: it makes the kernel probe a peer that stopped talking.
+const (
+	dialTimeout  = 30 * time.Second
+	authTimeout  = 30 * time.Second
+	keepAlive    = 30 * time.Second
+	idleInterval = 9 * time.Minute
+)
+
+// tokenClient bounds token minting on its own, for callers whose context
+// carries no deadline of its own.
+var tokenClient = &http.Client{Timeout: authTimeout}
 
 // endpoint fixes the IMAP address each vendor is reached at.
 func endpoint(v Vendor) (string, error) {
@@ -66,10 +85,16 @@ func validateInbox(in Inbox) error {
 }
 
 // dialIMAP opens and authenticates the vendor session for e; it is the
-// production dialer behind every listener and backfill.
-func dialIMAP(e Email) (Mailbox, error) {
+// production dialer behind every listener and backfill. Establishment is
+// bounded: the TCP+TLS dial by the dialer's timeout, token minting and
+// authentication by ctx capped at authTimeout — a cancelled or overdue
+// authentication closes the connection out from under its blocked command.
+func dialIMAP(ctx context.Context, e Email) (Mailbox, error) {
 	if e.Inbox == nil {
 		return nil, ErrNoInbox
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	in := *e.Inbox
 	addr, err := endpoint(in.Vendor)
@@ -86,6 +111,7 @@ func dialIMAP(e Email) (Mailbox, error) {
 	// than lost.
 	wake := make(chan struct{}, 1)
 	client, err := imapclient.DialTLS(addr, &imapclient.Options{
+		Dialer: &net.Dialer{Timeout: dialTimeout, KeepAlive: keepAlive},
 		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
 			Mailbox: func(*imapclient.UnilateralDataMailbox) {
 				select {
@@ -99,19 +125,34 @@ func dialIMAP(e Email) (Mailbox, error) {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
 
+	authCtx, cancel := context.WithTimeout(ctx, authTimeout)
+	defer cancel()
+	settled := make(chan struct{})
+	go func() {
+		select {
+		case <-authCtx.Done():
+			client.Close()
+		case <-settled:
+		}
+	}()
+
 	switch in.Auth.Kind {
 	case AuthPassword:
 		err = client.Login(username, in.Auth.Password).Wait()
 	case AuthOAuth2:
 		var token string
-		if token, err = fetchAccessToken(in.Vendor, in.Auth); err == nil {
+		if token, err = fetchAccessToken(authCtx, in.Vendor, in.Auth); err == nil {
 			err = client.Authenticate(xoauth2{username: username, token: token})
 		}
 	default:
 		err = fmt.Errorf("unknown auth kind %q", in.Auth.Kind)
 	}
+	close(settled)
 	if err != nil {
 		client.Close()
+		if ctxErr := authCtx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
 		return nil, fmt.Errorf("authenticate %s: %w", username, err)
 	}
 	return &imapMailbox{client: client, wake: wake}, nil
@@ -119,7 +160,7 @@ func dialIMAP(e Email) (Mailbox, error) {
 
 // fetchAccessToken mints a short-lived access token from the stored refresh
 // token. Dials are rare — one per listener session — so nothing is cached.
-func fetchAccessToken(v Vendor, a Auth) (string, error) {
+func fetchAccessToken(ctx context.Context, v Vendor, a Auth) (string, error) {
 	form := url.Values{
 		"client_id":     {a.ClientID},
 		"refresh_token": {a.RefreshToken},
@@ -128,7 +169,12 @@ func fetchAccessToken(v Vendor, a Auth) (string, error) {
 	if a.ClientSecret != "" {
 		form.Set("client_secret", a.ClientSecret)
 	}
-	resp, err := http.PostForm(tokenURL(v, a), form)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL(v, a), strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("refresh token: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := tokenClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("refresh token: %w", err)
 	}
@@ -174,6 +220,24 @@ type imapMailbox struct {
 	wake   chan struct{}
 }
 
+// unstick arms cancellation for one in-flight command: if ctx ends before
+// the returned release is called, the session is closed, which errors the
+// blocked command out. go-imap's command Waits cannot watch a context
+// themselves, and the listener's teardown story depends on every command
+// being interruptible — a fetch against a wedged server must not outlive
+// the listener that issued it. Use as: defer mb.unstick(ctx)().
+func (mb *imapMailbox) unstick(ctx context.Context) (release func()) {
+	settled := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			mb.client.Close()
+		case <-settled:
+		}
+	}()
+	return func() { close(settled) }
+}
+
 var fetchOptions = &imap.FetchOptions{
 	UID:         true,
 	Envelope:    true,
@@ -181,6 +245,10 @@ var fetchOptions = &imap.FetchOptions{
 }
 
 func (mb *imapMailbox) Select(ctx context.Context) (uint32, uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	defer mb.unstick(ctx)()
 	data, err := mb.client.Select("INBOX", nil).Wait()
 	if err != nil {
 		return 0, 0, fmt.Errorf("select INBOX: %w", err)
@@ -193,6 +261,10 @@ func (mb *imapMailbox) Select(ctx context.Context) (uint32, uint32, error) {
 }
 
 func (mb *imapMailbox) FetchSince(ctx context.Context, uid uint32) ([]Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	defer mb.unstick(ctx)()
 	set := imap.UIDSet{imap.UIDRange{Start: imap.UID(uid + 1), Stop: 0}}
 	bufs, err := mb.client.Fetch(set, fetchOptions).Collect()
 	if err != nil {
@@ -211,6 +283,10 @@ func (mb *imapMailbox) FetchSince(ctx context.Context, uid uint32) ([]Message, e
 }
 
 func (mb *imapMailbox) FetchSinceDate(ctx context.Context, since time.Time) ([]Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	defer mb.unstick(ctx)()
 	data, err := mb.client.UIDSearch(&imap.SearchCriteria{Since: since}, nil).Wait()
 	if err != nil {
 		return nil, fmt.Errorf("uid search: %w", err)
@@ -230,21 +306,34 @@ func (mb *imapMailbox) FetchSinceDate(ctx context.Context, since time.Time) ([]M
 	return msgs, nil
 }
 
-// Idle parks on the server until new mail may exist, ctx ends, or the
-// session breaks — a session that ends IDLE on its own is a broken one.
+// Idle parks on the server until new mail may exist, ctx ends, idleInterval
+// passes, or the session breaks — a session that ends IDLE on its own is a
+// broken one. The interval expiring reads exactly like a wake: the listener
+// loops through a fetch and idles again, which is the liveness probe — on a
+// connection some middlebox silently dropped, the re-issue is what finally
+// errors instead of parking forever, and it keeps the session inside every
+// server's and NAT's idle cutoff on the way.
 func (mb *imapMailbox) Idle(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	cmd, err := mb.client.Idle()
 	if err != nil {
 		return fmt.Errorf("idle: %w", err)
 	}
 	ended := make(chan error, 1)
 	go func() { ended <- cmd.Wait() }()
+	timer := time.NewTimer(idleInterval)
+	defer timer.Stop()
 
 	select {
 	case <-ctx.Done():
 		cmd.Close()
 		<-ended
 		return ctx.Err()
+	case <-timer.C:
+		cmd.Close()
+		return <-ended
 	case <-mb.wake:
 		cmd.Close()
 		return <-ended

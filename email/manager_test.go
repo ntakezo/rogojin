@@ -101,7 +101,7 @@ func (f *fakeServer) deliver(msg Message) {
 	f.mu.Unlock()
 }
 
-func (f *fakeServer) dial(e Email) (Mailbox, error) {
+func (f *fakeServer) dial(ctx context.Context, e Email) (Mailbox, error) {
 	f.dials.Add(1)
 	wake := make(chan struct{}, 1)
 	f.mu.Lock()
