@@ -65,17 +65,38 @@ var proxyMigrations = []migration{
 		Name: "create proxy_counters table",
 		SQL:  countersSchema("proxy_counters"),
 	},
+	// Outcome stats move from row columns into the counters table, where an
+	// increment is atomic and outcomes reported by several processes land
+	// whole. The legacy columns are frozen at their backfilled values — Save
+	// no longer writes them, List no longer reads them — and disappear when
+	// the histories collapse to their next baseline.
+	{
+		Name: "backfill successes counters",
+		SQL: `INSERT INTO proxy_counters (scope, name, value)
+			SELECT id, 'successes', successes FROM proxies WHERE successes > 0`,
+	},
+	{
+		Name: "backfill failures counters",
+		SQL: `INSERT INTO proxy_counters (scope, name, value)
+			SELECT id, 'failures', failures FROM proxies WHERE failures > 0`,
+	},
 }
 
 // proxyTables wires the shared leasing mechanics to this store's tables.
 var proxyTables = leaseTables{noun: "proxy", records: "proxies", holds: "proxy_holds", counters: "proxy_counters"}
 
 // List returns every stored proxy in stable id order, so the manager's pool
-// order is deterministic.
+// order is deterministic. Successes and Failures are projected from the
+// counters table — the durable truth ReleaseOutcome increments — not from the
+// frozen legacy columns.
 func (s *Proxies) List(ctx context.Context) ([]proxies.Proxy, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, url, group_id, owner_id, max_holders, version, successes, failures, created_at, updated_at
-		 FROM proxies ORDER BY id`)
+		`SELECT p.id, p.url, p.group_id, p.owner_id, p.max_holders, p.version,
+		        COALESCE(cs.value, 0), COALESCE(cf.value, 0), p.created_at, p.updated_at
+		 FROM proxies p
+		 LEFT JOIN proxy_counters cs ON cs.scope = p.id AND cs.name = 'successes'
+		 LEFT JOIN proxy_counters cf ON cf.scope = p.id AND cf.name = 'failures'
+		 ORDER BY p.id`)
 	if err != nil {
 		return nil, fmt.Errorf("list proxies: %w", err)
 	}
@@ -104,7 +125,10 @@ func (s *Proxies) List(ctx context.Context) ([]proxies.Proxy, error) {
 
 // Save writes the proxy's record conditionally on its Version — see
 // leasing.Repository. created_at is written on insert and never overwritten,
-// so a lock or a stat update cannot revise it.
+// so a lock cannot revise it. The record's Successes and Failures are not
+// written at all: their durable truth is the counters table, and a re-saved
+// record clobbering a concurrent increment is exactly the lost update the
+// counters exist to end.
 func (s *Proxies) Save(ctx context.Context, p proxies.Proxy) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -118,15 +142,15 @@ func (s *Proxies) Save(ctx context.Context, p proxies.Proxy) (int64, error) {
 	}
 	if insert {
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO proxies (id, url, group_id, owner_id, max_holders, version, successes, failures, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			p.ID, p.URL, p.GroupID, p.OwnerID, p.MaxHolders, next, p.Successes, p.Failures,
+			`INSERT INTO proxies (id, url, group_id, owner_id, max_holders, version, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			p.ID, p.URL, p.GroupID, p.OwnerID, p.MaxHolders, next,
 			formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
 	} else {
 		_, err = tx.ExecContext(ctx,
 			`UPDATE proxies SET url = ?, group_id = ?, owner_id = ?, max_holders = ?, version = ?,
-			 successes = ?, failures = ?, updated_at = ? WHERE id = ?`,
-			p.URL, p.GroupID, p.OwnerID, p.MaxHolders, next, p.Successes, p.Failures,
+			 updated_at = ? WHERE id = ?`,
+			p.URL, p.GroupID, p.OwnerID, p.MaxHolders, next,
 			formatTime(p.UpdatedAt), p.ID)
 	}
 	if err != nil {

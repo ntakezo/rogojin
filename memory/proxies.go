@@ -23,14 +23,34 @@ func NewProxies() proxies.Repository {
 }
 
 // List returns every stored proxy in stable id order, so the manager's pool
-// order is deterministic.
+// order is deterministic. Successes and Failures are projected from the
+// counters — the durable truth ReleaseOutcome increments — mirroring the
+// sqlite store; a zero-delta Increment is the contract's read.
 func (s *Proxies) List(ctx context.Context) ([]proxies.Proxy, error) {
-	return s.store.list(ctx)
+	listed, err := s.store.list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range listed {
+		successes, err := s.store.increment(ctx, listed[i].ID, "successes", 0)
+		if err != nil {
+			return nil, err
+		}
+		failures, err := s.store.increment(ctx, listed[i].ID, "failures", 0)
+		if err != nil {
+			return nil, err
+		}
+		listed[i].Successes, listed[i].Failures = uint64(successes), uint64(failures)
+	}
+	return listed, nil
 }
 
 // Save writes the proxy's record conditionally on its Version — see
 // leasing.Repository. CreatedAt is written on insert and never overwritten,
-// so a lock or a stat update cannot revise it.
+// so a lock cannot revise it. The record's Successes and Failures are stored
+// but never read back — List projects the counters instead, mirroring the
+// sqlite store's frozen legacy columns — so a re-saved record cannot clobber
+// a concurrent increment.
 func (s *Proxies) Save(ctx context.Context, p proxies.Proxy) (int64, error) {
 	return s.store.save(ctx, p)
 }
