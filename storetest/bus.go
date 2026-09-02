@@ -1,12 +1,29 @@
 package storetest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/ntakezo/rogojin/comms"
 )
+
+// samePayload reports whether a delivered payload matches want in either of
+// the port's documented delivery forms: the value itself from an in-process
+// bus, or its JSON encoding from a transport that crossed a process boundary.
+func samePayload(got, want any) bool {
+	if got == want {
+		return true
+	}
+	raw, ok := got.(json.RawMessage)
+	if !ok {
+		return false
+	}
+	encoded, err := json.Marshal(want)
+	return err == nil && bytes.Equal(bytes.TrimSpace(raw), encoded)
+}
 
 // Bus exercises the comms.Bus contract: fan-out to every subscriber current
 // at publish time, per-subscriber publish order, at-most-once delivery that
@@ -25,10 +42,10 @@ func Bus(t *testing.T, open func(t *testing.T) comms.Bus) {
 
 		b.Publish(ctx, "topic", "hello")
 
-		if got := recv(t, s1.C()); got != "hello" {
+		if got := recv(t, s1.C()); !samePayload(got, "hello") {
 			t.Errorf("s1 got %v, want hello", got)
 		}
-		if got := recv(t, s2.C()); got != "hello" {
+		if got := recv(t, s2.C()); !samePayload(got, "hello") {
 			t.Errorf("s2 got %v, want hello", got)
 		}
 	})
@@ -52,7 +69,7 @@ func Bus(t *testing.T, open func(t *testing.T) comms.Bus) {
 			b.Publish(ctx, "topic", i)
 		}
 		for i := 0; i < 5; i++ {
-			if got := recv(t, s.C()); got != i {
+			if got := recv(t, s.C()); !samePayload(got, i) {
 				t.Errorf("position %d got %v, want %d", i, got, i)
 			}
 		}
