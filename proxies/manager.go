@@ -45,6 +45,7 @@ func WithStrategy(name string, factory StrategyFactory) Option {
 func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {
 	installed := append([]Option{
 		WithStrategy(StrategyBayesian, func() Selection { return NewBayesian() }),
+		leasing.WithTopic[Proxy, *Proxy](string(Kind)),
 	}, opts...)
 	m, err := leasing.NewManager(ctx, repo, installed...)
 	if err != nil {

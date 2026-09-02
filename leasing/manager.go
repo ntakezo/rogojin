@@ -69,6 +69,10 @@ type Manager[R any, P Leasable[R]] struct {
 	topic     string
 	ttl       time.Duration
 
+	closing   chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+
 	mu         sync.Mutex
 	groups     map[string]Group
 	strategies map[string]Selection[R] // one instance per group, keyed by group ID
@@ -144,7 +148,58 @@ func NewManager[R any, P Leasable[R]](ctx context.Context, repo Repository[R], o
 			}
 		}
 	}
+
+	m.closing = make(chan struct{})
+	m.done = make(chan struct{})
+	go m.renewLoop()
 	return m, nil
+}
+
+// renewLoop is the lease heartbeat: at a third of the TTL it extends every
+// hold of every task this process is leasing for, so a healthy holder never
+// expires and a crashed one forfeits after one quiet TTL.
+func (m *Manager[R, P]) renewLoop() {
+	defer close(m.done)
+	tick := time.NewTicker(m.ttl / 3)
+	defer tick.Stop()
+	for {
+		select {
+		case <-m.closing:
+			return
+		case <-tick.C:
+			m.renewAll()
+		}
+	}
+}
+
+// renewAll renews once for each task holding a local lease. A store failure
+// skips the tick rather than acting on it: expiry takes a full TTL of
+// consecutive misses, so a blip heals on the next tick and only a store that
+// stays unreachable forfeits the leases — which is then the truth of it.
+func (m *Manager[R, P]) renewAll() {
+	m.mu.Lock()
+	tasks := make(map[string]struct{})
+	for _, holders := range m.holders {
+		for taskID := range holders {
+			tasks[taskID] = struct{}{}
+		}
+	}
+	m.mu.Unlock()
+
+	for taskID := range tasks {
+		_ = m.repo.RenewHolds(context.Background(), taskID, m.ttl)
+	}
+}
+
+// Close stops the lease heartbeat and waits for it; idempotent. It releases
+// nothing: leases this process holds simply stop renewing and drain at their
+// TTL, the same way a crash would surrender them.
+func (m *Manager[R, P]) Close() error {
+	m.closeOnce.Do(func() {
+		close(m.closing)
+		<-m.done
+	})
+	return nil
 }
 
 // A lockRepair names one duplicate lock load found: the newer of a task's
