@@ -44,12 +44,39 @@ type Manager[R any, P Leasable[R]] struct {
 // manager treats the store as a mirror everywhere, so no call site changes.
 type noopRepository[R any] struct{}
 
-func (noopRepository[R]) List(context.Context) ([]R, error)           { return nil, nil }
-func (noopRepository[R]) Save(context.Context, R) error               { return nil }
-func (noopRepository[R]) Delete(context.Context, string) error        { return nil }
-func (noopRepository[R]) ListGroups(context.Context) ([]Group, error) { return nil, nil }
-func (noopRepository[R]) SaveGroup(context.Context, Group) error      { return nil }
-func (noopRepository[R]) DeleteGroup(context.Context, string) error   { return nil }
+func (noopRepository[R]) List(context.Context) ([]R, error)                 { return nil, nil }
+func (noopRepository[R]) Delete(context.Context, string) error              { return nil }
+func (noopRepository[R]) ListGroups(context.Context) ([]Group, error)       { return nil, nil }
+func (noopRepository[R]) SaveGroup(context.Context, Group) error            { return nil }
+func (noopRepository[R]) DeleteGroup(context.Context, string) error         { return nil }
+func (noopRepository[R]) ReleaseHold(context.Context, string, string) error { return nil }
+func (noopRepository[R]) RenewHolds(context.Context, string, time.Duration) error {
+	return nil
+}
+func (noopRepository[R]) ListHolds(context.Context) ([]Hold, error)         { return nil, nil }
+func (noopRepository[R]) ClaimLock(context.Context, string, string) error   { return nil }
+func (noopRepository[R]) ReleaseLock(context.Context, string, string) error { return nil }
+
+// Save echoes the conditional-write contract without storing: the version
+// advances so the manager's cache stays coherent with what a real store
+// would have said.
+func (noopRepository[R]) Save(_ context.Context, record R) (int64, error) {
+	if p, ok := any(&record).(interface{ core() *Resource }); ok {
+		return p.core().Version + 1, nil
+	}
+	return 1, nil
+}
+
+// Acquire grants unconditionally, echoing the inputs: with no shared store
+// there is no second process to contend with, and the manager's own maps
+// remain the only live state.
+func (noopRepository[R]) Acquire(_ context.Context, resourceID, taskID string, _ int, ttl time.Duration) (Hold, error) {
+	return Hold{ResourceID: resourceID, TaskID: taskID, Count: 1, ExpiresAt: time.Now().Add(ttl)}, nil
+}
+
+func (noopRepository[R]) Increment(_ context.Context, _, _ string, delta int64) (int64, error) {
+	return delta, nil
+}
 
 // NewManager loads the groups and pool from the repository, persisting the
 // global group if absent. Round robin is always installed and is always the
@@ -340,9 +367,12 @@ func (m *Manager[R, P]) Add(ctx context.Context, p R) error {
 
 	now := time.Now().UTC()
 	c.CreatedAt, c.UpdatedAt = now, now
-	if err := m.repo.Save(ctx, p); err != nil {
+	c.Version = 0 // a create; the store assigns the first version
+	version, err := m.repo.Save(ctx, p)
+	if err != nil {
 		return fmt.Errorf("persist resource %s: %w", c.ID, err)
 	}
+	c.Version = version
 	m.pool[c.ID] = p
 	m.order = append(m.order, c.ID)
 	m.cond.Broadcast()
@@ -371,9 +401,11 @@ func (m *Manager[R, P]) Update(ctx context.Context, id string, fn func(*R)) erro
 	c := m.core(&p)
 	*c = kept
 	c.UpdatedAt = time.Now().UTC()
-	if err := m.repo.Save(ctx, p); err != nil {
+	version, err := m.repo.Save(ctx, p)
+	if err != nil {
 		return fmt.Errorf("persist resource %s: %w", id, err)
 	}
+	c.Version = version
 	m.pool[id] = p
 	return nil
 }
@@ -471,9 +503,11 @@ func (m *Manager[R, P]) acquire(ctx context.Context, a Assignment, lock bool) (*
 				if lock {
 					c.OwnerID = a.TaskID
 					c.UpdatedAt = time.Now().UTC()
-					if err := m.repo.Save(ctx, p); err != nil {
+					version, err := m.repo.Save(ctx, p)
+					if err != nil {
 						return nil, fmt.Errorf("persist lock: %w", err)
 					}
+					c.Version = version
 					m.pool[c.ID] = p
 					m.bindings[a.TaskID] = c.ID
 				}
@@ -835,9 +869,11 @@ func (m *Manager[R, P]) unlock(ctx context.Context, taskID, resourceID string) e
 	c := m.core(&p)
 	c.OwnerID = ""
 	c.UpdatedAt = time.Now().UTC()
-	if err := m.repo.Save(ctx, p); err != nil {
+	version, err := m.repo.Save(ctx, p)
+	if err != nil {
 		return fmt.Errorf("persist unlock: %w", err)
 	}
+	c.Version = version
 	m.pool[resourceID] = p
 	delete(m.bindings, taskID)
 	m.cond.Broadcast()

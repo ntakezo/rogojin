@@ -45,7 +45,7 @@ func main() {
 	// Each manager stands alone: it guards its own pool from the leases and
 	// locks it owns and asks nothing of the task manager.
 	proxyRepo := memory.NewProxies()
-	if err := proxyRepo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "local-1", GroupID: proxies.GlobalGroup}, URL: forward.URL}); err != nil {
+	if _, err := proxyRepo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "local-1", GroupID: proxies.GlobalGroup}, URL: forward.URL}); err != nil {
 		log.Fatalf("seed proxy: %v", err)
 	}
 	proxyManager, err := proxies.NewManager(ctx, logProxyStats{proxyRepo})
@@ -278,7 +278,7 @@ func (m *mailSession) Close() error {
 // proxy's rotation feedback stays visible in the example's output.
 type logProxyStats struct{ proxies.Repository }
 
-func (l logProxyStats) Save(ctx context.Context, p proxies.Proxy) error {
+func (l logProxyStats) Save(ctx context.Context, p proxies.Proxy) (int64, error) {
 	fmt.Printf("  proxy %s stats now %d/%d\n", p.ID, p.Successes, p.Failures)
 	return l.Repository.Save(ctx, p)
 }

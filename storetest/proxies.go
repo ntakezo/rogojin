@@ -29,7 +29,8 @@ func Proxies(t *testing.T, open func(t *testing.T) proxies.Repository) {
 			URL:       "http://p1.example:8080",
 			Successes: 7, Failures: 2,
 		}
-		if err := repo.Save(ctx, p); err != nil {
+		version, err := repo.Save(ctx, p)
+		if err != nil {
 			t.Fatalf("Save: %v", err)
 		}
 
@@ -42,8 +43,8 @@ func Proxies(t *testing.T, open func(t *testing.T) proxies.Repository) {
 			t.Fatalf("record = %+v", got)
 		}
 
-		p.URL, p.Successes = "http://new.example", 8
-		if err := repo.Save(ctx, p); err != nil {
+		p.URL, p.Successes, p.Version = "http://new.example", 8, version
+		if _, err := repo.Save(ctx, p); err != nil {
 			t.Fatalf("second Save: %v", err)
 		}
 		listed, _ = repo.List(ctx)

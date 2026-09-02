@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/ntakezo/rogojin/accounts"
+	"github.com/ntakezo/rogojin/leasing"
 )
 
 // Accounts is the accounts.Repository: one row per account, its workflow's
@@ -52,13 +54,28 @@ var accountMigrations = []migration{
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
 	},
+	{
+		Name: "add version column",
+		SQL:  `ALTER TABLE accounts ADD COLUMN version INTEGER NOT NULL DEFAULT 0`,
+	},
+	{
+		Name: "create account_holds table",
+		SQL:  holdsSchema("account_holds"),
+	},
+	{
+		Name: "create account_counters table",
+		SQL:  countersSchema("account_counters"),
+	},
 }
+
+// accountTables wires the shared leasing mechanics to this store's tables.
+var accountTables = leaseTables{noun: "account", records: "accounts", holds: "account_holds", counters: "account_counters"}
 
 // List returns every stored account in stable id order, so the manager's pool
 // order is deterministic.
 func (s *Accounts) List(ctx context.Context) ([]accounts.Account, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, group_id, owner_id, max_holders, email_id, fields, created_at, updated_at
+		`SELECT id, group_id, owner_id, max_holders, version, email_id, fields, created_at, updated_at
 		 FROM accounts ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
@@ -69,7 +86,7 @@ func (s *Accounts) List(ctx context.Context) ([]accounts.Account, error) {
 	for rows.Next() {
 		var a accounts.Account
 		var fields, created, updated string
-		if err := rows.Scan(&a.ID, &a.GroupID, &a.OwnerID, &a.MaxHolders, &a.EmailID, &fields, &created, &updated); err != nil {
+		if err := rows.Scan(&a.ID, &a.GroupID, &a.OwnerID, &a.MaxHolders, &a.Version, &a.EmailID, &fields, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list accounts: %w", err)
 		}
 		a.Fields = parseFields(fields)
@@ -87,36 +104,85 @@ func (s *Accounts) List(ctx context.Context) ([]accounts.Account, error) {
 	return listed, nil
 }
 
-// Save upserts the account's record: group, holder policy, lock owner, the
-// forwarding email, fields, and updated_at. created_at is written on
-// insert and never overwritten, so a later lock cannot revise it.
-func (s *Accounts) Save(ctx context.Context, a accounts.Account) error {
+// Save writes the account's record conditionally on its Version — see
+// leasing.Repository. created_at is written on insert and never overwritten,
+// so a later lock cannot revise it.
+func (s *Accounts) Save(ctx context.Context, a accounts.Account) (int64, error) {
 	fields, err := formatFields(a.Fields)
 	if err != nil {
-		return fmt.Errorf("save account %s: %w", a.ID, err)
+		return 0, fmt.Errorf("save account %s: %w", a.ID, err)
 	}
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO accounts (id, group_id, owner_id, max_holders, email_id, fields, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET group_id = excluded.group_id,
-		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
-		 email_id = excluded.email_id, fields = excluded.fields,
-		 updated_at = excluded.updated_at`,
-		a.ID, a.GroupID, a.OwnerID, a.MaxHolders,
-		a.EmailID, fields, formatTime(a.CreatedAt), formatTime(a.UpdatedAt))
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("save account %s: %w", a.ID, err)
+		return 0, fmt.Errorf("save account %s: %w", a.ID, err)
 	}
-	return nil
+	defer tx.Rollback()
+
+	insert, next, err := versionGate(ctx, tx, accountTables, a.ID, a.Version)
+	if err != nil {
+		return 0, err
+	}
+	if insert {
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO accounts (id, group_id, owner_id, max_holders, version, email_id, fields, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			a.ID, a.GroupID, a.OwnerID, a.MaxHolders, next,
+			a.EmailID, fields, formatTime(a.CreatedAt), formatTime(a.UpdatedAt))
+	} else {
+		_, err = tx.ExecContext(ctx,
+			`UPDATE accounts SET group_id = ?, owner_id = ?, max_holders = ?, version = ?,
+			 email_id = ?, fields = ?, updated_at = ? WHERE id = ?`,
+			a.GroupID, a.OwnerID, a.MaxHolders, next, a.EmailID, fields,
+			formatTime(a.UpdatedAt), a.ID)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("save account %s: %w", a.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("save account %s: %w", a.ID, err)
+	}
+	return next, nil
 }
 
-// Delete removes the account's record; absent rows are a no-op.
+// Acquire takes or re-enters a hold on the account under cap — see
+// leasing.Repository.
+func (s *Accounts) Acquire(ctx context.Context, resourceID, taskID string, cap int, ttl time.Duration) (leasing.Hold, error) {
+	return acquireHold(ctx, s.db, accountTables, resourceID, taskID, cap, ttl)
+}
+
+// ReleaseHold decrements the task's hold, removing it at zero.
+func (s *Accounts) ReleaseHold(ctx context.Context, resourceID, taskID string) error {
+	return releaseHold(ctx, s.db, accountTables, resourceID, taskID)
+}
+
+// RenewHolds extends every unexpired hold the task has.
+func (s *Accounts) RenewHolds(ctx context.Context, taskID string, ttl time.Duration) error {
+	return renewHolds(ctx, s.db, accountTables, taskID, ttl)
+}
+
+// ListHolds returns every hold row, expired ones included.
+func (s *Accounts) ListHolds(ctx context.Context) ([]leasing.Hold, error) {
+	return listHolds(ctx, s.db, accountTables)
+}
+
+// ClaimLock binds the account to the task iff unlocked or already its own.
+func (s *Accounts) ClaimLock(ctx context.Context, resourceID, taskID string) error {
+	return claimLock(ctx, s.db, accountTables, resourceID, taskID)
+}
+
+// ReleaseLock clears the lock iff the task owns it.
+func (s *Accounts) ReleaseLock(ctx context.Context, resourceID, taskID string) error {
+	return releaseLock(ctx, s.db, accountTables, resourceID, taskID)
+}
+
+// Increment atomically adds delta to the counter under (scope, name).
+func (s *Accounts) Increment(ctx context.Context, scope, name string, delta int64) (int64, error) {
+	return incrementCounter(ctx, s.db, accountTables, scope, name, delta)
+}
+
+// Delete removes the account's record and its holds; absent rows are a no-op.
 func (s *Accounts) Delete(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete account %s: %w", id, err)
-	}
-	return nil
+	return deleteWithHolds(ctx, s.db, accountTables, id)
 }
 
 // ListGroups returns every stored account group in stable id order.

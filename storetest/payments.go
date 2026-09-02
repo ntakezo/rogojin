@@ -27,10 +27,10 @@ func Payments(t *testing.T, open func(t *testing.T) payments.Repository) {
 	t.Run("FieldsAreOpaque", func(t *testing.T) {
 		repo := open(t)
 		deep := mustJSON(t, map[string]any{"billing": map[string]string{"zip": "10001"}, "tokens": []int{1, 2}})
-		if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: deep}); err != nil {
+		if _, err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: deep}); err != nil {
 			t.Fatalf("Save: %v", err)
 		}
-		if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c2"}}); err != nil {
+		if _, err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c2"}}); err != nil {
 			t.Fatalf("Save without fields: %v", err)
 		}
 
@@ -47,7 +47,7 @@ func Payments(t *testing.T, open func(t *testing.T) payments.Repository) {
 	// inside a later run, and the refusal stores nothing.
 	t.Run("FieldsMustBeJSON", func(t *testing.T) {
 		repo := open(t)
-		err := repo.Save(ctx, payments.Payment{
+		_, err := repo.Save(ctx, payments.Payment{
 			Resource: leasing.Resource{ID: "c1"},
 			Fields:   json.RawMessage(`{"broken`),
 		})
@@ -63,7 +63,7 @@ func Payments(t *testing.T, open func(t *testing.T) payments.Repository) {
 	t.Run("FieldsDoNotAlias", func(t *testing.T) {
 		repo := open(t)
 		fields := mustJSON(t, map[string]string{"number": "4111"})
-		if err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: fields}); err != nil {
+		if _, err := repo.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: fields}); err != nil {
 			t.Fatalf("Save: %v", err)
 		}
 		fields[2] = 'X'

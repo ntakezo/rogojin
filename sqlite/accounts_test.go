@@ -40,7 +40,7 @@ func TestAccountsSchemaReopensCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := first.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: mustJSON(t, map[string]string{"email": "a@b.c"})}); err != nil {
+	if _, err := first.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1"}, Fields: mustJSON(t, map[string]string{"email": "a@b.c"})}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := firstDB.Close(); err != nil {

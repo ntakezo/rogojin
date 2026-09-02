@@ -46,10 +46,10 @@ func TestPaymentsAndAccountsShareOneDatabase(t *testing.T) {
 		t.Fatalf("open payments on the same database: %v", err)
 	}
 
-	if err := accountStore.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", GroupID: "site"}}); err != nil {
+	if _, err := accountStore.Save(ctx, accounts.Account{Resource: leasing.Resource{ID: "a1", GroupID: "site"}}); err != nil {
 		t.Fatalf("save account: %v", err)
 	}
-	if err := paymentStore.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1", GroupID: "bin"}}); err != nil {
+	if _, err := paymentStore.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1", GroupID: "bin"}}); err != nil {
 		t.Fatalf("save payment: %v", err)
 	}
 
@@ -80,7 +80,7 @@ func TestPaymentsSchemaReopensCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := first.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, map[string]string{"number": "4111111111111111"})}); err != nil {
+	if _, err := first.Save(ctx, payments.Payment{Resource: leasing.Resource{ID: "c1"}, Fields: mustJSON(t, map[string]string{"number": "4111111111111111"})}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := firstDB.Close(); err != nil {
