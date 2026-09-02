@@ -22,6 +22,7 @@ package leasing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -34,7 +35,31 @@ const GlobalGroup = "global"
 // accounts.Kind, payments.Kind) — the key placements, registrations, and a
 // workflow's manager lookups are all filed under, so every layer agrees on
 // the name by construction.
+//
+// A kind is one or more ASCII letters, digits, '-', or '_'. The charset is a
+// contract, not a style rule: stores file placements under the kind as a JSON
+// key and edit them in place through it as a JSON path, where a '.' or '[' has
+// meaning of its own and would misfile the placement instead of storing it.
+// Validate is the rule; registration and the durable write paths all enforce
+// it, so a bad kind fails at the first door rather than corrupting mid-run.
 type Kind string
+
+// Validate reports whether k is a legal kind name: non-empty ASCII letters,
+// digits, '-', or '_'. See Kind for why the charset is this tight. Consumer
+// packages defining their own kind can check the constant once in a test.
+func (k Kind) Validate() error {
+	if k == "" {
+		return errors.New("kind is empty")
+	}
+	for _, r := range k {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return fmt.Errorf("kind %q contains %q; kinds are ASCII letters, digits, '-', and '_'", string(k), r)
+		}
+	}
+	return nil
+}
 
 // UnlimitedHolders marks a holder policy with no cap: any number of concurrent
 // leases is tolerated.

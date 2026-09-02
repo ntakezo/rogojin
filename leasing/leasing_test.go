@@ -131,3 +131,20 @@ func TestWithStrategyOverridesRoundRobin(t *testing.T) {
 		lease.Release()
 	}
 }
+
+// TestKindValidate pins the kind charset: the names placements are filed under
+// become JSON keys and JSON paths in stores, so a character with meaning there
+// ('.', '[', a quote) must be refused at validation rather than misfile a
+// placement at write time. The three shipped kinds must, of course, pass.
+func TestKindValidate(t *testing.T) {
+	for _, k := range []Kind{"proxy", "account", "payment", "sms-inbox", "Kind_2"} {
+		if err := k.Validate(); err != nil {
+			t.Errorf("Validate(%q) = %v, want nil", k, err)
+		}
+	}
+	for _, k := range []Kind{"", "x.y", "a[0]", `q"o`, "sp ace", "ünïcode"} {
+		if err := k.Validate(); err == nil {
+			t.Errorf("Validate(%q) = nil, want an error", k)
+		}
+	}
+}

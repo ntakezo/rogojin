@@ -681,3 +681,39 @@ func TestTasksSaveAssignmentOnUnplacedTask(t *testing.T) {
 		t.Fatalf("proxy group = %v, want residential", stored)
 	}
 }
+
+// TestTasksSaveAssignmentRefusesUnsafeKind verifies the store's own guard: the
+// kind becomes a json_set path, where a '.', '[', or quote would nest or
+// misfile the placement instead of storing it flat the way CreateTask does.
+// The manager validates first, but a repository must not corrupt its column on
+// direct use either — each bad kind is refused and the record left untouched.
+func TestTasksSaveAssignmentRefusesUnsafeKind(t *testing.T) {
+	repo := newTestTasks(t)
+	ctx := context.Background()
+
+	group := "residential"
+	rec := tasks.Task{ID: "t1", WorkflowID: "wf1", Assignments: map[leasing.Kind]tasks.Assignment{
+		proxyKind: {GroupID: &group},
+	}}
+	if err := repo.CreateTask(ctx, rec); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	other := "g"
+	for _, kind := range []leasing.Kind{"x.y", "a[0]", "", `q"o`} {
+		if err := repo.SaveAssignment(ctx, "t1", kind, tasks.Assignment{GroupID: &other}); err == nil {
+			t.Errorf("SaveAssignment with kind %q = nil, want an error", kind)
+		}
+	}
+
+	got, err := repo.RecoverTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("RecoverTask: %v", err)
+	}
+	if len(got.Assignments) != 1 {
+		t.Fatalf("assignments = %v, want the single proxy placement untouched", got.Assignments)
+	}
+	if stored := got.Assignments[proxyKind].GroupID; stored == nil || *stored != "residential" {
+		t.Fatalf("proxy group = %v, want residential untouched", stored)
+	}
+}

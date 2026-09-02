@@ -113,8 +113,14 @@ func (s *Tasks) SaveCheckpoint(ctx context.Context, id, status, state string, sn
 // SaveAssignment repoints a task's placement for one kind, leaving every other
 // kind and the rest of the record untouched. A nil field stores JSON null: no
 // group assignment of its own, or no pin. json_set edits the stored object in
-// place, so one kind is rewritten without reading the others back first.
+// place, so one kind is rewritten without reading the others back first — which
+// is why the kind is validated here even though the manager already refuses bad
+// ones: it becomes a JSON path, and a '.' or '[' in it would misfile the
+// placement instead of storing it.
 func (s *Tasks) SaveAssignment(ctx context.Context, id string, kind leasing.Kind, a tasks.Assignment) error {
+	if err := kind.Validate(); err != nil {
+		return fmt.Errorf("assign placement of task %s: %w", id, err)
+	}
 	encoded, err := json.Marshal(a)
 	if err != nil {
 		return fmt.Errorf("assign %s placement of task %s: %w", kind, id, err)
