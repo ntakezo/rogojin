@@ -41,10 +41,13 @@ type Option func(*manager)
 // and repointing one leaves it leasing what it was moved off, since a binding
 // outranks the group.
 //
-// It panics on a nil manager and on a kind registered twice, which could only
-// unlock it twice.
+// It panics on a nil manager, on an invalid kind (see leasing.Kind for the
+// charset), and on a kind registered twice, which could only unlock it twice.
 func WithResource(kind leasing.Kind, rm ResourceManager) Option {
 	return func(m *manager) {
+		if err := kind.Validate(); err != nil {
+			panic(fmt.Sprintf("tasks: resource kind registered with an invalid name: %v", err))
+		}
 		if rm == nil {
 			panic(fmt.Sprintf("tasks: resource kind %q registered with a nil manager", kind))
 		}
@@ -298,6 +301,9 @@ func (m *manager) CreateTask(ctx context.Context, workflowID string, input any, 
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if err := validKinds(cfg.assignments); err != nil {
+		return nil, fmt.Errorf("failed to create task: %w", err)
+	}
 	group, err := m.getGroup(cfg.groupID)
 	if err != nil {
 		return nil, err
@@ -462,6 +468,10 @@ func resolveAll(assignments map[leasing.Kind]Assignment, group Group) map[leasin
 // its next recovery, since a run is wired with its placement at start and keeps
 // the lease it already holds.
 func (m *manager) AssignResource(ctx context.Context, id string, kind leasing.Kind, assignment Assignment) error {
+	if err := kind.Validate(); err != nil {
+		return fmt.Errorf("failed to assign placement of task %s: %w", id, err)
+	}
+
 	m.taskRegistryMu.Lock()
 	defer m.taskRegistryMu.Unlock()
 
@@ -551,9 +561,30 @@ func (m *manager) managerFor(kind leasing.Kind) ResourceManager {
 	return nil
 }
 
+// validKinds checks every kind keying the map against leasing.Kind's charset,
+// in sorted order so a failure names the same kind every run. Placements are
+// filed and edited under these keys in the store, so an unsafe one has to be
+// refused before it is written, not discovered when a later edit misfiles it.
+func validKinds[V any](kinds map[leasing.Kind]V) error {
+	sorted := make([]leasing.Kind, 0, len(kinds))
+	for kind := range kinds {
+		sorted = append(sorted, kind)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	for _, kind := range sorted {
+		if err := kind.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *manager) CreateGroup(ctx context.Context, group Group) error {
 	if group.ID == "" {
 		return errors.New("task group id is required")
+	}
+	if err := validKinds(group.ResourceGroups); err != nil {
+		return fmt.Errorf("task group %s: %w", group.ID, err)
 	}
 	if group.ID == GlobalGroup {
 		return fmt.Errorf("task group %s exists implicitly", GlobalGroup)
@@ -598,6 +629,9 @@ func (m *manager) UpdateGroup(ctx context.Context, id string, fn func(*Group)) e
 	kept := g
 	fn(&g)
 	g.ID, g.CreatedAt = kept.ID, kept.CreatedAt
+	if err := validKinds(g.ResourceGroups); err != nil {
+		return fmt.Errorf("task group %s: %w", id, err)
+	}
 	if g.CreatedAt.IsZero() {
 		// The implicit global group gains its stored record here.
 		g.CreatedAt = time.Now().UTC()
