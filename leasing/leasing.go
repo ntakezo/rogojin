@@ -1,7 +1,10 @@
 // Package leasing allocates pooled resources to tasks. A consumer-provided
-// Repository stores the pool and its groups durably while the Manager owns all
-// live acquisition state, rotating unlocked resources through per-group
-// selection strategies and honoring durable task-to-resource locks.
+// Repository is the authority on the pool, its groups, and every live
+// acquisition fact — holds, locks, rotation cursors — while the Manager
+// rotates unlocked resources through per-group selection strategies over
+// caches of it, proving each grant against the store. Several managers over
+// one store therefore agree on who holds what by construction, which is what
+// lets a deployment run more than one process.
 //
 // Resource is the model every leasable kind shares: a proxy, an account, a
 // card is a struct that embeds it and adds its own fields — a URL, a
@@ -11,12 +14,12 @@
 // inspected here. Everything in this package is about who holds what, and
 // for how long.
 //
-// This package is mechanism, not policy. It guards its pool with the two facts
-// it owns outright — who holds a live lease, who holds a durable lock — and
-// asks nothing of any other layer. What a task is, whether one is running, and
-// what to do about a task whose lock a deletion released are its callers'
-// concerns; deletions report what they unbound and leave the response to the
-// caller.
+// This package is mechanism, not policy. It guards its pool with the two
+// facts the store owns outright — who holds a live lease, who holds a durable
+// lock — and asks nothing of any other layer. What a task is, whether one is
+// running, and what to do about a task whose lock a deletion released are its
+// callers' concerns; deletions report what they unbound and leave the
+// response to the caller.
 package leasing
 
 import (

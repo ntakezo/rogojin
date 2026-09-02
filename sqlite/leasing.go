@@ -76,7 +76,10 @@ func versionGate(ctx context.Context, tx *sql.Tx, t leaseTables, id string, vers
 // acquireHold takes or re-enters a hold inside one immediate transaction:
 // expired rows of the resource are pruned on this write path — a superseded
 // hold must not be revivable by its owner's next heartbeat — then the cap is
-// measured over what remains.
+// measured over what remains. A resource locked by another task refuses with
+// ErrLockHeld — a manager's cache may not know about the lock yet, so the
+// store is what says no; a resource with no record reads as unlocked, since
+// the store does not police existence.
 func acquireHold(ctx context.Context, db *sql.DB, t leaseTables, resourceID, taskID string, cap int, ttl time.Duration) (leasing.Hold, error) {
 	fail := func(err error) (leasing.Hold, error) {
 		return leasing.Hold{}, fmt.Errorf("acquire %s %s for task %s: %w", t.noun, resourceID, taskID, err)
@@ -86,6 +89,15 @@ func acquireHold(ctx context.Context, db *sql.DB, t leaseTables, resourceID, tas
 		return fail(err)
 	}
 	defer tx.Rollback()
+
+	var owner string
+	err = tx.QueryRowContext(ctx, `SELECT owner_id FROM `+t.records+` WHERE id = ?`, resourceID).Scan(&owner)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fail(err)
+	}
+	if owner != "" && owner != taskID {
+		return fail(leasing.ErrLockHeld)
+	}
 
 	now := time.Now()
 	if _, err := tx.ExecContext(ctx,

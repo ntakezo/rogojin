@@ -361,6 +361,23 @@ func Leasing[R any](t *testing.T,
 
 	// ClaimLock races admit one owner; the owner re-claims freely; a
 	// non-owner's release is a no-op and the owner's frees the lock.
+	// A resource locked by another task refuses Acquire with ErrLockHeld —
+	// an acquirer's cache may not know about the lock yet, so the store is
+	// what says no — while the lock's own task leases it freely.
+	t.Run("LockExcludesAcquire", func(t *testing.T) {
+		repo := open(t)
+		create(t, repo, "r1", nil)
+		if err := repo.ClaimLock(ctx, "r1", "owner"); err != nil {
+			t.Fatalf("ClaimLock: %v", err)
+		}
+		if _, err := repo.Acquire(ctx, "r1", "stranger", 0, time.Minute); !errors.Is(err, leasing.ErrLockHeld) {
+			t.Fatalf("Acquire by a stranger = %v, want ErrLockHeld", err)
+		}
+		if _, err := repo.Acquire(ctx, "r1", "owner", 1, time.Minute); err != nil {
+			t.Fatalf("Acquire by the owner: %v", err)
+		}
+	})
+
 	t.Run("LockClaims", func(t *testing.T) {
 		repo := open(t)
 		create(t, repo, "r1", nil)
