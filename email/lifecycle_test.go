@@ -2,6 +2,8 @@ package email
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -157,4 +159,101 @@ func TestCloseCancelsAndWaitsForBackfills(t *testing.T) {
 	if _, ok := <-sub.C(); ok {
 		t.Fatalf("subscription channel still open after close")
 	}
+}
+
+// TestSecondNodeListenIsRefusedWhileTheClaimLives verifies the one-listener
+// rule holds across processes, not just within one: a second manager over
+// the same store, standing in for a second node, is told the inbox is taken
+// instead of silently opening a duplicate IMAP session.
+func TestSecondNodeListenIsRefusedWhileTheClaimLives(t *testing.T) {
+	server := newFakeServer()
+	repo := newMemRepo()
+	a := newTestManager(t, repo, server, WithNode("node-a"))
+	addEmail(t, a, testEmail("inbox-1"))
+
+	subA, err := a.Listen(context.Background(), "t1", "inbox-1")
+	if err != nil {
+		t.Fatalf("node-a listen: %v", err)
+	}
+	defer subA.Close()
+
+	b := newTestManager(t, repo, server, WithNode("node-b"))
+	if _, err := b.Listen(context.Background(), "t2", "inbox-1"); !errors.Is(err, ErrListenerHeld) {
+		t.Fatalf("node-b listen = %v, want ErrListenerHeld", err)
+	}
+}
+
+// TestListenerReleasesItsClaimOnTeardown verifies the claim follows the
+// listener's life: once the last subscriber hangs up and the goroutine
+// exits, another node can take the inbox without waiting out the TTL.
+func TestListenerReleasesItsClaimOnTeardown(t *testing.T) {
+	server := newFakeServer()
+	repo := newMemRepo()
+	a := newTestManager(t, repo, server, WithNode("node-a"))
+	addEmail(t, a, testEmail("inbox-1"))
+
+	subA, err := a.Listen(context.Background(), "t1", "inbox-1")
+	if err != nil {
+		t.Fatalf("node-a listen: %v", err)
+	}
+	awaitListening(t, repo, "inbox-1", 1)
+	subA.Close()
+
+	b := newTestManager(t, repo, server, WithNode("node-b"))
+	var subB Subscription
+	eventually(t, "node-b taking the released inbox", func() bool {
+		sub, err := b.Listen(context.Background(), "t2", "inbox-1")
+		if err != nil {
+			return false
+		}
+		subB = sub
+		return true
+	})
+	defer subB.Close()
+}
+
+// usurpableRepo forces renewals to report the claim taken by another node,
+// standing in for a claim that expired during a stall and was picked up
+// elsewhere before this node's next heartbeat.
+type usurpableRepo struct {
+	Repository
+	usurped atomic.Bool
+}
+
+func (r *usurpableRepo) RenewListener(ctx context.Context, emailID, node string, ttl time.Duration) error {
+	if r.usurped.Load() {
+		return fmt.Errorf("renew %s: %w", emailID, ErrListenerHeld)
+	}
+	return r.Repository.RenewListener(ctx, emailID, node, ttl)
+}
+
+// TestUsurpedListenerStopsAndClosesItsSubscriptions verifies losing the
+// claim tears the listener down: the subscriptions' closed channels are the
+// honest signal the feed ended, and the registry entry is gone so the dying
+// goroutine can neither deliver nor move the cursor.
+func TestUsurpedListenerStopsAndClosesItsSubscriptions(t *testing.T) {
+	server := newFakeServer()
+	repo := &usurpableRepo{Repository: newMemRepo()}
+	m := newTestManager(t, repo, server, WithListenerTTL(30*time.Millisecond))
+	addEmail(t, m, testEmail("inbox-1"))
+
+	sub, err := m.Listen(context.Background(), "t1", "inbox-1")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	repo.usurped.Store(true)
+
+	select {
+	case _, ok := <-sub.C():
+		if ok {
+			t.Fatalf("got a message; want the channel closed by the usurpation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("subscription still open after the claim was lost")
+	}
+	eventually(t, "the listener leaving the registry", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return len(m.listeners) == 0
+	})
 }

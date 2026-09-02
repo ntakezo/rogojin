@@ -250,6 +250,19 @@ func (r *memEmailRepo) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// The listener-claim half of the port is irrelevant to these tests — no
+// inbox is listened to — so the claim methods are permissive stubs.
+func (r *memEmailRepo) ClaimListener(context.Context, string, string, time.Duration) error {
+	return nil
+}
+func (r *memEmailRepo) RenewListener(context.Context, string, string, time.Duration) error {
+	return nil
+}
+func (r *memEmailRepo) ReleaseListener(context.Context, string, string) error { return nil }
+func (r *memEmailRepo) AdvanceCursor(context.Context, string, string, uint32, uint32) error {
+	return nil
+}
+
 // TestWithEmailProtectsReferencedInboxes verifies the wiring WithEmail
 // exists for: once the account manager holds the email manager, deleting an
 // inbox a live-leased account forwards to refuses and names the task, and
