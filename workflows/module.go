@@ -99,6 +99,29 @@ func (m *Module[In]) NewInstance(input any, deps Deps) (Instance, error) {
 	return inst, nil
 }
 
+// NewStoredInstance builds a fresh instance from input as CreateTask persisted
+// it — the marshaled JSON of an In — for a run on a node holding only the
+// record. Empty input reads as the zero In, exactly as a nil one does at
+// creation.
+func (m *Module[In]) NewStoredInstance(input json.RawMessage, deps Deps) (Instance, error) {
+	var in In
+	if len(input) > 0 {
+		if err := json.Unmarshal(input, &in); err != nil {
+			return nil, fmt.Errorf("%s: decode input: %w", m.id, err)
+		}
+	}
+	inst, err := m.build(in, deps)
+	if err != nil {
+		return nil, err
+	}
+	b, err := m.baseOf(inst)
+	if err != nil {
+		return nil, err
+	}
+	b.bind(deps, input)
+	return inst, nil
+}
+
 // RestoreInstance decodes the snapshot envelope, rebuilds the instance from
 // its recorded input, and restores the effect log and durable state into it.
 func (m *Module[In]) RestoreInstance(deps Deps, snapshot []byte) (Instance, error) {

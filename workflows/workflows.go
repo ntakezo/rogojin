@@ -11,6 +11,7 @@ package workflows
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/ntakezo/rogojin/comms"
 	"github.com/ntakezo/rogojin/leasing"
@@ -122,6 +123,16 @@ type Outputter interface {
 type PersistableWorkflow interface {
 	Workflow
 	RestoreInstance(deps Deps, snapshot []byte) (Instance, error)
+}
+
+// DispatchableWorkflow builds a fresh instance from input as the task record
+// persisted it — marshaled JSON, not the typed value NewInstance takes. It is
+// the dispatch path: a task created on one node begins running on a node that
+// holds only the record. Module implements it; a workflow that does not can
+// be started fresh only by its creating process.
+type DispatchableWorkflow interface {
+	Workflow
+	NewStoredInstance(input json.RawMessage, deps Deps) (Instance, error)
 }
 
 // ResourceReceiver is the opt-in wiring capability. RegisterWorkflow calls

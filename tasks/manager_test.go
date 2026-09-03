@@ -99,11 +99,13 @@ func (r *recordStore) ClaimTask(ctx context.Context, id, node string, ttl time.D
 	return rec, nil
 }
 
-// TestRecoverNeverCheckpointedTaskFailsLoud verifies a task that was created
-// but never checkpointed recovers into a task whose Start fails with
-// ErrNoCheckpoint. Its input was never persisted, so nothing can actually
-// resume; a cryptic state error — or silently rerunning — would both lie about
-// what recovery can do. Durability begins at the first checkpoint.
+// TestRecoverNeverCheckpointedTaskFailsLoud verifies a never-checkpointed
+// record carrying no input — the shape from before CreateTask persisted
+// inputs — recovers into a task whose Start fails with ErrNoCheckpoint. With
+// neither checkpoint nor input there is nothing to run; a cryptic state error
+// — or silently running from a zero input — would both lie about what the
+// record holds. A record with input dispatches instead; see the external
+// dispatch tests.
 func TestRecoverNeverCheckpointedTaskFailsLoud(t *testing.T) {
 	var log []workflows.State
 	store := &recordStore{record: Task{ID: "t1", WorkflowID: "test"}}

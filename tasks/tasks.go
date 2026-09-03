@@ -12,6 +12,7 @@ package tasks
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -23,10 +24,11 @@ import (
 	"github.com/ntakezo/rogojin/workflows"
 )
 
-// ErrNoCheckpoint is returned by Start on a recovered task that was created but
-// never checkpointed. Task input is not persisted — durability begins at the
-// first checkpoint — so there is nothing to resume from; the task can only be
-// deleted and re-created.
+// ErrNoCheckpoint is returned by Start on a recovered, never-checkpointed task
+// whose record carries no input. CreateTask persists input, so such a task
+// normally begins a fresh run on whichever node claims it; a record with none
+// predates persisted inputs, and with neither checkpoint nor input there is
+// nothing to run — the task can only be deleted and re-created.
 var ErrNoCheckpoint = errors.New("task has no checkpoint to resume from")
 
 // ErrTaskDeleted is returned by Start on a task the manager has deleted, or is
@@ -90,9 +92,15 @@ type Task struct {
 	WorkflowID  string                      `json:"workflowId"`
 	GroupID     string                      `json:"groupId"`
 	Assignments map[leasing.Kind]Assignment `json:"assignments,omitempty"`
-	State       string                      `json:"state"`
-	Snapshot    []byte                      `json:"snapshot,omitempty"`
-	Status      string                      `json:"status"`
+	// Input is the task's input as persisted at creation — marshaled JSON any
+	// node builds a fresh run from, which is what lets a task created on one
+	// node begin on another. Written once by CreateTask and never revised;
+	// empty only on records from before inputs were persisted, whose dispatch
+	// refuses with ErrNoCheckpoint.
+	Input    json.RawMessage `json:"input,omitempty"`
+	State    string          `json:"state"`
+	Snapshot []byte          `json:"snapshot,omitempty"`
+	Status   string          `json:"status"`
 	// Output is the workflow's result, persisted when the run completes cleanly;
 	// nil for tasks that have not finished or produce no output.
 	Output    []byte    `json:"output,omitempty"`
@@ -206,10 +214,17 @@ type Repository interface {
 
 // createTask validates input against the workflow and returns a new unstarted
 // task whose instance leases each kind under resolved, already settled against
-// the task group. The caller must not modify input or the maps after creation.
+// the task group. The record carries the marshaled input, so any node holding
+// it can begin the run; a nil input marshals to JSON null, which reads back as
+// the zero input, so even an input-less task is dispatchable. The caller must
+// not modify input or the maps after creation.
 func createTask(workflow workflows.Workflow, workflowID string, input any, bus comms.Bus, repo Repository, groupID string, stored map[leasing.Kind]Assignment, resolved map[leasing.Kind]workflows.Assignment) (*Task, error) {
 	if err := workflow.ValidateInput(input); err != nil {
 		return nil, fmt.Errorf("task input validation error: %w", err)
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return nil, fmt.Errorf("task input must round-trip through JSON: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -218,6 +233,7 @@ func createTask(workflow workflows.Workflow, workflowID string, input any, bus c
 		WorkflowID:  workflowID,
 		GroupID:     groupID,
 		Assignments: stored,
+		Input:       raw,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 		input:       input,
@@ -295,6 +311,9 @@ func (t *Task) unseal() {
 // a live claim — and a recovered task resumes from the claimed record's
 // checkpoint, which may be fresher than the one it was recovered with; one
 // resuming a suspended checkpoint starts parked there until Resume or Kill.
+// A recovered task that never ran anywhere starts fresh from the record's
+// persisted input — the dispatch path, how a task created on one node begins
+// on another.
 // A task built from a bare record has no runtime and refuses; create or
 // recover it through a Manager. A handle drives at most one run: a second
 // Start — the first still in flight, finished, or detached — refuses with
@@ -329,13 +348,21 @@ func (t *Task) Start(ctx context.Context) ([]byte, error) {
 		status := workflows.Status(t.Status)
 		// A refusal that runs nothing releases the claim it just took, so the
 		// task is immediately claimable elsewhere instead of after the lease.
-		if status == workflows.StatusNotStarted {
-			return nil, errors.Join(fmt.Errorf("task %s: %w", t.ID, ErrNoCheckpoint), t.engine.releaseClaim())
-		}
 		if status.Terminal() {
 			return nil, errors.Join(fmt.Errorf("task %s is %s: %w", t.ID, status, ErrAlreadyTerminal), t.engine.releaseClaim())
 		}
-		err = t.engine.Rehydrate(ctx, t.Snapshot, workflows.State(t.State), status == workflows.StatusSuspended)
+		switch {
+		case status == workflows.StatusNotStarted && len(t.Input) == 0:
+			// Never checkpointed and no persisted input: a record from before
+			// inputs were stored, with nothing to run from.
+			return nil, errors.Join(fmt.Errorf("task %s: %w", t.ID, ErrNoCheckpoint), t.engine.releaseClaim())
+		case status == workflows.StatusNotStarted:
+			// Created — anywhere — and never run: dispatch, not recovery. The
+			// record's input feeds a fresh run from the graph's initial state.
+			err = t.engine.ExecuteStored(ctx, t.Input)
+		default:
+			err = t.engine.Rehydrate(ctx, t.Snapshot, workflows.State(t.State), status == workflows.StatusSuspended)
+		}
 	} else {
 		err = t.engine.Execute(ctx, t.input)
 	}
