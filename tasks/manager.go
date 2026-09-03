@@ -60,14 +60,15 @@ func WithLeaseTTL(d time.Duration) Option {
 }
 
 // WithRecoverySweep runs RecoverClaimable every interval and starts what it
-// claims — the loop that picks up tasks a crashed node left behind once
-// their leases lapse, and begins created-but-never-started tasks from their
-// persisted input, which makes the sweep the fleet's dispatcher. Losing a
-// claim race, a terminal or input-less never-checkpointed record, and a task
-// already running here are all normal and reported to no one; every other
-// failure goes to onErr (nil drops them) with the task id, or "" when the
-// sweep itself failed. Swept runs execute on background
-// contexts and outlive Close. It panics on a non-positive interval.
+// claims — all of it, unless WithMaxRunning bounds the pull. It is the loop
+// that picks up tasks a crashed node left behind once their leases lapse,
+// and it begins created-but-never-started tasks from their persisted input,
+// which makes the sweep the fleet's dispatcher. Losing a claim race, a
+// terminal or input-less never-checkpointed record, and a task already
+// running here are all normal and reported to no one; every other failure
+// goes to onErr (nil drops them) with the task id, or "" when the sweep
+// itself failed. Swept runs execute on background contexts and outlive
+// Close. It panics on a non-positive interval.
 func WithRecoverySweep(interval time.Duration, onErr func(taskID string, err error)) Option {
 	return func(m *manager) {
 		if interval <= 0 {
@@ -75,6 +76,22 @@ func WithRecoverySweep(interval time.Duration, onErr func(taskID string, err err
 		}
 		m.sweepInterval = interval
 		m.sweepErr = onErr
+	}
+}
+
+// WithMaxRunning bounds how many tasks run on this node at once, so the
+// sweep pulls work only while capacity remains — the admission control that
+// turns a fleet into a pull-based queue, and the number an autoscaler can
+// multiply by. The bound governs only the sweep: a direct Start, created or
+// recovered by hand, is the operator saying "run it here" and is never
+// refused, though what it runs does count against the sweep's budget. It
+// panics on a non-positive n.
+func WithMaxRunning(n int) Option {
+	return func(m *manager) {
+		if n <= 0 {
+			panic("tasks: max running must be positive")
+		}
+		m.maxRunning = n
 	}
 }
 
@@ -217,10 +234,18 @@ type manager struct {
 	ttl           time.Duration
 	sweepInterval time.Duration
 	sweepErr      func(taskID string, err error)
+	maxRunning    int
 	background    context.Context
 	stop          context.CancelFunc
 	work          sync.WaitGroup
 	closeOnce     sync.Once
+
+	// sweepInflight holds the ids of sweep starts that have not returned yet,
+	// written only by the sweep goroutine and cleared by each run on its way
+	// out. It is what keeps the budget honest across the window between a
+	// start launching and its task showing up running in the registry.
+	sweepMu       sync.Mutex
+	sweepInflight map[string]struct{}
 
 	workflowRegistryMu sync.RWMutex
 	taskRegistryMu     sync.RWMutex
@@ -248,6 +273,7 @@ func NewManager(ctx context.Context, repository Repository, bus comms.Bus, opts 
 		groups:           map[string]Group{GlobalGroup: {ID: GlobalGroup}},
 		node:             nodeid.Default(),
 		ttl:              30 * time.Second,
+		sweepInflight:    make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -320,7 +346,10 @@ func (m *manager) heartbeat() {
 // sweep runs the recovery loop configured by WithRecoverySweep: list what is
 // claimable, rehydrate it, and Start each on a background context so a
 // stolen run outlives Close along with every other run. Start is the claim
-// point, so racing sweeps on other nodes lose there, quietly.
+// point, so racing sweeps on other nodes lose there, quietly. Each tick is
+// budgeted first — see sweepBudget — so a WithMaxRunning node pulls only
+// what its capacity allows, and a task an earlier tick already started is
+// never started twice over.
 func (m *manager) sweep() {
 	defer m.work.Done()
 	tick := time.NewTicker(m.sweepInterval)
@@ -338,8 +367,26 @@ func (m *manager) sweep() {
 			}
 			continue
 		}
+		budget, inflight := m.sweepBudget()
 		for _, t := range tasks {
+			if _, dup := inflight[t.ID]; dup {
+				continue
+			}
+			if budget == 0 {
+				break
+			}
+			if budget > 0 {
+				budget--
+			}
+			m.sweepMu.Lock()
+			m.sweepInflight[t.ID] = struct{}{}
+			m.sweepMu.Unlock()
 			go func(t *Task) {
+				defer func() {
+					m.sweepMu.Lock()
+					delete(m.sweepInflight, t.ID)
+					m.sweepMu.Unlock()
+				}()
 				_, err := t.Start(context.Background())
 				if err == nil || errors.Is(err, ErrClaimHeld) || errors.Is(err, ErrAlreadyTerminal) ||
 					errors.Is(err, ErrNoCheckpoint) || errors.Is(err, ErrAlreadyStarted) {
@@ -351,6 +398,39 @@ func (m *manager) sweep() {
 			}(t)
 		}
 	}
+}
+
+// sweepBudget reports how many more runs this tick may start and which tasks
+// it must skip because an earlier tick's start is still in flight. The count
+// behind the budget unions what the registry shows running with those
+// in-flight starts, by id, so a run counts once whichever side of its claim
+// it is on; only the sweep goroutine grows the in-flight set, so the budget
+// cannot be overdrawn by a concurrent tick. A direct Start racing the count
+// can still push the node past the bound — the bound governs what the sweep
+// pulls, not what an operator runs deliberately. Without WithMaxRunning the
+// budget is -1: start everything claimable.
+func (m *manager) sweepBudget() (budget int, inflight map[string]struct{}) {
+	m.taskRegistryMu.RLock()
+	running := make(map[string]struct{})
+	for id, t := range m.taskRegistry {
+		if t.IsRunning() {
+			running[id] = struct{}{}
+		}
+	}
+	m.taskRegistryMu.RUnlock()
+
+	m.sweepMu.Lock()
+	inflight = make(map[string]struct{}, len(m.sweepInflight))
+	for id := range m.sweepInflight {
+		inflight[id] = struct{}{}
+		running[id] = struct{}{}
+	}
+	m.sweepMu.Unlock()
+
+	if m.maxRunning == 0 {
+		return -1, inflight
+	}
+	return max(m.maxRunning-len(running), 0), inflight
 }
 
 func (m *manager) RegisterWorkflow(id string, workflow workflows.Workflow) error {
