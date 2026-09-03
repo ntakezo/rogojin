@@ -7,86 +7,34 @@
 //
 // Node a creates a task, runs its first state — recording an effect and a
 // durable greeting — and crashes inside the second. Its claim on the task
-// stops renewing, so it expires; node b polls for claimable work, claims the
-// task, resumes at the checkpointed state, and finishes. The effect does not
+// stops renewing, so it expires; node b's recovery sweep claims the task,
+// resumes it at the checkpointed state, and finishes. The effect does not
 // run again: its log survives in the store, which is the whole trick.
 //
-// The same binary works over postgres by pointing -db at a DSN and swapping
-// sqlite.Open/NewTasks for the postgres constructors.
+// The workflow itself lives in the demo package; this file is the node
+// wiring. The same binary works over postgres by pointing -db at a DSN and
+// swapping sqlite.Open/NewTasks for the postgres constructors.
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
+	fleet_demo "github.com/ntakezo/rogojin/_examples/workflows/fleet/demo"
 	"github.com/ntakezo/rogojin/comms"
 	"github.com/ntakezo/rogojin/sqlite"
 	"github.com/ntakezo/rogojin/tasks"
 	"github.com/ntakezo/rogojin/workflows"
 )
 
-const workflowName = "fleet-demo"
-
 // leaseTTL is deliberately short so the dead node's claim lapses while you
 // watch; production keeps the 30s default.
 const leaseTTL = 2 * time.Second
-
-const (
-	greet  workflows.State = "greet"
-	finish workflows.State = "finish"
-)
-
-type input struct {
-	Order string `json:"order"`
-}
-
-// run is one task's instance. The durable struct rides the snapshot, so the
-// greeting composed on one node is there when another resumes the run.
-type run struct {
-	workflows.Base
-	in   input
-	node string
-	d    struct{ Greeting string }
-}
-
-func (r *run) Graph() workflows.Graph {
-	return workflows.NewGraph(greet,
-		workflows.On(greet, r.Greet),
-		workflows.On(finish, r.Finish),
-	)
-}
-
-// Greet composes the greeting through an effect, so it happens once
-// fleet-wide: the node that resumes this run reads the recorded result
-// instead of composing a second greeting.
-func (r *run) Greet(ctx context.Context) (*workflows.State, error) {
-	greeting, err := workflows.Do(ctx, &r.Base, "compose-greeting", func(ctx context.Context) (string, error) {
-		fmt.Printf("[%s] composing the greeting — an effect, so it runs once fleet-wide\n", r.node)
-		return fmt.Sprintf("order %s, greeted by %s", r.in.Order, r.node), nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	r.d.Greeting = greeting
-	return workflows.Next(finish), nil
-}
-
-// Finish prints the greeting — or, with FLEET_CRASH set, dies the way a
-// yanked power cord would: no teardown, no release, the claim simply stops
-// renewing.
-func (r *run) Finish(ctx context.Context) (*workflows.State, error) {
-	if os.Getenv("FLEET_CRASH") != "" {
-		fmt.Printf("[%s] crashing before finishing — the claim will lapse in %s\n", r.node, leaseTTL)
-		os.Exit(1)
-	}
-	fmt.Printf("[%s] finished: %s\n", r.node, r.d.Greeting)
-	return nil, nil
-}
 
 func main() {
 	dsn := flag.String("db", "fleet.db", "database the fleet shares")
@@ -104,37 +52,39 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// The sweep is the recovery loop: every interval it lists tasks whose
+	// claims have lapsed and starts them on background contexts. Nothing
+	// below polls for work — this option is the whole takeover story.
 	svc, err := tasks.NewManager(ctx, repo, comms.NewBus(),
-		tasks.WithNode(*node), tasks.WithLeaseTTL(leaseTTL))
+		tasks.WithNode(*node), tasks.WithLeaseTTL(leaseTTL),
+		tasks.WithRecoverySweep(leaseTTL/4, func(taskID string, err error) {
+			fmt.Printf("[%s] sweep %s: %v\n", *node, taskID, err)
+		}))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer svc.Close()
 
-	module := workflows.NewModule(workflowName, func(in input, deps workflows.Deps) (workflows.Instance, error) {
-		r := &run{in: in, node: *node}
-		r.Persist(&r.d)
-		return r, nil
-	})
-	if err := svc.RegisterWorkflow(workflowName, module); err != nil {
+	if err := svc.RegisterWorkflow(fleet_demo.Name, fleet_demo.New(*node)); err != nil {
 		log.Fatal(err)
 	}
 
-	// A node's loop in miniature: finish what a dead peer left claimable, or
-	// start fresh work when the store holds none.
+	// Fresh work or a dead peer's: the store decides. With unfinished tasks
+	// present the sweep will claim them once their leases lapse; this process
+	// only has to watch for them turning terminal.
 	recovered, err := svc.RecoverAll(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	pending := 0
+	var pending []string
 	for _, t := range recovered {
 		if !workflows.Status(t.Status).Terminal() {
-			pending++
+			pending = append(pending, t.ID)
 		}
 	}
 
-	if pending == 0 {
-		t, err := svc.CreateTask(ctx, workflowName, input{Order: "999"})
+	if len(pending) == 0 {
+		t, err := svc.CreateTask(ctx, fleet_demo.Name, fleet_demo.Input{Order: "999"})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -145,29 +95,31 @@ func main() {
 		return
 	}
 
-	// Pending work exists but may still be claimed by its owner; poll until a
-	// lapsed claim frees it. This inline loop is what WithRecoverySweep runs
-	// for a long-lived node.
-	fmt.Printf("[%s] %d unfinished task(s) in the store; waiting for a claim to lapse\n", *node, pending)
-	deadline := time.Now().Add(5 * leaseTTL)
+	fmt.Printf("[%s] %d unfinished task(s) in the store; the sweep takes over once their claims lapse\n", *node, len(pending))
+	deadline := time.Now().Add(10 * leaseTTL)
 	for time.Now().Before(deadline) {
-		claimable, err := svc.RecoverClaimable(ctx)
-		if err != nil {
-			log.Fatal(err)
-		}
-		for _, t := range claimable {
-			rec := t.Record()
-			fmt.Printf("[%s] claiming task %s, checkpointed at state %q by %q\n", *node, rec.ID, rec.State, rec.OwnerNode)
-			switch _, err := t.Start(ctx); {
-			case err == nil:
-				return
-			case errors.Is(err, tasks.ErrClaimHeld):
-				fmt.Printf("[%s] another node won task %s\n", *node, rec.ID)
-			default:
+		remaining := pending[:0]
+		for _, id := range pending {
+			t, err := svc.RecoverTask(ctx, id)
+			if err != nil {
 				log.Fatal(err)
 			}
+			if !t.LiveStatus().Terminal() {
+				remaining = append(remaining, id)
+			}
+		}
+		if pending = remaining; len(pending) == 0 {
+			return
 		}
 		time.Sleep(leaseTTL / 4)
 	}
-	fmt.Printf("[%s] nothing became claimable; is the owner still alive?\n", *node)
+	fmt.Printf("[%s] %s never finished; is the owner still alive?\n", *node, plural(pending))
+}
+
+// plural renders the leftover ids as "task t1" or "tasks t1, t2".
+func plural(ids []string) string {
+	if len(ids) == 1 {
+		return "task " + ids[0]
+	}
+	return "tasks " + strings.Join(ids, ", ")
 }

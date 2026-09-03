@@ -122,38 +122,18 @@ func (m *Manager) GuardDeletes(guard func(emailID string) (held, locked []string
 	m.guard = guard
 }
 
-// noopRepository is the Repository a nil one is swapped for: it loads nothing
-// and drops every write, leaving the manager's inventory as the only copy.
-// The one durable field, the listener cursor, is simply never stored — a
-// restart re-reads from the backfill window instead. Listener claims always
-// succeed: with no shared store there is no second node to hold one.
-type noopRepository struct{}
-
-func (noopRepository) List(context.Context) ([]Email, error) { return nil, nil }
-func (noopRepository) Save(context.Context, Email) error     { return nil }
-func (noopRepository) Delete(context.Context, string) error  { return nil }
-
-func (noopRepository) ClaimListener(context.Context, string, string, time.Duration) error {
-	return nil
-}
-func (noopRepository) RenewListener(context.Context, string, string, time.Duration) error {
-	return nil
-}
-func (noopRepository) ReleaseListener(context.Context, string, string) error { return nil }
-func (noopRepository) AdvanceCursor(context.Context, string, string, uint32, uint32) error {
-	return nil
-}
-
 // NewManager loads the inventory from the repository. The inventory changes
 // afterwards only through Add and Delete; listener cursors are the one field
 // the manager writes back on its own.
 //
-// A nil repository runs the inventory purely in memory: the manager starts
-// empty (seed it through Add), and neither inboxes nor listener cursors
-// survive the process — the same bargain a nil task repository strikes.
+// A nil repository runs the inventory purely in memory, on the same
+// in-process store NewMemoryRepository returns: claims and cursors are
+// enforced for real, but the manager starts empty (seed it through Add) and
+// no inbox survives the process — the same bargain a nil task repository
+// strikes.
 func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {
 	if repo == nil {
-		repo = noopRepository{}
+		repo = NewMemoryRepository()
 	}
 	m := &Manager{
 		repo:        repo,

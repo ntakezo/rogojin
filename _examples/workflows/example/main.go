@@ -2,8 +2,7 @@
 // a canned test site and a local forward proxy, registers the workflow on a task
 // manager backed by an in-memory repository, leases a proxy from a round-robin
 // proxy manager and locks a site account from an account manager, then creates
-// and starts one task, printing each state it checkpoints through and each
-// request the proxy forwards.
+// and starts one task, printing each request the proxy forwards.
 package main
 
 import (
@@ -48,7 +47,7 @@ func main() {
 	if _, err := proxyRepo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "local-1", GroupID: proxies.GlobalGroup}, URL: forward.URL}); err != nil {
 		log.Fatalf("seed proxy: %v", err)
 	}
-	proxyManager, err := proxies.NewManager(ctx, logProxyStats{proxyRepo})
+	proxyManager, err := proxies.NewManager(ctx, proxyRepo)
 	if err != nil {
 		log.Fatalf("proxy manager: %v", err)
 	}
@@ -56,11 +55,8 @@ func main() {
 	// Email is not a leased resource — no groups, no rotation, no locks. The
 	// inventory holds the forwarding inboxes accounts point at; a workflow
 	// reaches its inbox through its locked account (ForwardingEmail, then
-	// Listen with a sender filter and a backfill window). The nil repository
-	// runs the inventory in memory — this example wants no rows surviving it —
-	// where the proxy and task repositories below are written out because they
-	// do something with their writes.
-	emailManager, err := email.NewManager(ctx, nil, email.WithDialer(mailServer.dial))
+	// Listen with a sender filter and a backfill window).
+	emailManager, err := email.NewManager(ctx, memory.NewEmails(), email.WithDialer(mailServer.dial))
 	if err != nil {
 		log.Fatalf("email manager: %v", err)
 	}
@@ -79,7 +75,7 @@ func main() {
 	// account's guaranteed field — its forwarding inbox — and WithEmail
 	// closes the referential loop: an inbox a held or locked account forwards
 	// to refuses deletion, exactly like a leased resource would.
-	accountManager, err := accounts.NewManager(ctx, nil, accounts.WithEmail(emailManager))
+	accountManager, err := accounts.NewManager(ctx, memory.NewAccounts(), accounts.WithEmail(emailManager))
 	if err != nil {
 		log.Fatalf("account manager: %v", err)
 	}
@@ -98,7 +94,7 @@ func main() {
 	// exactly once, here: RegisterWorkflow hands them to the workflow through
 	// UseResources, so the instance a task leases through is the instance a
 	// deletion unlocks through.
-	taskManager, err := tasks.NewManager(ctx, logCheckpoints{memory.NewTasks()}, comms.NewBus(),
+	taskManager, err := tasks.NewManager(ctx, memory.NewTasks(), comms.NewBus(),
 		tasks.WithResource(proxies.Kind, proxyManager),
 		tasks.WithResource(accounts.Kind, accountManager))
 	if err != nil {
@@ -272,24 +268,6 @@ func (m *mailSession) Close() error {
 	delete(m.server.wakes, m.wake)
 	m.server.mu.Unlock()
 	return nil
-}
-
-// logProxyStats prints each stat write the manager persists, so the leased
-// proxy's rotation feedback stays visible in the example's output.
-type logProxyStats struct{ proxies.Repository }
-
-func (l logProxyStats) Save(ctx context.Context, p proxies.Proxy) (int64, error) {
-	fmt.Printf("  proxy %s stats now %d/%d\n", p.ID, p.Successes, p.Failures)
-	return l.Repository.Save(ctx, p)
-}
-
-// logCheckpoints prints each state the task checkpoints through on its way
-// into the store.
-type logCheckpoints struct{ tasks.Repository }
-
-func (l logCheckpoints) SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error) {
-	fmt.Printf("  checkpoint %-16s [%s] snapshot=%s\n", state, status, snapshot)
-	return l.Repository.SaveCheckpoint(ctx, id, version, node, status, state, snapshot)
 }
 
 // profileFields marshals this workflow's account shape into the opaque JSON the
