@@ -18,15 +18,22 @@ import (
 // so no test needs a network.
 
 // memRepo is an in-memory Repository recording saves so tests can assert
-// persistence without sqlite.
+// persistence without sqlite. Its claim half enforces the real contract —
+// the multi-node tests below need refusals, not stubs.
 type memRepo struct {
-	mu    sync.Mutex
-	rows  map[string]Email
-	order []string
+	mu     sync.Mutex
+	rows   map[string]Email
+	order  []string
+	claims map[string]repoClaim
+}
+
+type repoClaim struct {
+	node      string
+	expiresAt time.Time
 }
 
 func newMemRepo() *memRepo {
-	return &memRepo{rows: map[string]Email{}}
+	return &memRepo{rows: map[string]Email{}, claims: map[string]repoClaim{}}
 }
 
 func (r *memRepo) List(ctx context.Context) ([]Email, error) {
@@ -55,6 +62,67 @@ func (r *memRepo) Delete(ctx context.Context, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.rows, id)
+	return nil
+}
+
+func (r *memRepo) ClaimListener(ctx context.Context, emailID, node string, ttl time.Duration) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.rows[emailID]; !ok {
+		return fmt.Errorf("claim %s: %w", emailID, ErrEmailNotFound)
+	}
+	if c, held := r.claims[emailID]; held && c.node != node && time.Now().Before(c.expiresAt) {
+		return fmt.Errorf("claim %s: %w", emailID, ErrListenerHeld)
+	}
+	r.claims[emailID] = repoClaim{node: node, expiresAt: time.Now().Add(ttl)}
+	return nil
+}
+
+func (r *memRepo) RenewListener(ctx context.Context, emailID, node string, ttl time.Duration) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.rows[emailID]; !ok {
+		return fmt.Errorf("renew %s: %w", emailID, ErrEmailNotFound)
+	}
+	if c, held := r.claims[emailID]; !held || c.node != node {
+		return fmt.Errorf("renew %s: %w", emailID, ErrListenerHeld)
+	}
+	r.claims[emailID] = repoClaim{node: node, expiresAt: time.Now().Add(ttl)}
+	return nil
+}
+
+func (r *memRepo) ReleaseListener(ctx context.Context, emailID, node string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.rows[emailID]; !ok {
+		return fmt.Errorf("release %s: %w", emailID, ErrEmailNotFound)
+	}
+	if c, held := r.claims[emailID]; held && c.node == node {
+		delete(r.claims, emailID)
+	}
+	return nil
+}
+
+func (r *memRepo) AdvanceCursor(ctx context.Context, emailID, node string, uidValidity, lastUID uint32) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.rows[emailID]
+	if !ok {
+		return fmt.Errorf("advance %s: %w", emailID, ErrEmailNotFound)
+	}
+	if c, held := r.claims[emailID]; !held || c.node != node {
+		return fmt.Errorf("advance %s: %w", emailID, ErrListenerHeld)
+	}
+	if e.Inbox == nil {
+		return nil
+	}
+	if uidValidity == e.Inbox.UIDValidity && lastUID <= e.Inbox.LastUID {
+		return nil
+	}
+	inbox := *e.Inbox
+	inbox.UIDValidity, inbox.LastUID = uidValidity, lastUID
+	e.Inbox = &inbox
+	r.rows[emailID] = e
 	return nil
 }
 

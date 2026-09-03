@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ntakezo/rogojin/comms"
+	"github.com/ntakezo/rogojin/internal/nodeid"
 	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/workflows"
 )
@@ -28,6 +29,52 @@ type ResourceManager interface {
 
 // An Option configures a Manager at construction.
 type Option func(*manager)
+
+// WithNode sets the manager's node identity, the name its claims are filed
+// under. Every manager in a process may share one; two processes must not.
+// The default — host, pid, and a random suffix — is safe unmanaged, so set
+// this only to make claim rows legible under a naming scheme of your own.
+// It panics on an empty id, which would file claims as unclaimed.
+func WithNode(id string) Option {
+	return func(m *manager) {
+		if id == "" {
+			panic("tasks: node id must not be empty")
+		}
+		m.node = id
+	}
+}
+
+// WithLeaseTTL sets how long the store presumes a claimed task alive without
+// renewal (default 30s). The heartbeat renews at a third of this, so the
+// lease only lapses after a crash — or that long of consecutive renewal
+// failures, which is the intended failure semantics: a store unreachable for
+// a whole TTL has already ceded the task to whoever can reach it. It panics
+// on a non-positive duration.
+func WithLeaseTTL(d time.Duration) Option {
+	return func(m *manager) {
+		if d <= 0 {
+			panic("tasks: lease TTL must be positive")
+		}
+		m.ttl = d
+	}
+}
+
+// WithRecoverySweep runs RecoverClaimable every interval and starts what it
+// claims — the loop that picks up tasks a crashed node left behind once
+// their leases lapse. Losing a claim race, a terminal or never-checkpointed
+// record, and a task already running here are all normal and reported to no
+// one; every other failure goes to onErr (nil drops them) with the task id,
+// or "" when the sweep itself failed. Swept runs execute on background
+// contexts and outlive Close. It panics on a non-positive interval.
+func WithRecoverySweep(interval time.Duration, onErr func(taskID string, err error)) Option {
+	return func(m *manager) {
+		if interval <= 0 {
+			panic("tasks: sweep interval must be positive")
+		}
+		m.sweepInterval = interval
+		m.sweepErr = onErr
+	}
+}
 
 // WithResource registers one resource kind's leasing manager, which is the
 // whole of that wiring:
@@ -81,9 +128,17 @@ type Manager interface {
 	// returned but cannot be started; its Start fails with ErrNoCheckpoint.
 	RecoverTask(ctx context.Context, id string) (*Task, error)
 	// RecoverAll rehydrates every persisted task and returns them unstarted,
-	// terminal ones included. The caller decides what to Start; terminal tasks
-	// recover for inspection only, and their Start fails with ErrAlreadyTerminal.
+	// terminal ones included. It claims nothing — it is the listing surface,
+	// and another node's live tasks recover here for inspection. The caller
+	// decides what to Start; terminal tasks recover for inspection only, and
+	// their Start fails with ErrAlreadyTerminal.
 	RecoverAll(ctx context.Context) ([]*Task, error)
+	// RecoverClaimable rehydrates the tasks whose claim is free for the
+	// taking — unclaimed, or leased past expiry — and returns them
+	// unstarted. It claims nothing either: Start is the single claim point,
+	// and a Start losing the race there with ErrClaimHeld is how a race
+	// between sweeping nodes resolves.
+	RecoverClaimable(ctx context.Context) ([]*Task, error)
 	// DeleteTask removes a task from the registry and the repository, releasing
 	// its external resources first. It refuses a running task.
 	DeleteTask(ctx context.Context, id string) error
@@ -125,6 +180,12 @@ type Manager interface {
 	// IsRunning reports whether a known task is started and not yet terminal.
 	// A suspended task counts: it is parked, not finished.
 	IsRunning(id string) bool
+	// Close stops the manager's background work — the claim heartbeat and
+	// the recovery sweep — and waits for it. It does not kill running tasks:
+	// they run on, but their claims stop renewing, so within a lease TTL
+	// other nodes may legitimately take them over. Stop or finish the work
+	// first if that is not intended. Close is idempotent.
+	Close() error
 }
 
 type manager struct {
@@ -144,6 +205,19 @@ type manager struct {
 	// always present, stored record or not.
 	groups map[string]Group
 
+	// node and ttl are the claim identity and lease length every task this
+	// manager creates or recovers starts under; sweepInterval and sweepErr
+	// configure the optional recovery sweep. The background context and wait
+	// group are the heartbeat's and sweep's lifecycle, ended by Close.
+	node          string
+	ttl           time.Duration
+	sweepInterval time.Duration
+	sweepErr      func(taskID string, err error)
+	background    context.Context
+	stop          context.CancelFunc
+	work          sync.WaitGroup
+	closeOnce     sync.Once
+
 	workflowRegistryMu sync.RWMutex
 	taskRegistryMu     sync.RWMutex
 	groupsMu           sync.RWMutex
@@ -152,12 +226,15 @@ type manager struct {
 // NewManager returns a Manager that persists tasks in repository and injects
 // bus into each task's workflow instance, loading the task groups from the
 // repository once — the cache is authoritative afterwards, and changes only
-// through CreateGroup and DeleteGroup. A nil repository selects purely
-// in-memory operation: tasks run without checkpoints, durable terminal stamps,
-// or stored groups, and there is nothing to recover after a restart. Use it
-// when durability and crash recovery are not needed. Unlike the leasing
-// managers, task records are not validated against groups here; a record
-// naming a missing group fails at recovery instead.
+// through CreateGroup and DeleteGroup. Tasks it starts are claimed for its
+// node against the store, and a heartbeat renews those claims until Close,
+// so which node runs a task is the store's decision, not an accident of who
+// called Start first. A nil repository selects purely in-memory operation:
+// tasks run without checkpoints, durable terminal stamps, stored groups,
+// claims, or the heartbeat, and there is nothing to recover after a restart.
+// Use it when durability and crash recovery are not needed. Unlike the
+// leasing managers, task records are not validated against groups here; a
+// record naming a missing group fails at recovery instead.
 func NewManager(ctx context.Context, repository Repository, bus comms.Bus, opts ...Option) (Manager, error) {
 	s := &manager{
 		repository:       repository,
@@ -165,20 +242,111 @@ func NewManager(ctx context.Context, repository Repository, bus comms.Bus, opts 
 		taskRegistry:     make(map[string]*Task),
 		bus:              bus,
 		groups:           map[string]Group{GlobalGroup: {ID: GlobalGroup}},
+		node:             nodeid.Default(),
+		ttl:              30 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.background, s.stop = context.WithCancel(context.Background())
 	if repository != nil {
 		listed, err := repository.ListGroups(ctx)
 		if err != nil {
+			s.stop()
 			return nil, fmt.Errorf("failed to load task groups: %w", err)
 		}
 		for _, g := range listed {
 			s.groups[g.ID] = g
 		}
+		s.work.Add(1)
+		go s.heartbeat()
+		if s.sweepInterval > 0 {
+			s.work.Add(1)
+			go s.sweep()
+		}
 	}
 	return s, nil
+}
+
+// Close stops the heartbeat and sweep and waits for them. Running tasks are
+// left running; see Manager.Close for what that means for their claims.
+func (m *manager) Close() error {
+	m.closeOnce.Do(func() {
+		m.stop()
+		m.work.Wait()
+	})
+	return nil
+}
+
+// heartbeat renews the claim of every live task on this manager at a third
+// of the lease TTL. ErrStale or a vanished record means the task is no
+// longer this node's to run — usurped after a lapse, or deleted elsewhere —
+// and the local run is killed so it stops side-effecting. Any other failure
+// is left for the next tick: a store blip must not kill runs, and the lease
+// only lapses after a full TTL of them, exactly when ceding the task is
+// right.
+func (m *manager) heartbeat() {
+	defer m.work.Done()
+	tick := time.NewTicker(m.ttl / 3)
+	defer tick.Stop()
+	for {
+		select {
+		case <-m.background.Done():
+			return
+		case <-tick.C:
+		}
+		m.taskRegistryMu.RLock()
+		live := make([]*Task, 0, len(m.taskRegistry))
+		for _, t := range m.taskRegistry {
+			if t.IsRunning() {
+				live = append(live, t)
+			}
+		}
+		m.taskRegistryMu.RUnlock()
+
+		for _, t := range live {
+			err := m.repository.RenewClaim(m.background, t.ID, m.node, m.ttl)
+			if errors.Is(err, ErrStale) || errors.Is(err, ErrTaskNotFound) {
+				t.Kill()
+			}
+		}
+	}
+}
+
+// sweep runs the recovery loop configured by WithRecoverySweep: list what is
+// claimable, rehydrate it, and Start each on a background context so a
+// stolen run outlives Close along with every other run. Start is the claim
+// point, so racing sweeps on other nodes lose there, quietly.
+func (m *manager) sweep() {
+	defer m.work.Done()
+	tick := time.NewTicker(m.sweepInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-m.background.Done():
+			return
+		case <-tick.C:
+		}
+		tasks, err := m.RecoverClaimable(m.background)
+		if err != nil {
+			if m.sweepErr != nil && m.background.Err() == nil {
+				m.sweepErr("", err)
+			}
+			continue
+		}
+		for _, t := range tasks {
+			go func(t *Task) {
+				_, err := t.Start(context.Background())
+				if err == nil || errors.Is(err, ErrClaimHeld) || errors.Is(err, ErrAlreadyTerminal) ||
+					errors.Is(err, ErrNoCheckpoint) || errors.Is(err, ErrAlreadyStarted) {
+					return
+				}
+				if m.sweepErr != nil {
+					m.sweepErr(t.ID, err)
+				}
+			}(t)
+		}
+	}
 }
 
 func (m *manager) RegisterWorkflow(id string, workflow workflows.Workflow) error {
@@ -313,6 +481,7 @@ func (m *manager) CreateTask(ctx context.Context, workflowID string, input any, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create task: %w", err)
 	}
+	task.node, task.ttl = m.node, m.ttl
 
 	// A nil repository is purely in-memory: skip persistence and keep the task
 	// only in the registry.
@@ -378,6 +547,24 @@ func (m *manager) RecoverAll(ctx context.Context) ([]*Task, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to recover tasks: %w", err)
 	}
+	return m.adopt(records)
+}
+
+func (m *manager) RecoverClaimable(ctx context.Context) ([]*Task, error) {
+	if m.repository == nil {
+		return nil, nil
+	}
+
+	records, err := m.repository.ListClaimable(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list claimable tasks: %w", err)
+	}
+	return m.adopt(records)
+}
+
+// adopt rehydrates records into the registry, passing live tasks through
+// as-is; a record naming a missing group fails the whole sweep.
+func (m *manager) adopt(records []Task) ([]*Task, error) {
 	// Snapshot the group cache once: resolving each record's own would take
 	// the read lock per task for an answer that cannot change mid-sweep.
 	m.groupsMu.RLock()
@@ -426,7 +613,9 @@ func (m *manager) rehydrate(record Task, group Group) (*Task, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workflow for recovery: %w", err)
 	}
-	return rehydrateTask(workflow, record, m.bus, m.repository, resolveAll(record.Assignments, group)), nil
+	t := rehydrateTask(workflow, record, m.bus, m.repository, resolveAll(record.Assignments, group))
+	t.node, t.ttl = m.node, m.ttl
+	return t, nil
 }
 
 // resolve settles one kind's placement: the task's own assignment wherever it

@@ -40,7 +40,7 @@ func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager,
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	m, err := leasing.NewManager(ctx, repo)
+	m, err := leasing.NewManager(ctx, repo, leasing.WithTopic[Account, *Account](string(Kind)))
 	if err != nil {
 		return nil, err
 	}

@@ -45,6 +45,7 @@ func WithStrategy(name string, factory StrategyFactory) Option {
 func NewManager(ctx context.Context, repo Repository, opts ...Option) (*Manager, error) {
 	installed := append([]Option{
 		WithStrategy(StrategyBayesian, func() Selection { return NewBayesian() }),
+		leasing.WithTopic[Proxy, *Proxy](string(Kind)),
 	}, opts...)
 	m, err := leasing.NewManager(ctx, repo, installed...)
 	if err != nil {
@@ -81,7 +82,8 @@ type Lease struct {
 	once    sync.Once
 }
 
-// ReleaseOutcome tallies the outcome on the proxy — persisted, so the
+// ReleaseOutcome tallies the outcome on the proxy — an atomic store-side
+// increment, so outcomes reported by every process land whole and the
 // bayesian strategy's history survives a restart — and then frees it. The
 // tally goes first, while the lease still guards the proxy from deletion; the
 // hold is freed even if the tally fails to persist, since a lease must never
@@ -90,13 +92,23 @@ type Lease struct {
 func (l *Lease) ReleaseOutcome(ctx context.Context, success bool) error {
 	var err error
 	l.once.Do(func() {
-		err = l.manager.Update(ctx, l.Resource().ID, func(p *Proxy) {
-			if success {
-				p.Successes++
-			} else {
-				p.Failures++
-			}
-		})
+		id, name := l.Resource().ID, "successes"
+		if !success {
+			name = "failures"
+		}
+		// The counter is the durable truth; the cache amendment keeps this
+		// process's sampler as current as the increment that just landed,
+		// since candidates are selected from the cached pool.
+		_, err = l.manager.Increment(ctx, id, name, 1)
+		if err == nil {
+			l.manager.Amend(id, func(p *Proxy) {
+				if success {
+					p.Successes++
+				} else {
+					p.Failures++
+				}
+			})
+		}
 		l.Lease.Release()
 	})
 	return err

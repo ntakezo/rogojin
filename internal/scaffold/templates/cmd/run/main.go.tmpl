@@ -8,7 +8,11 @@ import (
 {{- if and (not .Persist) (or .Accounts .Payments)}}
 	"encoding/json"
 {{- end}}
+{{- if .Persist}}
+	"flag"
+{{- end}}
 	"log"
+	"os"
 
 	"github.com/ntakezo/rogojin/comms"
 {{- if .Accounts}}
@@ -27,7 +31,7 @@ import (
 	"github.com/ntakezo/rogojin/proxies"
 {{- end}}
 {{- if .Persist}}
-	"github.com/ntakezo/rogojin/sqlite"
+	"github.com/ntakezo/rogojin/{{.RepoPkg}}"
 {{- end}}
 	"github.com/ntakezo/rogojin/tasks"
 	"{{.ModulePath}}/{{.Package}}"
@@ -40,10 +44,13 @@ func main() {
 {{- if .Persist}}
 
 	// One database holds every store — tasks and inventory alike: each store
-	// records its migrations under its own name in a shared ledger. Open a
-	// second file if you would rather keep them apart. The inventory seeded
-	// below persists across runs, so grow it once and it stays.
-	db, err := sqlite.Open("{{.Package}}.db")
+	// records its migrations under its own name in a shared ledger. The
+	// inventory seeded below persists across runs, so grow it once and it
+	// stays. Every process pointed at the same database is a node of the same
+	// fleet: claims, leases, and locks coordinate them through the store.
+	dsn := flag.String("db", "{{.DBDefault}}", "database the fleet shares")
+	flag.Parse()
+	db, err := {{.RepoPkg}}.Open(*dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -52,7 +59,7 @@ func main() {
 
 	// Every repository below is nil: the managers run purely in memory, so
 	// nothing — inventory, locks, task history — survives the process. Swap
-	// in the sqlite constructors for durability.
+	// in the sqlite or postgres constructors for durability.
 {{- end}}
 
 {{- if .Email}}
@@ -60,7 +67,7 @@ func main() {
 	// Email is not a leased resource — no groups, no rotation, no locks. The
 	// inventory holds the inboxes tasks listen to.
 {{- if .Persist}}
-	emailRepo, err := sqlite.NewEmails(db)
+	emailRepo, err := {{.RepoPkg}}.NewEmails(db)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -86,7 +93,7 @@ func main() {
 {{- if .Proxy}}
 
 {{- if .Persist}}
-	proxyRepo, err := sqlite.NewProxies(db)
+	proxyRepo, err := {{.RepoPkg}}.NewProxies(db)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -97,6 +104,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer proxyManager.Close()
 {{- if not .Persist}}
 	if err := proxyManager.Add(ctx, proxies.Proxy{
 		Resource: leasing.Resource{ID: "proxy-1"}, // replace with real proxies
@@ -110,7 +118,7 @@ func main() {
 {{- if .Accounts}}
 
 {{- if .Persist}}
-	accountRepo, err := sqlite.NewAccounts(db)
+	accountRepo, err := {{.RepoPkg}}.NewAccounts(db)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -121,6 +129,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer accountManager.Close()
 {{- if not .Persist}}
 	if err := accountManager.Add(ctx, accounts.Account{
 		Resource: leasing.Resource{ID: "account-1"}, // replace with real accounts
@@ -137,7 +146,7 @@ func main() {
 {{- if .Payments}}
 
 {{- if .Persist}}
-	paymentRepo, err := sqlite.NewPayments(db)
+	paymentRepo, err := {{.RepoPkg}}.NewPayments(db)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -148,6 +157,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer paymentManager.Close()
 {{- if not .Persist}}
 	if err := paymentManager.Add(ctx, payments.Payment{
 		Resource: leasing.Resource{ID: "payment-1"}, // replace with real instruments
@@ -160,7 +170,7 @@ func main() {
 
 {{- if .Persist}}
 
-	repo, err := sqlite.NewTasks(db)
+	repo, err := {{.RepoPkg}}.NewTasks(db)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -173,13 +183,27 @@ func main() {
 	// so the instance a task leases through is the instance a deletion
 	// unlocks through.
 {{- end}}
-	svc, err := tasks.NewManager(ctx, {{if .Persist}}repo{{else}}nil{{end}}, comms.NewBus(){{if .Proxy}},
-		tasks.WithResource(proxies.Kind, proxyManager){{end}}{{if .Accounts}},
-		tasks.WithResource(accounts.Kind, accountManager){{end}}{{if .Payments}},
-		tasks.WithResource(payments.Kind, paymentManager){{end}})
+	opts := []tasks.Option{
+{{- if .Proxy}}
+		tasks.WithResource(proxies.Kind, proxyManager),
+{{- end}}
+{{- if .Accounts}}
+		tasks.WithResource(accounts.Kind, accountManager),
+{{- end}}
+{{- if .Payments}}
+		tasks.WithResource(payments.Kind, paymentManager),
+{{- end}}
+	}
+	// A node id names this process in the store's task claims. The default is
+	// unique per process; set ROGOJIN_NODE to pin a stable name per machine.
+	if node := os.Getenv("ROGOJIN_NODE"); node != "" {
+		opts = append(opts, tasks.WithNode(node))
+	}
+	svc, err := tasks.NewManager(ctx, {{if .Persist}}repo{{else}}nil{{end}}, comms.NewBus(), opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer svc.Close()
 
 	wf := {{.Package}}.New({{if .Email}}emailManager{{end}})
 	if err := svc.RegisterWorkflow({{.Package}}.Name, wf); err != nil {

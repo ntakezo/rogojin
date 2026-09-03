@@ -31,7 +31,9 @@ The portal to the internet is built for humans. Websites exclude bots from that 
 
 ## Installation
 
-Requires Go 1.27+; the SQLite adapter needs cgo.
+Requires Go 1.27+; the SQLite adapter needs cgo. The Postgres adapter
+(`postgres.Open` on a `postgres://` DSN, pure Go) is the store several nodes
+share when one process is not enough.
 
 ```sh
 go get github.com/ntakezo/rogojin
@@ -54,6 +56,16 @@ To watch the whole thing work first:
 ```sh
 cd _examples && go run ./workflows/example
 ```
+
+## Deployment profiles
+
+One codebase, three ways to run it — the difference is only which repository the managers open:
+
+- **Embedded** (`--repo memory`) — everything in one process, nothing survives it. Experiments and tests.
+- **Single node** (`--repo sqlite`, the default) — one file holds every store; tasks, locks, and inventory survive restarts.
+- **Fleet** (`--repo postgres`) — N processes over one database. The store is the authority: task claims decide who runs what, leases and locks decide who holds what, and the effect log makes a side effect happen once fleet-wide, so two nodes can't run the same task or charge the same instrument. Kill a node and its work is claimable the moment its lease lapses — `_examples/workflows/fleet` is that story in one file, runnable on a shared sqlite file. For tasks on different nodes to hear each other, add the [`bus/redis`](./bus/redis) package: a `comms.Bus` and `comms.Notifier` over Redis pub/sub, so topic messages and capacity wakeups cross nodes the way they already cross goroutines. Workflow code doesn't change — the typed `comms.Topic` layer reads identically over either transport.
+
+Pre-1.0 note: this release collapsed the schema histories; a database file from an earlier release is refused at open — recreate it.
 
 ## Documentation
 

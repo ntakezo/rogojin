@@ -2,6 +2,7 @@ package email
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -75,8 +76,13 @@ func (l *listener) taskIDs() []string {
 // run is the listener goroutine: dial, serve until the session breaks, back
 // off, redial — never giving up while subscribers remain. The loop never
 // takes the caller's context; it lives exactly as long as its stop channel.
+// On the way out it releases the inbox claim, unless a successor listener in
+// this process has already been registered over it — the claim is then the
+// successor's to keep.
 func (m *Manager) run(l *listener) {
 	defer close(l.done)
+	defer m.releaseClaim(l)
+	go m.renewLoop(l)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -179,6 +185,71 @@ func (m *Manager) owns(l *listener) bool {
 	return m.listeners[l.emailID] == l
 }
 
+// renewLoop is the claim heartbeat: while the listener lives, its node's
+// claim never expires. A renewal refused with ErrListenerHeld means another
+// node took the inbox after this claim lapsed — the listener is torn down at
+// once, because everything it fetches from here on is the new owner's mail.
+// Any other renewal failure is reported and retried on the next tick: the
+// claim survives a store hiccup as long as no one else takes it.
+func (m *Manager) renewLoop(l *listener) {
+	tick := time.NewTicker(max(m.listenerTTL/3, time.Millisecond))
+	defer tick.Stop()
+	for {
+		select {
+		case <-l.stop:
+			return
+		case <-tick.C:
+			err := m.repo.RenewListener(context.Background(), l.emailID, m.node, m.listenerTTL)
+			switch {
+			case err == nil:
+			case errors.Is(err, ErrListenerHeld):
+				m.mu.Lock()
+				m.usurpedLocked(l)
+				m.mu.Unlock()
+				m.reportError(l.emailID, fmt.Errorf("inbox listener usurped: %w", err))
+				return
+			default:
+				m.reportError(l.emailID, fmt.Errorf("renew listener claim: %w", err))
+			}
+		}
+	}
+}
+
+// usurpedLocked tears the listener down after another node took its inbox:
+// subscriptions are retired — a closed channel is the honest signal that
+// this feed has ended — and the listener leaves the registry so its dying
+// goroutine can neither deliver nor write the cursor. Callers hold m.mu.
+func (m *Manager) usurpedLocked(l *listener) {
+	if !m.owns(l) {
+		return
+	}
+	close(l.stop)
+	for s := range l.subs {
+		s.retire()
+	}
+	l.subs = make(map[*subscription]struct{})
+	delete(m.listeners, l.emailID)
+}
+
+// releaseClaim hands the inbox claim back on listener exit — unless a
+// successor listener is registered, in which case the claim now belongs to
+// it, or this node was usurped, in which case ReleaseListener is a no-op by
+// contract. Best-effort on a background context: the process may be shutting
+// down, and an unreleased claim only costs its TTL.
+func (m *Manager) releaseClaim(l *listener) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listeners[l.emailID] != nil {
+		return
+	}
+	err := m.repo.ReleaseListener(context.Background(), l.emailID, m.node)
+	if err != nil && !errors.Is(err, ErrEmailNotFound) {
+		// A deleted email has no claim left to release; anything else is
+		// worth a report, though the claim expiring covers for it.
+		m.reportError(l.emailID, fmt.Errorf("release listener claim: %w", err))
+	}
+}
+
 // cursor reads the email's durable cursor; ok is false once the email is
 // gone from the inventory or l is no longer its listener.
 func (m *Manager) cursor(l *listener) (Inbox, bool) {
@@ -193,10 +264,13 @@ func (m *Manager) cursor(l *listener) (Inbox, bool) {
 }
 
 // advanceCursor persists and installs the cursor, store first like every
-// other write here. reset moves LastUID backwards too, for UIDVALIDITY
-// changes; ordinary advances only ever move it forward. A listener that lost
-// its inbox writes nothing — its successor owns the cursor now, and a stale
-// reset landing over the successor's fresh one would replay or skip mail.
+// other write here. The store's AdvanceCursor enforces what used to be
+// reasoned about locally: only the claim holder writes, only forward moves
+// land (a changed UIDVALIDITY is the reset that may move LastUID back), and
+// a lagging duplicate write is a silent no-op — so a stale writer can never
+// roll the cursor back over a successor's progress. A refusal naming
+// ErrListenerHeld means another node took the inbox; the listener is torn
+// down on the spot rather than served to nobody until its next renewal.
 func (m *Manager) advanceCursor(l *listener, uidValidity, uid uint32, reset bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -205,6 +279,15 @@ func (m *Manager) advanceCursor(l *listener, uidValidity, uid uint32, reset bool
 	if !ok || e.Inbox == nil || !m.owns(l) {
 		return nil
 	}
+	// Background, not the session context: a cursor whose mail was fanned out
+	// should land even as the listener is being cancelled.
+	if err := m.repo.AdvanceCursor(context.Background(), l.emailID, m.node, uidValidity, uid); err != nil {
+		if errors.Is(err, ErrListenerHeld) {
+			m.usurpedLocked(l)
+			return nil
+		}
+		return fmt.Errorf("persist cursor of email %s: %w", l.emailID, err)
+	}
 	inbox := *e.Inbox
 	inbox.UIDValidity = uidValidity
 	if reset || uid > inbox.LastUID {
@@ -212,11 +295,6 @@ func (m *Manager) advanceCursor(l *listener, uidValidity, uid uint32, reset bool
 	}
 	e.Inbox = &inbox
 	e.UpdatedAt = time.Now().UTC()
-	// Background, not the session context: a cursor whose mail was fanned out
-	// should land even as the listener is being cancelled.
-	if err := m.repo.Save(context.Background(), e); err != nil {
-		return fmt.Errorf("persist cursor of email %s: %w", l.emailID, err)
-	}
 	m.inventory[l.emailID] = e
 	return nil
 }

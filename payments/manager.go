@@ -16,5 +16,5 @@ type Lease = leasing.Lease[Payment, *Payment]
 // global group if absent. Seed groups before resources — see
 // leasing.NewManager.
 func NewManager(ctx context.Context, repo Repository) (*Manager, error) {
-	return leasing.NewManager[Payment](ctx, repo)
+	return leasing.NewManager(ctx, repo, leasing.WithTopic[Payment, *Payment](string(Kind)))
 }

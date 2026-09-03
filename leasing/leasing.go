@@ -1,7 +1,10 @@
 // Package leasing allocates pooled resources to tasks. A consumer-provided
-// Repository stores the pool and its groups durably while the Manager owns all
-// live acquisition state, rotating unlocked resources through per-group
-// selection strategies and honoring durable task-to-resource locks.
+// Repository is the authority on the pool, its groups, and every live
+// acquisition fact — holds, locks, rotation cursors — while the Manager
+// rotates unlocked resources through per-group selection strategies over
+// caches of it, proving each grant against the store. Several managers over
+// one store therefore agree on who holds what by construction, which is what
+// lets a deployment run more than one process.
 //
 // Resource is the model every leasable kind shares: a proxy, an account, a
 // card is a struct that embeds it and adds its own fields — a URL, a
@@ -11,12 +14,12 @@
 // inspected here. Everything in this package is about who holds what, and
 // for how long.
 //
-// This package is mechanism, not policy. It guards its pool with the two facts
-// it owns outright — who holds a live lease, who holds a durable lock — and
-// asks nothing of any other layer. What a task is, whether one is running, and
-// what to do about a task whose lock a deletion released are its callers'
-// concerns; deletions report what they unbound and leave the response to the
-// caller.
+// This package is mechanism, not policy. It guards its pool with the two
+// facts the store owns outright — who holds a live lease, who holds a durable
+// lock — and asks nothing of any other layer. What a task is, whether one is
+// running, and what to do about a task whose lock a deletion released are its
+// callers' concerns; deletions report what they unbound and leave the
+// response to the caller.
 package leasing
 
 import (
@@ -86,12 +89,17 @@ const StrategyRoundRobin = "roundrobin"
 // The embedded fields promote, so a Proxy's ID is p.ID; JSON encodes them
 // flat, at the same level as the model's own.
 type Resource struct {
-	ID         string    `json:"id"`
-	GroupID    string    `json:"groupId"`
-	OwnerID    string    `json:"ownerId"`
-	MaxHolders int       `json:"maxHolders"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	ID         string `json:"id"`
+	GroupID    string `json:"groupId"`
+	OwnerID    string `json:"ownerId"`
+	MaxHolders int    `json:"maxHolders"`
+	// Version is the record's write generation, bumped by the store on every
+	// successful Save, ClaimLock, and ReleaseLock. Save is conditional on it,
+	// so a writer holding a stale copy loses with ErrStale instead of
+	// silently overwriting a concurrent write.
+	Version   int64     `json:"version"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // core returns the leasing record itself. It is the one method Leasable asks
@@ -126,16 +134,69 @@ type Group struct {
 	UpdatedAt time.Time         `json:"updatedAt"`
 }
 
-// Repository is the persistence port: a dumb durable store of one model's
-// records and their groups. It tracks no leases — the Manager owns live state
-// and stamps UpdatedAt before every write it makes.
+// A Hold is one task's durable stake in one resource: the store row that is
+// the authority on who leases what. Count is the re-entrant lease depth;
+// ExpiresAt is renewed by the holder's heartbeat, and expiry frees the
+// capacity — a hold whose holder stopped renewing no longer counts against
+// the cap, and once expired it cannot be revived, only re-acquired.
+type Hold struct {
+	ResourceID string
+	TaskID     string
+	Count      int
+	ExpiresAt  time.Time
+}
+
+// Repository is the persistence port: the durable store of one model's
+// records, their groups, and the coordination facts shared across processes —
+// holds, locks, and counters. The store is the authority on all three; a
+// Manager's maps are caches of it. Expiry is always measured against the
+// store's own clock, so the clocks of the nodes contending never decide
+// capacity.
 type Repository[R any] interface {
 	List(ctx context.Context) ([]R, error)
-	Save(ctx context.Context, record R) error
+	// Save writes the record conditionally on its Version and returns the
+	// stored version. Version 0 creates (ErrStale if the id exists — a
+	// creation race is a real conflict, not an upsert); Version N replaces
+	// iff the stored version is N, preserving CreatedAt; any mismatch, or a
+	// row deleted under the writer, is ErrStale.
+	Save(ctx context.Context, record R) (int64, error)
 	Delete(ctx context.Context, id string) error
 	ListGroups(ctx context.Context) ([]Group, error)
 	SaveGroup(ctx context.Context, group Group) error
 	DeleteGroup(ctx context.Context, id string) error
+
+	// Acquire takes or re-enters a hold: a new task slot is granted iff the
+	// count of distinct tasks with unexpired holds stays within cap
+	// (cap <= 0 is unlimited — callers pass the resolved policy), returning
+	// ErrCapacity when full; the task's own live hold re-enters (Count+1)
+	// regardless of cap, and its expired one starts over at Count 1. Either
+	// way the lease is refreshed to ttl from the store's now.
+	Acquire(ctx context.Context, resourceID, taskID string, cap int, ttl time.Duration) (Hold, error)
+	// ReleaseHold decrements the task's hold, removing it at zero; no hold
+	// is a no-op.
+	ReleaseHold(ctx context.Context, resourceID, taskID string) error
+	// RenewHolds extends every unexpired hold the task has — the heartbeat
+	// primitive. An expired hold is not revived: its capacity may already be
+	// promised elsewhere, so the holder must re-acquire.
+	RenewHolds(ctx context.Context, taskID string, ttl time.Duration) error
+	// ListHolds returns every hold row, expired ones included — the reader
+	// filters — ordered by resource then task.
+	ListHolds(ctx context.Context) ([]Hold, error)
+
+	// ClaimLock durably binds the resource to the task: OwnerID is set iff
+	// it is "" or already the task's, ErrLockHeld otherwise. Locks carry no
+	// expiry on purpose: a lock is owned by a task, not a process — a dead
+	// node's tasks are recovered elsewhere and their locks legitimately
+	// follow, and a detached task heartbeats nowhere yet keeps its bindings.
+	// Releasing a dead task's locks is its manager's job, not the clock's.
+	ClaimLock(ctx context.Context, resourceID, taskID string) error
+	// ReleaseLock clears the lock iff the task owns it; otherwise a no-op.
+	ReleaseLock(ctx context.Context, resourceID, taskID string) error
+
+	// Increment atomically adds delta to the named counter under scope — a
+	// resource or group id — and returns the new value; a missing counter
+	// starts at 0. One primitive serves outcome stats and rotation cursors.
+	Increment(ctx context.Context, scope, name string, delta int64) (int64, error)
 }
 
 // An Assignment is the placement a task leases under: the group it rotates
@@ -203,3 +264,19 @@ var ErrResourceLocked = errors.New("pinned resource is locked to another task")
 // its assignment pins another. A lease must never drop a durable lock as a side
 // effect, so the fix is to reassign the task — see Manager.ReleaseStaleLock.
 var ErrPinConflict = errors.New("locked resource conflicts with pinned resource")
+
+// ErrCapacity is returned by Repository.Acquire when every task slot within
+// the cap is taken by an unexpired hold. It is the store-side refusal the
+// acquire loop waits out, the way it waits out a full holders map.
+var ErrCapacity = errors.New("resource at capacity")
+
+// ErrLockHeld is returned by Repository.ClaimLock when another task owns the
+// lock. Nothing frees a lock but its owner's manager, so callers report it
+// rather than wait on it.
+var ErrLockHeld = errors.New("resource locked by another task")
+
+// ErrStale is returned by Repository.Save when the conditional write lost:
+// the caller's Version is behind the store's, the id it meant to create
+// exists, or the row it meant to replace is gone. The store's copy won; the
+// caller re-reads and decides again.
+var ErrStale = errors.New("stale resource write")

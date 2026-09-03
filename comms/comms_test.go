@@ -2,9 +2,14 @@ package comms
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
+
+// The Bus transport contract is asserted by storetest.Bus (see
+// contract_test.go); this file holds only what is the in-memory
+// implementation's own — the typed Topic layer and its tuning options.
 
 // recv pulls one message within a deadline, failing if none arrives. Encodes the
 // expectation that delivery is prompt, not eventually-maybe.
@@ -36,109 +41,6 @@ func assertEmpty[T any](t *testing.T, ch <-chan T) {
 	}
 }
 
-// Fan-out is the core promise: each current subscriber sees every later publish.
-func TestBusFanOut(t *testing.T) {
-	b := NewBus()
-	ctx := context.Background()
-
-	s1, _ := b.Subscribe(ctx, "topic")
-	s2, _ := b.Subscribe(ctx, "topic")
-	defer s1.Close()
-	defer s2.Close()
-
-	b.Publish(ctx, "topic", "hello")
-
-	if got := recv(t, s1.C()); got != "hello" {
-		t.Errorf("s1 got %v, want hello", got)
-	}
-	if got := recv(t, s2.C()); got != "hello" {
-		t.Errorf("s2 got %v, want hello", got)
-	}
-}
-
-// Publishing into the void must be a harmless no-op, not an error — that is the
-// decoupling pub/sub exists to provide.
-func TestPublishNoSubscribers(t *testing.T) {
-	b := NewBus()
-	if err := b.Publish(context.Background(), "topic", "into-the-void"); err != nil {
-		t.Fatalf("publish to empty topic errored: %v", err)
-	}
-}
-
-// A subscriber must observe messages in the order they were published, so
-// downstream coordination logic can rely on sequence.
-func TestBusOrdering(t *testing.T) {
-	b := NewBus()
-	ctx := context.Background()
-
-	s, _ := b.Subscribe(ctx, "topic")
-	defer s.Close()
-
-	for i := 0; i < 5; i++ {
-		b.Publish(ctx, "topic", i)
-	}
-	for i := 0; i < 5; i++ {
-		if got := recv(t, s.C()); got != i {
-			t.Errorf("position %d got %v, want %d", i, got, i)
-		}
-	}
-}
-
-// Close means unsubscribe: no further delivery, channel closed, and calling it
-// again is safe. A leaked subscription is a memory leak on the one box we run on.
-func TestCloseUnsubscribes(t *testing.T) {
-	b := NewBus()
-	ctx := context.Background()
-
-	s, _ := b.Subscribe(ctx, "topic")
-	s.Close()
-	s.Close() // idempotent
-
-	b.Publish(ctx, "topic", "after-close")
-
-	if _, ok := <-s.C(); ok {
-		t.Fatal("received on a closed subscription")
-	}
-}
-
-// A subscriber that never reads must not stall the publisher or other
-// subscribers; excess messages are dropped for the slow one (at-most-once).
-func TestSlowSubscriberDropsNotBlocks(t *testing.T) {
-	b := NewBus()
-	ctx := context.Background()
-
-	slow, _ := b.Subscribe(ctx, "topic")
-	defer slow.Close()
-
-	done := make(chan struct{})
-	go func() {
-		for i := 0; i < defaultBuffer*4; i++ {
-			b.Publish(ctx, "topic", i)
-		}
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("publisher blocked on a slow subscriber")
-	}
-}
-
-// Subscribing after a publish must not retroactively deliver it — subscriptions
-// are live, not replayed.
-func TestLateSubscriberMissesEarlier(t *testing.T) {
-	b := NewBus()
-	ctx := context.Background()
-
-	b.Publish(ctx, "topic", "early")
-
-	s, _ := b.Subscribe(ctx, "topic")
-	defer s.Close()
-
-	assertEmpty(t, s.C())
-}
-
 // The typed layer is the ergonomics modules actually use: a value emitted
 // through a Topic arrives on its feed asserting back to the emitted type.
 func TestTopicRoundTrip(t *testing.T) {
@@ -161,6 +63,73 @@ func TestTopicRoundTrip(t *testing.T) {
 	}
 	if got.URL != "https://x" {
 		t.Errorf("got %q, want https://x", got.URL)
+	}
+}
+
+// TestTopicDecodesWirePayloads verifies the typed layer's transport
+// neutrality: a payload arriving in the wire form — the JSON encoding a
+// cross-process bus delivers — decodes back to T on the topic's feed, so
+// receive code written against an in-process bus runs unchanged over a
+// distributed one.
+func TestTopicDecodesWirePayloads(t *testing.T) {
+	b := NewBus()
+	ctx := context.Background()
+
+	type result struct{ URL string }
+	topic := NewTopic[result](b, "results")
+
+	sub, _ := topic.On(ctx)
+	defer sub.Close()
+
+	// Publish the wire form directly, as a distributed bus adapter would
+	// deliver it.
+	if err := b.Publish(ctx, "results", json.RawMessage(`{"URL":"https://x"}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	got, ok := recv(t, sub.C()).(result)
+	if !ok {
+		t.Fatal("wire payload did not decode back to the emitted type")
+	}
+	if got.URL != "https://x" {
+		t.Errorf("got %q, want https://x", got.URL)
+	}
+}
+
+// TestTopicDropsUndecodablePayloads verifies a payload that is neither a T
+// nor JSON decoding into one is dropped rather than delivered mistyped —
+// at-most-once already permits the drop, and a later good payload still
+// arrives.
+func TestTopicDropsUndecodablePayloads(t *testing.T) {
+	b := NewBus()
+	ctx := context.Background()
+
+	topic := NewTopic[string](b, "cookies")
+	sub, _ := topic.On(ctx)
+	defer sub.Close()
+
+	b.Publish(ctx, "cookies", 42)                         // not a string, not wire bytes
+	b.Publish(ctx, "cookies", json.RawMessage(`{"a":1}`)) // wire bytes of the wrong shape
+	topic.Emit(ctx, "the-good-one")
+
+	if got := recv(t, sub.C()); got.(string) != "the-good-one" {
+		t.Errorf("got %v, want the payload after the dropped ones", got)
+	}
+}
+
+// TestTopicSubscriptionCloseEndsTheFeed verifies the decoding wrapper keeps
+// Subscription's teardown contract: Close ends the feed and is safe to call
+// more than once.
+func TestTopicSubscriptionCloseEndsTheFeed(t *testing.T) {
+	b := NewBus()
+	topic := NewTopic[string](b, "t")
+
+	sub, _ := topic.On(context.Background())
+	sub.Close()
+	sub.Close()
+
+	if _, ok := <-sub.C(); ok {
+		t.Fatal("received on a closed topic subscription")
 	}
 }
 

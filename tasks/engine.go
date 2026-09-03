@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/ntakezo/rogojin/workflows"
 )
@@ -22,6 +23,11 @@ type engine struct {
 	state  workflows.Status
 	cancel context.CancelFunc
 	output []byte
+	// version and node are the run's claim: every conditional write carries
+	// them, and version tracks the store's bumps. A run whose write returns
+	// ErrStale was usurped and must stop side-effecting.
+	version int64
+	node    string
 	// sealed latches the engine closed for deletion: Start refuses, so a task
 	// cannot begin running out from under the sweep that is removing it.
 	sealed bool
@@ -41,9 +47,16 @@ type engine struct {
 
 func newEngine(workflow workflows.Workflow, deps workflows.Deps, repo Repository) *engine {
 	e := &engine{workflow: workflow, repo: repo}
-	// The instance's mid-state checkpoint rides in on Deps, so a handler can
-	// make an effect's success durable the moment it lands.
+	// The instance's mid-state checkpoint and effect recorder ride in on
+	// Deps, so a handler can make progress and effects durable the moment
+	// they land.
 	deps.Checkpoint = e.midCheckpoint
+	if repo != nil {
+		taskID := deps.TaskID
+		deps.RecordEffect = func(ctx context.Context, key string, result []byte) ([]byte, bool, error) {
+			return repo.RecordEffect(ctx, taskID, key, result)
+		}
+	}
 	e.deps = deps
 	e.cond = sync.NewCond(&e.mu)
 	return e
@@ -67,6 +80,16 @@ func (e *engine) Rehydrate(ctx context.Context, snapshot []byte, start workflows
 	pw, ok := e.workflow.(workflows.PersistableWorkflow)
 	if !ok {
 		return fmt.Errorf("workflow %s is not persistable", e.workflow.ID())
+	}
+	// The store's effect log rides in on Deps so the rebuilt instance skips
+	// recorded effects — including ones a checkpoint never saw, recorded in
+	// the crash window between an effect and the next snapshot.
+	if e.repo != nil {
+		effects, err := e.repo.ListEffects(ctx, e.deps.TaskID)
+		if err != nil {
+			return fmt.Errorf("list effects: %w", err)
+		}
+		e.deps.Effects = effects
 	}
 	instance, err := pw.RestoreInstance(e.deps, snapshot)
 	if err != nil {
@@ -226,9 +249,44 @@ func (e *engine) midCheckpoint(ctx context.Context) error {
 	return e.checkpoint(ctx, workflows.StatusRunning, state, snap)
 }
 
+// claim takes (or re-takes) the store claim for node and seeds the run's
+// version from the claimed record, returning it so Start can refresh a
+// recovered handle's resume point. It is a no-op without a repository.
+func (e *engine) claim(ctx context.Context, node string, ttl time.Duration) (Task, error) {
+	if e.repo == nil {
+		return Task{}, nil
+	}
+	record, err := e.repo.ClaimTask(ctx, e.deps.TaskID, node, ttl)
+	if err != nil {
+		return Task{}, err
+	}
+	e.mu.Lock()
+	e.version, e.node = record.Version, node
+	e.mu.Unlock()
+	return record, nil
+}
+
+// releaseClaim frees the store claim on exits that stamp no terminal — a
+// detach, or a recovered handle refusing to run — so another node can take
+// the task now rather than after the lease expires. Best-effort on a
+// background context: a release racing its own usurpation is a no-op by the
+// port's contract.
+func (e *engine) releaseClaim() error {
+	e.mu.Lock()
+	node := e.node
+	e.mu.Unlock()
+	if e.repo == nil || node == "" {
+		return nil
+	}
+	return e.repo.ReleaseClaim(context.Background(), e.deps.TaskID, node)
+}
+
 // checkpoint persists a snapshot stamped with status for the state about to be
-// entered. It is a no-op for instances that cannot snapshot or when no
-// repository is wired.
+// entered, carrying the run's claim. It is a no-op for instances that cannot
+// snapshot or when no repository is wired. ErrStale means another node took
+// the task after this one's lease expired: the run kills itself so it stops
+// side-effecting — the usurper owns the record, and every write from here
+// would lose the same way.
 func (e *engine) checkpoint(ctx context.Context, status workflows.Status, state workflows.State, snap snapshotState) error {
 	if !snap.canSnapshot || e.repo == nil {
 		return nil
@@ -238,7 +296,21 @@ func (e *engine) checkpoint(ctx context.Context, status workflows.Status, state 
 	if err != nil {
 		return err
 	}
-	return e.repo.SaveCheckpoint(ctx, e.deps.TaskID, string(status), string(state), blob)
+	e.mu.Lock()
+	version, node := e.version, e.node
+	e.mu.Unlock()
+	newVersion, err := e.repo.SaveCheckpoint(ctx, e.deps.TaskID, version, node, string(status), string(state), blob)
+	if err != nil {
+		if errors.Is(err, ErrStale) {
+			e.Kill()
+			return fmt.Errorf("task %s usurped by another node: %w", e.deps.TaskID, err)
+		}
+		return err
+	}
+	e.mu.Lock()
+	e.version = newVersion
+	e.mu.Unlock()
+	return nil
 }
 
 // harvest captures the instance's result on clean completion via the optional
@@ -378,16 +450,22 @@ func (e *engine) Kill() error {
 
 // finish stamps the run's durable outcome: killed stays killed, an errored run
 // is stamped failed (still recoverable from its last checkpoint), a clean one
-// done. A detached exit stamps nothing: the suspended checkpoint written at
-// the park boundary is the durable truth, and a terminal stamp would overwrite
-// it into an unrecoverable record. The record is never deleted here; removal
-// is consumer-driven. The stamp uses a background context so it lands even
-// after a kill's cancellation; a stamp failure is returned so the run surfaces
-// it rather than silently reporting a durable outcome that never landed.
+// done. A detached exit stamps nothing — the suspended checkpoint written at
+// the park boundary is the durable truth — but releases the claim, so another
+// node can take the task now rather than after the lease expires. The record
+// is never deleted here; removal is consumer-driven. The stamp uses a
+// background context so it lands even after a kill's cancellation, and
+// carries the run's claim: ErrStale means a usurper owns the record, whose
+// own outcome must stand — the stamp is skipped, not forced. A stamp failure
+// is returned so the run surfaces it rather than silently reporting a durable
+// outcome that never landed.
 func (e *engine) finish(runErr error) error {
 	e.mu.Lock()
 	if e.detachDone {
 		e.mu.Unlock()
+		if err := e.releaseClaim(); err != nil {
+			return fmt.Errorf("release claim: %w", err)
+		}
 		return nil
 	}
 	if e.state != workflows.StatusKilled {
@@ -399,12 +477,16 @@ func (e *engine) finish(runErr error) error {
 	}
 	outcome := e.state
 	output := e.output
+	version, node := e.version, e.node
 	e.mu.Unlock()
 
 	if e.repo == nil {
 		return nil
 	}
-	if err := e.repo.MarkTerminal(context.Background(), e.deps.TaskID, string(outcome), output); err != nil {
+	if _, err := e.repo.MarkTerminal(context.Background(), e.deps.TaskID, version, node, string(outcome), output); err != nil {
+		if errors.Is(err, ErrStale) {
+			return fmt.Errorf("task %s usurped by another node; its outcome stands: %w", e.deps.TaskID, err)
+		}
 		return fmt.Errorf("mark terminal: %w", err)
 	}
 	return nil

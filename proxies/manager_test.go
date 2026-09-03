@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ntakezo/rogojin/leasing"
 )
@@ -14,19 +15,27 @@ import (
 
 // fakeRepo is a minimal in-memory Repository.
 type fakeRepo struct {
-	mu      sync.Mutex
-	order   []string
-	records map[string]Proxy
-	groups  map[string]Group
+	mu       sync.Mutex
+	order    []string
+	records  map[string]Proxy
+	groups   map[string]Group
+	counters map[string]int64
 }
 
 func newFakeRepo(seed ...Proxy) *fakeRepo {
-	r := &fakeRepo{records: map[string]Proxy{}, groups: map[string]Group{}}
+	r := &fakeRepo{records: map[string]Proxy{}, groups: map[string]Group{}, counters: map[string]int64{}}
 	for _, p := range seed {
 		r.records[p.ID] = p
 		r.order = append(r.order, p.ID)
 	}
 	return r
+}
+
+// counter reads one tally, the way the tests assert what ReleaseOutcome wrote.
+func (r *fakeRepo) counter(scope, name string) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counters[scope+"/"+name]
 }
 
 func (r *fakeRepo) List(ctx context.Context) ([]Proxy, error) {
@@ -41,14 +50,40 @@ func (r *fakeRepo) List(ctx context.Context) ([]Proxy, error) {
 	return out, nil
 }
 
-func (r *fakeRepo) Save(ctx context.Context, p Proxy) error {
+// Save is a blind upsert handing back a bumped version; the conditional-write
+// rules are storetest's to verify against the real adapters.
+func (r *fakeRepo) Save(ctx context.Context, p Proxy) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.records[p.ID]; !ok {
+	if kept, ok := r.records[p.ID]; ok {
+		p.Version = kept.Version + 1
+	} else {
 		r.order = append(r.order, p.ID)
+		p.Version = 1
 	}
 	r.records[p.ID] = p
+	return p.Version, nil
+}
+
+func (r *fakeRepo) Acquire(ctx context.Context, resourceID, taskID string, cap int, ttl time.Duration) (leasing.Hold, error) {
+	return leasing.Hold{ResourceID: resourceID, TaskID: taskID, Count: 1, ExpiresAt: time.Now().Add(ttl)}, nil
+}
+func (r *fakeRepo) ReleaseHold(ctx context.Context, resourceID, taskID string) error { return nil }
+func (r *fakeRepo) RenewHolds(ctx context.Context, taskID string, ttl time.Duration) error {
 	return nil
+}
+func (r *fakeRepo) ListHolds(ctx context.Context) ([]leasing.Hold, error) { return nil, nil }
+func (r *fakeRepo) ClaimLock(ctx context.Context, resourceID, taskID string) error {
+	return nil
+}
+func (r *fakeRepo) ReleaseLock(ctx context.Context, resourceID, taskID string) error {
+	return nil
+}
+func (r *fakeRepo) Increment(ctx context.Context, scope, name string, delta int64) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.counters[scope+"/"+name] += delta
+	return r.counters[scope+"/"+name], nil
 }
 
 func (r *fakeRepo) Delete(ctx context.Context, id string) error {
@@ -103,9 +138,14 @@ func TestURLTravelsThroughThePool(t *testing.T) {
 		t.Fatalf("ReleaseOutcome: %v", err)
 	}
 
-	r := repo.records["p1"]
-	if r.URL != "http://10.0.0.1:8080" || r.Successes != 1 || r.OwnerID != "t1" {
-		t.Fatalf("persisted = %+v, want URL, stats, and lock intact", r)
+	// The tally lands in the counters; the URL, the lock, and the amended
+	// stat show on the manager's view of the pool.
+	if got := repo.counter("p1", "successes"); got != 1 {
+		t.Fatalf("successes counter = %d, want 1", got)
+	}
+	p, ok := m.Get("p1")
+	if !ok || p.URL != "http://10.0.0.1:8080" || p.OwnerID != "t1" || p.Successes != 1 {
+		t.Fatalf("pool view = %+v, want URL, lock, and amended stat intact", p)
 	}
 }
 
@@ -126,9 +166,8 @@ func TestReleaseWithoutOutcomeCountsNeither(t *testing.T) {
 	}
 	lease.Release()
 
-	r := repo.records["p1"]
-	if r.Successes != 0 || r.Failures != 0 {
-		t.Fatalf("persisted counts = %d/%d, want 0/0 for an outcome-free release", r.Successes, r.Failures)
+	if s, f := repo.counter("p1", "successes"), repo.counter("p1", "failures"); s != 0 || f != 0 {
+		t.Fatalf("counters = %d/%d, want 0/0 for an outcome-free release", s, f)
 	}
 	// The slot is free again: a second acquire under the default cap succeeds.
 	if _, err := m.Acquire(ctx, Assignment{TaskID: "t2"}); err != nil {
@@ -157,8 +196,8 @@ func TestOutcomeAndReleaseActOnce(t *testing.T) {
 		t.Fatalf("ReleaseOutcome: %v", err)
 	}
 	lease.Release()
-	if got := repo.records["p1"].Successes; got != 1 {
-		t.Fatalf("Successes = %d, want 1 after outcome-then-release", got)
+	if got := repo.counter("p1", "successes"); got != 1 {
+		t.Fatalf("successes counter = %d, want 1 after outcome-then-release", got)
 	}
 
 	// Release first: the later ReleaseOutcome must not tally.
@@ -170,8 +209,8 @@ func TestOutcomeAndReleaseActOnce(t *testing.T) {
 	if err := lease.ReleaseOutcome(ctx, true); err != nil {
 		t.Fatalf("ReleaseOutcome after Release: %v", err)
 	}
-	if got := repo.records["p1"].Successes; got != 1 {
-		t.Fatalf("Successes = %d, want still 1 after release-then-outcome", got)
+	if got := repo.counter("p1", "successes"); got != 1 {
+		t.Fatalf("successes counter = %d, want still 1 after release-then-outcome", got)
 	}
 }
 

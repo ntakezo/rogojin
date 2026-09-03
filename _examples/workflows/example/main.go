@@ -2,8 +2,7 @@
 // a canned test site and a local forward proxy, registers the workflow on a task
 // manager backed by an in-memory repository, leases a proxy from a round-robin
 // proxy manager and locks a site account from an account manager, then creates
-// and starts one task, printing each state it checkpoints through and each
-// request the proxy forwards.
+// and starts one task, printing each request the proxy forwards.
 package main
 
 import (
@@ -23,6 +22,7 @@ import (
 	"github.com/ntakezo/rogojin/accounts"
 	"github.com/ntakezo/rogojin/comms"
 	"github.com/ntakezo/rogojin/email"
+	"github.com/ntakezo/rogojin/memory"
 	"github.com/ntakezo/rogojin/proxies"
 	"github.com/ntakezo/rogojin/tasks"
 )
@@ -43,7 +43,11 @@ func main() {
 
 	// Each manager stands alone: it guards its own pool from the leases and
 	// locks it owns and asks nothing of the task manager.
-	proxyManager, err := proxies.NewManager(ctx, newMemProxyRepo(proxies.Proxy{Resource: leasing.Resource{ID: "local-1", GroupID: proxies.GlobalGroup}, URL: forward.URL}))
+	proxyRepo := memory.NewProxies()
+	if _, err := proxyRepo.Save(ctx, proxies.Proxy{Resource: leasing.Resource{ID: "local-1", GroupID: proxies.GlobalGroup}, URL: forward.URL}); err != nil {
+		log.Fatalf("seed proxy: %v", err)
+	}
+	proxyManager, err := proxies.NewManager(ctx, proxyRepo)
 	if err != nil {
 		log.Fatalf("proxy manager: %v", err)
 	}
@@ -51,11 +55,8 @@ func main() {
 	// Email is not a leased resource — no groups, no rotation, no locks. The
 	// inventory holds the forwarding inboxes accounts point at; a workflow
 	// reaches its inbox through its locked account (ForwardingEmail, then
-	// Listen with a sender filter and a backfill window). The nil repository
-	// runs the inventory in memory — this example wants no rows surviving it —
-	// where the proxy and task repositories below are written out because they
-	// do something with their writes.
-	emailManager, err := email.NewManager(ctx, nil, email.WithDialer(mailServer.dial))
+	// Listen with a sender filter and a backfill window).
+	emailManager, err := email.NewManager(ctx, memory.NewEmails(), email.WithDialer(mailServer.dial))
 	if err != nil {
 		log.Fatalf("email manager: %v", err)
 	}
@@ -74,7 +75,7 @@ func main() {
 	// account's guaranteed field — its forwarding inbox — and WithEmail
 	// closes the referential loop: an inbox a held or locked account forwards
 	// to refuses deletion, exactly like a leased resource would.
-	accountManager, err := accounts.NewManager(ctx, nil, accounts.WithEmail(emailManager))
+	accountManager, err := accounts.NewManager(ctx, memory.NewAccounts(), accounts.WithEmail(emailManager))
 	if err != nil {
 		log.Fatalf("account manager: %v", err)
 	}
@@ -93,7 +94,7 @@ func main() {
 	// exactly once, here: RegisterWorkflow hands them to the workflow through
 	// UseResources, so the instance a task leases through is the instance a
 	// deletion unlocks through.
-	taskManager, err := tasks.NewManager(ctx, newMemRepo(), comms.NewBus(),
+	taskManager, err := tasks.NewManager(ctx, memory.NewTasks(), comms.NewBus(),
 		tasks.WithResource(proxies.Kind, proxyManager),
 		tasks.WithResource(accounts.Kind, accountManager))
 	if err != nil {
@@ -269,78 +270,6 @@ func (m *mailSession) Close() error {
 	return nil
 }
 
-// memProxyRepo is a minimal in-memory proxies.Repository seeded with a fixed
-// pool; the manager owns all live lease state, so this only stores the records.
-type memProxyRepo struct {
-	mu      sync.Mutex
-	records map[string]proxies.Proxy
-	order   []string
-	groups  map[string]proxies.Group
-}
-
-func newMemProxyRepo(seed ...proxies.Proxy) *memProxyRepo {
-	r := &memProxyRepo{records: make(map[string]proxies.Proxy), groups: make(map[string]proxies.Group)}
-	for _, p := range seed {
-		r.records[p.ID] = p
-		r.order = append(r.order, p.ID)
-	}
-	return r
-}
-
-func (r *memProxyRepo) List(ctx context.Context) ([]proxies.Proxy, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]proxies.Proxy, 0, len(r.order))
-	for _, id := range r.order {
-		if p, ok := r.records[id]; ok {
-			out = append(out, p)
-		}
-	}
-	return out, nil
-}
-
-func (r *memProxyRepo) Save(ctx context.Context, p proxies.Proxy) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.records[p.ID]; !ok {
-		r.order = append(r.order, p.ID)
-	}
-	r.records[p.ID] = p
-	fmt.Printf("  proxy %s stats now %d/%d\n", p.ID, p.Successes, p.Failures)
-	return nil
-}
-
-func (r *memProxyRepo) Delete(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.records, id)
-	return nil
-}
-
-func (r *memProxyRepo) ListGroups(ctx context.Context) ([]proxies.Group, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]proxies.Group, 0, len(r.groups))
-	for _, g := range r.groups {
-		out = append(out, g)
-	}
-	return out, nil
-}
-
-func (r *memProxyRepo) SaveGroup(ctx context.Context, g proxies.Group) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.groups[g.ID] = g
-	return nil
-}
-
-func (r *memProxyRepo) DeleteGroup(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.groups, id)
-	return nil
-}
-
 // profileFields marshals this workflow's account shape into the opaque JSON the
 // accounts module stores. Another workflow's accounts would carry other fields
 // entirely, against the same store.
@@ -350,143 +279,4 @@ func profileFields(p example_checkout.Profile) json.RawMessage {
 		log.Fatalf("encode account fields: %v", err)
 	}
 	return raw
-}
-
-// memRepo is a minimal in-memory Repository: a dumb byte store that records each
-// task's last checkpoint and prints the states it advances through.
-type memRepo struct {
-	mu      sync.Mutex
-	records map[string]tasks.Task
-	groups  map[string]tasks.Group
-}
-
-func newMemRepo() *memRepo {
-	return &memRepo{records: make(map[string]tasks.Task), groups: make(map[string]tasks.Group)}
-}
-
-func (r *memRepo) CreateTask(ctx context.Context, rec tasks.Task) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.records[rec.ID] = rec
-	return nil
-}
-
-func (r *memRepo) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rec := r.records[id]
-	rec.Status, rec.State, rec.Snapshot = status, state, snapshot
-	r.records[id] = rec
-	fmt.Printf("  checkpoint %-16s [%s] snapshot=%s\n", state, status, snapshot)
-	return nil
-}
-
-func (r *memRepo) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rec := r.records[id]
-	rec.Status, rec.Output = outcome, output
-	r.records[id] = rec
-	return nil
-}
-
-func (r *memRepo) RecoverTask(ctx context.Context, id string) (tasks.Task, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rec, ok := r.records[id]
-	if !ok {
-		return tasks.Task{}, fmt.Errorf("task %s not found", id)
-	}
-	return rec, nil
-}
-
-func (r *memRepo) RecoverAll(ctx context.Context) ([]tasks.Task, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]tasks.Task, 0, len(r.records))
-	for _, rec := range r.records {
-		out = append(out, rec)
-	}
-	return out, nil
-}
-
-func (r *memRepo) DeleteTask(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.records, id)
-	return nil
-}
-
-func (r *memRepo) SaveGroup(ctx context.Context, g tasks.Group) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.groups[g.ID] = g
-	return nil
-}
-
-func (r *memRepo) GetGroup(ctx context.Context, id string) (tasks.Group, bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	g, ok := r.groups[id]
-	return g, ok, nil
-}
-
-func (r *memRepo) ListGroups(ctx context.Context) ([]tasks.Group, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]tasks.Group, 0, len(r.groups))
-	for _, g := range r.groups {
-		out = append(out, g)
-	}
-	return out, nil
-}
-
-func (r *memRepo) DeleteGroup(ctx context.Context, id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.groups, id)
-	return nil
-}
-
-func (r *memRepo) TasksInGroup(ctx context.Context, groupID string) ([]string, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ids := make([]string, 0)
-	for id, rec := range r.records {
-		if rec.GroupID == groupID {
-			ids = append(ids, id)
-		}
-	}
-	return ids, nil
-}
-
-// SaveAssignment rewrites one kind and copies the rest, so repointing a task's
-// proxies leaves its account placement alone.
-func (r *memRepo) SaveAssignment(ctx context.Context, id string, kind leasing.Kind, a tasks.Assignment) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rec, ok := r.records[id]
-	if !ok {
-		return fmt.Errorf("task %s not found", id)
-	}
-	assignments := make(map[leasing.Kind]tasks.Assignment, len(rec.Assignments)+1)
-	for k, v := range rec.Assignments {
-		assignments[k] = v
-	}
-	assignments[kind] = a
-	rec.Assignments = assignments
-	r.records[id] = rec
-	return nil
-}
-
-func (r *memRepo) TasksPinnedTo(ctx context.Context, kind leasing.Kind, resourceID string) ([]tasks.Task, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	pinned := make([]tasks.Task, 0)
-	for _, rec := range r.records {
-		if pin := rec.Assignments[kind].ResourceID; pin != nil && *pin == resourceID {
-			pinned = append(pinned, rec)
-		}
-	}
-	return pinned, nil
 }

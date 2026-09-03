@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
+	"github.com/ntakezo/rogojin/leasing"
 	"github.com/ntakezo/rogojin/payments"
 )
 
@@ -40,6 +42,7 @@ var paymentMigrations = []migration{
 			group_id    TEXT NOT NULL DEFAULT 'global',
 			owner_id    TEXT NOT NULL DEFAULT '',
 			max_holders INTEGER NOT NULL DEFAULT 0,
+			version     INTEGER NOT NULL DEFAULT 0,
 			fields      TEXT NOT NULL DEFAULT '',
 			created_at  TEXT NOT NULL DEFAULT '',
 			updated_at  TEXT NOT NULL DEFAULT ''
@@ -55,13 +58,24 @@ var paymentMigrations = []migration{
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
 	},
+	{
+		Name: "create payment_holds table",
+		SQL:  holdsSchema("payment_holds"),
+	},
+	{
+		Name: "create payment_counters table",
+		SQL:  countersSchema("payment_counters"),
+	},
 }
+
+// paymentTables wires the shared leasing mechanics to this store's tables.
+var paymentTables = leaseTables{noun: "payment", records: "payments", holds: "payment_holds", counters: "payment_counters"}
 
 // List returns every stored payment in stable id order, so the manager's pool
 // order is deterministic.
 func (s *Payments) List(ctx context.Context) ([]payments.Payment, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, group_id, owner_id, max_holders, fields, created_at, updated_at
+		`SELECT id, group_id, owner_id, max_holders, version, fields, created_at, updated_at
 		 FROM payments ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list payments: %w", err)
@@ -72,7 +86,7 @@ func (s *Payments) List(ctx context.Context) ([]payments.Payment, error) {
 	for rows.Next() {
 		var c payments.Payment
 		var fields, created, updated string
-		if err := rows.Scan(&c.ID, &c.GroupID, &c.OwnerID, &c.MaxHolders, &fields, &created, &updated); err != nil {
+		if err := rows.Scan(&c.ID, &c.GroupID, &c.OwnerID, &c.MaxHolders, &c.Version, &fields, &created, &updated); err != nil {
 			return nil, fmt.Errorf("list payments: %w", err)
 		}
 		c.Fields = parseFields(fields)
@@ -90,36 +104,84 @@ func (s *Payments) List(ctx context.Context) ([]payments.Payment, error) {
 	return listed, nil
 }
 
-// Save upserts the payment's record: group, holder policy, lock owner, fields, and
-// updated_at. created_at is written on insert and never overwritten, so a later
-// lock cannot revise it.
-func (s *Payments) Save(ctx context.Context, c payments.Payment) error {
+// Save writes the payment's record conditionally on its Version — see
+// leasing.Repository. created_at is written on insert and never overwritten,
+// so a later lock cannot revise it.
+func (s *Payments) Save(ctx context.Context, c payments.Payment) (int64, error) {
 	fields, err := formatFields(c.Fields)
 	if err != nil {
-		return fmt.Errorf("save payment %s: %w", c.ID, err)
+		return 0, fmt.Errorf("save payment %s: %w", c.ID, err)
 	}
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO payments (id, group_id, owner_id, max_holders, fields, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET group_id = excluded.group_id,
-		 owner_id = excluded.owner_id, max_holders = excluded.max_holders,
-		 fields = excluded.fields,
-		 updated_at = excluded.updated_at`,
-		c.ID, c.GroupID, c.OwnerID, c.MaxHolders, fields,
-		formatTime(c.CreatedAt), formatTime(c.UpdatedAt))
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("save payment %s: %w", c.ID, err)
+		return 0, fmt.Errorf("save payment %s: %w", c.ID, err)
 	}
-	return nil
+	defer tx.Rollback()
+
+	insert, next, err := versionGate(ctx, tx, paymentTables, c.ID, c.Version)
+	if err != nil {
+		return 0, err
+	}
+	if insert {
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO payments (id, group_id, owner_id, max_holders, version, fields, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			c.ID, c.GroupID, c.OwnerID, c.MaxHolders, next, fields,
+			formatTime(c.CreatedAt), formatTime(c.UpdatedAt))
+	} else {
+		_, err = tx.ExecContext(ctx,
+			`UPDATE payments SET group_id = ?, owner_id = ?, max_holders = ?, version = ?,
+			 fields = ?, updated_at = ? WHERE id = ?`,
+			c.GroupID, c.OwnerID, c.MaxHolders, next, fields, formatTime(c.UpdatedAt), c.ID)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("save payment %s: %w", c.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("save payment %s: %w", c.ID, err)
+	}
+	return next, nil
 }
 
-// Delete removes the payment's record; absent rows are a no-op.
+// Delete removes the payment's record and its holds; absent rows are a no-op.
 func (s *Payments) Delete(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM payments WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete payment %s: %w", id, err)
-	}
-	return nil
+	return deleteWithHolds(ctx, s.db, paymentTables, id)
+}
+
+// Acquire takes or re-enters a hold on the payment under cap — see
+// leasing.Repository.
+func (s *Payments) Acquire(ctx context.Context, resourceID, taskID string, cap int, ttl time.Duration) (leasing.Hold, error) {
+	return acquireHold(ctx, s.db, paymentTables, resourceID, taskID, cap, ttl)
+}
+
+// ReleaseHold decrements the task's hold, removing it at zero.
+func (s *Payments) ReleaseHold(ctx context.Context, resourceID, taskID string) error {
+	return releaseHold(ctx, s.db, paymentTables, resourceID, taskID)
+}
+
+// RenewHolds extends every unexpired hold the task has.
+func (s *Payments) RenewHolds(ctx context.Context, taskID string, ttl time.Duration) error {
+	return renewHolds(ctx, s.db, paymentTables, taskID, ttl)
+}
+
+// ListHolds returns every hold row, expired ones included.
+func (s *Payments) ListHolds(ctx context.Context) ([]leasing.Hold, error) {
+	return listHolds(ctx, s.db, paymentTables)
+}
+
+// ClaimLock binds the payment to the task iff unlocked or already its own.
+func (s *Payments) ClaimLock(ctx context.Context, resourceID, taskID string) error {
+	return claimLock(ctx, s.db, paymentTables, resourceID, taskID)
+}
+
+// ReleaseLock clears the lock iff the task owns it.
+func (s *Payments) ReleaseLock(ctx context.Context, resourceID, taskID string) error {
+	return releaseLock(ctx, s.db, paymentTables, resourceID, taskID)
+}
+
+// Increment atomically adds delta to the counter under (scope, name).
+func (s *Payments) Increment(ctx context.Context, scope, name string, delta int64) (int64, error) {
+	return incrementCounter(ctx, s.db, paymentTables, scope, name, delta)
 }
 
 // ListGroups returns every stored payment group in stable id order.

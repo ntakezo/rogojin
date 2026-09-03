@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -31,7 +32,7 @@ func TestPackageName(t *testing.T) {
 // otherwise generate code that lies about what it does — and pins that the
 // combos deliberately kept independent stay valid.
 func TestValidateRejectsIncoherentCombos(t *testing.T) {
-	durableInMemory := Options{Name: "x", Package: "x", Durable: true, Persist: false}
+	durableInMemory := Options{Name: "x", Package: "x", Durable: true, Repo: RepoMemory}
 	if err := durableInMemory.Validate(); err == nil {
 		t.Error("durable + memory repo should be rejected: snapshots would never be written")
 	}
@@ -39,11 +40,16 @@ func TestValidateRejectsIncoherentCombos(t *testing.T) {
 	// Email and accounts are independent features: an inbox can be listened to
 	// without routing through an account's forwarding reference, and accounts
 	// need no inbox at all.
-	emailWithoutAccounts := Options{Name: "x", Package: "x", Email: true, Accounts: false, Persist: true}
+	emailWithoutAccounts := Options{Name: "x", Package: "x", Email: true, Accounts: false, Repo: RepoSQLite}
 	if err := emailWithoutAccounts.Validate(); err != nil {
 		t.Errorf("email without accounts should be valid, got %v", err)
 	}
-	accountsWithoutEmail := Options{Name: "x", Package: "x", Accounts: true, Email: false, Persist: true}
+	accountsWithoutEmail := Options{Name: "x", Package: "x", Accounts: true, Email: false, Repo: RepoSQLite}
+
+	unknownRepo := Options{Name: "x", Package: "x", Repo: "mongodb"}
+	if err := unknownRepo.Validate(); err == nil {
+		t.Error("an unknown repo name should be rejected")
+	}
 	if err := accountsWithoutEmail.Validate(); err != nil {
 		t.Errorf("accounts without email should be valid, got %v", err)
 	}
@@ -55,7 +61,7 @@ func TestValidateRejectsIncoherentCombos(t *testing.T) {
 // error over the full rendered source.
 func TestValidateRejectsUnusablePackageNames(t *testing.T) {
 	for _, name := range []string{"type", "select", "func", "main", "Go!"} {
-		o := Options{Name: name, Package: PackageName(name), Persist: true}
+		o := Options{Name: name, Package: PackageName(name), Repo: RepoSQLite}
 		if err := o.Validate(); err == nil {
 			t.Errorf("Validate accepted name %q (package %q), want rejection", name, o.Package)
 		}
@@ -72,7 +78,7 @@ func validCombos() []Options {
 			for _, accounts := range bools {
 				for _, payments := range bools {
 					for _, mail := range bools {
-						for _, persist := range bools {
+						for _, repo := range []string{RepoSQLite, RepoPostgres, RepoMemory} {
 							o := Options{
 								Name:     "sample",
 								Package:  "sample",
@@ -81,7 +87,7 @@ func validCombos() []Options {
 								Accounts: accounts,
 								Payments: payments,
 								Email:    mail,
-								Persist:  persist,
+								Repo:     repo,
 							}
 							if o.Validate() != nil {
 								continue
@@ -132,6 +138,16 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read repo go.sum: %v", err)
 	}
+	rootMod, err := os.ReadFile(filepath.Join(repoRoot, "go.mod"))
+	if err != nil {
+		t.Fatalf("read repo go.mod: %v", err)
+	}
+	// The throwaway module restates every requirement of the root module at
+	// the root's selected versions. With only the rogojin require, resolving
+	// the graph would traverse into each dependency's own go.mod and meet
+	// versions the root build never downloads — absent from a cold module
+	// cache, and unfetchable under GOPROXY=off.
+	requires := requireLines(t, string(rootMod))
 
 	for _, o := range validCombos() {
 		t.Run(comboName(o), func(t *testing.T) {
@@ -147,8 +163,11 @@ go 1.25.0
 
 require github.com/ntakezo/rogojin v0.0.0
 
+require (
+%s)
+
 replace github.com/ntakezo/rogojin => %s
-`, repoRoot)
+`, requires, repoRoot)
 			if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -166,7 +185,32 @@ replace github.com/ntakezo/rogojin => %s
 	}
 }
 
+// requireLines extracts every "path version" requirement from a go.mod, block
+// and single-line forms alike, as lines ready for a require block.
+func requireLines(t *testing.T, gomod string) string {
+	t.Helper()
+	var out strings.Builder
+	inBlock := false
+	for _, line := range strings.Split(gomod, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "require (":
+			inBlock = true
+		case inBlock && trimmed == ")":
+			inBlock = false
+		case inBlock && trimmed != "":
+			fmt.Fprintf(&out, "\t%s\n", trimmed)
+		case strings.HasPrefix(trimmed, "require "):
+			fmt.Fprintf(&out, "\t%s\n", strings.TrimPrefix(trimmed, "require "))
+		}
+	}
+	if out.Len() == 0 {
+		t.Fatal("no requirements found in the root go.mod")
+	}
+	return out.String()
+}
+
 func comboName(o Options) string {
-	return fmt.Sprintf("durable=%t_proxy=%t_accounts=%t_payments=%t_email=%t_persist=%t",
-		o.Durable, o.Proxy, o.Accounts, o.Payments, o.Email, o.Persist)
+	return fmt.Sprintf("durable=%t_proxy=%t_accounts=%t_payments=%t_email=%t_repo=%s",
+		o.Durable, o.Proxy, o.Accounts, o.Payments, o.Email, o.Repo)
 }

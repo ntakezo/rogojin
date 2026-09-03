@@ -110,30 +110,65 @@ type fakeStore struct {
 	// terminalErr, when set, fails MarkTerminal without recording the stamp,
 	// simulating a store outage at the terminal write.
 	terminalErr error
+	// effects is the durable effect log, keyed by effect key; the fake serves
+	// one task, so the task id is not part of the key.
+	effects map[string][]byte
 }
 
-func (f *fakeStore) SaveCheckpoint(ctx context.Context, id, status, state string, snapshot []byte) error {
+func (f *fakeStore) SaveCheckpoint(ctx context.Context, id string, version int64, node, status, state string, snapshot []byte) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.saves = append(f.saves, recordedSave{id, workflows.Status(status), workflows.State(state), append([]byte(nil), snapshot...)})
 	if f.saveErr != nil {
-		return f.saveErr(workflows.State(state))
+		return 0, f.saveErr(workflows.State(state))
 	}
-	return nil
+	return int64(len(f.saves)), nil
 }
 
-func (f *fakeStore) MarkTerminal(ctx context.Context, id, outcome string, output []byte) error {
+func (f *fakeStore) MarkTerminal(ctx context.Context, id string, version int64, node, outcome string, output []byte) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.terminalErr != nil {
-		return f.terminalErr
+		return 0, f.terminalErr
 	}
 	f.terminal = workflows.Status(outcome)
 	f.terminalSet = true
 	// append to a nil slice preserves nil, so "no output" stays distinguishable.
 	f.terminalOutput = append([]byte(nil), output...)
+	return int64(len(f.saves)) + 1, nil
+}
+
+func (f *fakeStore) RecordEffect(ctx context.Context, taskID, key string, result []byte) ([]byte, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if stored, ok := f.effects[key]; ok {
+		return stored, false, nil
+	}
+	if f.effects == nil {
+		f.effects = make(map[string][]byte)
+	}
+	f.effects[key] = append([]byte(nil), result...)
+	return result, true, nil
+}
+
+func (f *fakeStore) ListEffects(ctx context.Context, taskID string) (map[string][]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	effects := make(map[string][]byte, len(f.effects))
+	for key, result := range f.effects {
+		effects[key] = result
+	}
+	return effects, nil
+}
+
+func (f *fakeStore) ClaimTask(ctx context.Context, id, node string, ttl time.Duration) (Task, error) {
+	return Task{}, nil
+}
+func (f *fakeStore) RenewClaim(ctx context.Context, id, node string, ttl time.Duration) error {
 	return nil
 }
+func (f *fakeStore) ReleaseClaim(ctx context.Context, id, node string) error { return nil }
+func (f *fakeStore) ListClaimable(ctx context.Context) ([]Task, error)       { return nil, nil }
 
 func (f *fakeStore) CreateTask(ctx context.Context, record Task) error { return nil }
 func (f *fakeStore) SaveAssignment(ctx context.Context, id string, kind leasing.Kind, a Assignment) error {
@@ -269,11 +304,12 @@ func effectRecorded(t *testing.T, snapshot []byte) bool {
 	return ok
 }
 
-// TestMidStateCheckpointRecordsProgress verifies Deps.Checkpoint persists the
-// snapshot stamped running at the executing state: after s1's effect the store
-// holds a second s1 checkpoint whose snapshot carries the guard, so a crash
-// from that moment on recovers into a state that knows the effect happened.
-func TestMidStateCheckpointRecordsProgress(t *testing.T) {
+// TestEffectDurableWithoutCheckpoint verifies Do's durability no longer rides
+// on a checkpoint: after s1's effect the store holds the effect record itself,
+// the checkpoint stream carries only the pre-state saves, and no snapshot
+// embeds the log — so there is no window between an effect landing and its
+// record existing.
+func TestEffectDurableWithoutCheckpoint(t *testing.T) {
 	store := &fakeStore{}
 	wf := newEffectWorkflow()
 	engine := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
@@ -284,26 +320,28 @@ func TestMidStateCheckpointRecordsProgress(t *testing.T) {
 	if wf.effects != 1 {
 		t.Fatalf("effects = %d, want 1", wf.effects)
 	}
-	// Saves: pre-state s1 (log empty), mid-state s1 (effect recorded), pre-state s2.
-	if got := store.states(); !reflect.DeepEqual(got, []workflows.State{s1, s1, s2}) {
-		t.Fatalf("checkpoint states = %v, want [s1 s1 s2]", got)
+	// Saves: pre-state s1 and pre-state s2 — the effect adds no checkpoint.
+	if got := store.states(); !reflect.DeepEqual(got, []workflows.State{s1, s2}) {
+		t.Fatalf("checkpoint states = %v, want [s1 s2]", got)
 	}
-	first := effectRecorded(t, store.saves[0].snapshot)
-	mid := effectRecorded(t, store.saves[1].snapshot)
-	if first || !mid {
-		t.Fatalf("effect recorded = pre:%v mid:%v, want pre:false mid:true", first, mid)
+	if _, ok := store.effects["emit"]; !ok {
+		t.Fatal("effect record missing from the store")
 	}
-	if store.saves[1].status != workflows.StatusRunning {
-		t.Fatalf("mid-state checkpoint status = %q, want running", store.saves[1].status)
+	for i, save := range store.saves {
+		if effectRecorded(t, save.snapshot) {
+			t.Fatalf("checkpoint %d embeds the effect log; it lives in the store now", i)
+		}
 	}
 }
 
-// TestRetryAfterMidStateCheckpointSkipsEffect verifies the policy the
-// mid-state checkpoint implements: a state that errors after its recorded
-// effect retries from the top of the state — the at-least-once contract —
-// but the restored guard skips the effect, so the retry repeats only the
-// work that never succeeded.
-func TestRetryAfterMidStateCheckpointSkipsEffect(t *testing.T) {
+// TestRetryAfterRecordedEffectSkipsEffect verifies the recovery contract the
+// store-side log provides: a state that errors after its recorded effect
+// retries from the top of the state — the at-least-once contract — but
+// Rehydrate seeds the rebuilt instance from the store's effect records, so
+// the retry repeats only the work that never succeeded. The snapshot it
+// resumes from predates the effect entirely; the record alone does the
+// skipping — exactly the crash-after-effect window the envelope era lost.
+func TestRetryAfterRecordedEffectSkipsEffect(t *testing.T) {
 	store := &fakeStore{}
 	wf := newEffectWorkflow()
 	wf.failAfterEffect = true
@@ -320,21 +358,21 @@ func TestRetryAfterMidStateCheckpointSkipsEffect(t *testing.T) {
 		t.Fatalf("terminal = %q, want failed (still recoverable)", store.terminal)
 	}
 
-	// Retry from the mid-state checkpoint, the way recovery would.
-	mid := store.saves[len(store.saves)-1]
-	if mid.state != s1 {
-		t.Fatalf("last checkpoint state = %v, want s1", mid.state)
+	// Retry from the last checkpoint on the same store, the way recovery
+	// would: its snapshot was taken before the effect ran.
+	last := store.saves[len(store.saves)-1]
+	if last.state != s1 {
+		t.Fatalf("last checkpoint state = %v, want s1", last.state)
 	}
-	retryStore := &fakeStore{}
-	retry := newEngine(wf, workflows.Deps{TaskID: "task-1"}, retryStore)
-	if err := retry.Rehydrate(context.Background(), mid.snapshot, s1, false); err != nil {
+	retry := newEngine(wf, workflows.Deps{TaskID: "task-1"}, store)
+	if err := retry.Rehydrate(context.Background(), last.snapshot, s1, false); err != nil {
 		t.Fatalf("Rehydrate: %v", err)
 	}
 	if wf.effects != 1 {
-		t.Fatalf("effects = %d after retry, want still 1 (guard must skip the effect)", wf.effects)
+		t.Fatalf("effects = %d after retry, want still 1 (the store's record must skip the effect)", wf.effects)
 	}
-	if retryStore.terminal != workflows.StatusDone {
-		t.Fatalf("retry terminal = %q, want done", retryStore.terminal)
+	if store.terminal != workflows.StatusDone {
+		t.Fatalf("retry terminal = %q, want done", store.terminal)
 	}
 }
 
