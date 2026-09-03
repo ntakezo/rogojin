@@ -81,6 +81,56 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		}
 	})
 
+	// The input persisted at creation survives every read path verbatim — it
+	// is what another node builds a fresh run from — and a record created
+	// without one (a pre-input row, or a bare seed) reads back input-less
+	// rather than as empty JSON.
+	t.Run("InputRoundTrip", func(t *testing.T) {
+		repo := open(t)
+		now := time.Now().UTC()
+		input := []byte(`{"order":"999"}`)
+		rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: tasks.GlobalGroup,
+			Input: input, CreatedAt: now, UpdatedAt: now}
+		if err := repo.CreateTask(ctx, rec); err != nil {
+			t.Fatalf("CreateTask: %v", err)
+		}
+		seedTask(t, repo, "t2", "wf1")
+
+		got, err := repo.RecoverTask(ctx, "t1")
+		if err != nil {
+			t.Fatalf("RecoverTask: %v", err)
+		}
+		if string(got.Input) != string(input) {
+			t.Fatalf("recovered input = %q, want %q", got.Input, input)
+		}
+		bare, _ := repo.RecoverTask(ctx, "t2")
+		if len(bare.Input) != 0 {
+			t.Fatalf("input-less record reads back input %q, want none", bare.Input)
+		}
+
+		claimable, err := repo.ListClaimable(ctx)
+		if err != nil {
+			t.Fatalf("ListClaimable: %v", err)
+		}
+		byID := make(map[string]tasks.Task, len(claimable))
+		for _, c := range claimable {
+			byID[c.ID] = c
+		}
+		if string(byID["t1"].Input) != string(input) {
+			t.Fatalf("claimable input = %q, want %q — the sweep dispatches from this listing", byID["t1"].Input, input)
+		}
+
+		// A checkpoint leaves the input alone: it is written once, at creation.
+		v := claimed(t, repo, "t1", "node-a")
+		if _, err := repo.SaveCheckpoint(ctx, "t1", v, "node-a", "running", "s1", []byte("snap")); err != nil {
+			t.Fatalf("SaveCheckpoint: %v", err)
+		}
+		after, _ := repo.RecoverTask(ctx, "t1")
+		if string(after.Input) != string(input) {
+			t.Fatalf("input after checkpoint = %q, want %q", after.Input, input)
+		}
+	})
+
 	// A checkpoint's status, state, and snapshot survive recovery, and a
 	// later checkpoint replaces an earlier one.
 	t.Run("SaveCheckpoint", func(t *testing.T) {
@@ -491,11 +541,13 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 	t.Run("CopiesAtTheBoundary", func(t *testing.T) {
 		repo := open(t)
 		group := "residential"
-		rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: "g1",
+		input := []byte(`{"n":1}`)
+		rec := tasks.Task{ID: "t1", WorkflowID: "wf1", GroupID: "g1", Input: input,
 			Assignments: map[leasing.Kind]tasks.Assignment{proxyKind: {GroupID: &group}}}
 		if err := repo.CreateTask(ctx, rec); err != nil {
 			t.Fatalf("CreateTask: %v", err)
 		}
+		input[1] = 'X'
 		snap := []byte("snap")
 		if _, err := repo.SaveCheckpoint(ctx, "t1", claimed(t, repo, "t1", "node-a"), "node-a", "running", "s1", snap); err != nil {
 			t.Fatalf("SaveCheckpoint: %v", err)
@@ -511,6 +563,9 @@ func Tasks(t *testing.T, open func(t *testing.T) tasks.Repository) {
 		}
 		if string(got.Snapshot) != "snap" {
 			t.Fatalf("saved snapshot mutated through the caller: %q", got.Snapshot)
+		}
+		if string(got.Input) != `{"n":1}` {
+			t.Fatalf("saved input mutated through the caller: %q", got.Input)
 		}
 
 		*got.Assignments[proxyKind].GroupID = "leaked"

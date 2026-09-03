@@ -34,7 +34,7 @@ func NewTasks() tasks.Repository {
 	}
 }
 
-// CreateTask inserts a fresh task record: workflow, placement, and
+// CreateTask inserts a fresh task record: workflow, placement, input, and
 // timestamps, with no checkpoint yet. A duplicate id is refused.
 func (s *Tasks) CreateTask(ctx context.Context, rec tasks.Task) error {
 	s.mu.Lock()
@@ -47,6 +47,7 @@ func (s *Tasks) CreateTask(ctx context.Context, rec tasks.Task) error {
 		WorkflowID:  rec.WorkflowID,
 		GroupID:     rec.GroupID,
 		Assignments: copyAssignments(rec.Assignments),
+		Input:       copyBytes(rec.Input),
 		CreatedAt:   storeTime(rec.CreatedAt),
 		UpdatedAt:   storeTime(rec.UpdatedAt),
 	}
@@ -356,6 +357,7 @@ func (s *Tasks) TasksInGroup(ctx context.Context, groupID string) ([]string, err
 
 // copyTask deep-copies a record so the store's copy is never reachable.
 func copyTask(rec tasks.Task) tasks.Task {
+	rec.Input = copyBytes(rec.Input)
 	rec.Snapshot = copyBytes(rec.Snapshot)
 	rec.Output = copyBytes(rec.Output)
 	if rec.Assignments != nil {

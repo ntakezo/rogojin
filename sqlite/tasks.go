@@ -73,6 +73,13 @@ var taskMigrations = []migration{
 			PRIMARY KEY (task_id, key)
 		)`,
 	},
+	{
+		// The record's persisted input, written once at creation — what lets
+		// any node begin a task another node created. NULL on rows from
+		// before the column, which dispatch refuses.
+		Name: "add input column to tasks",
+		SQL:  `ALTER TABLE tasks ADD COLUMN input BLOB`,
+	},
 }
 
 // The lease expiry is stored as unix milliseconds, not RFC3339Nano text like
@@ -101,16 +108,16 @@ func parseMillis(ms int64) time.Time {
 }
 
 // CreateTask inserts a fresh task row from its record: workflow, placement,
-// and timestamps, with no checkpoint yet.
+// input, and timestamps, with no checkpoint yet.
 func (s *Tasks) CreateTask(ctx context.Context, rec tasks.Task) error {
 	assignments, err := encodeAssignments(rec.Assignments)
 	if err != nil {
 		return fmt.Errorf("create task %s: %w", rec.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO tasks (id, workflow_id, group_id, assignments, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		rec.ID, rec.WorkflowID, rec.GroupID, assignments, formatTime(rec.CreatedAt), formatTime(rec.UpdatedAt))
+		`INSERT INTO tasks (id, workflow_id, group_id, assignments, input, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		rec.ID, rec.WorkflowID, rec.GroupID, assignments, []byte(rec.Input), formatTime(rec.CreatedAt), formatTime(rec.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("create task %s: %w", rec.ID, err)
 	}
@@ -282,7 +289,7 @@ func (s *Tasks) conditionalWrite(ctx context.Context, op, id string, version int
 
 // taskColumns is the SELECT list scanTask reads, shared so every read path
 // stays in step with the schema.
-const taskColumns = `id, workflow_id, group_id, assignments, state, status, snapshot, output, created_at, updated_at, version, owner_node, lease_expires_at`
+const taskColumns = `id, workflow_id, group_id, assignments, input, state, status, snapshot, output, created_at, updated_at, version, owner_node, lease_expires_at`
 
 // RecoverTask returns the record for id, or ErrTaskNotFound if none exists.
 func (s *Tasks) RecoverTask(ctx context.Context, id string) (tasks.Task, error) {
@@ -492,10 +499,12 @@ func (s *Tasks) TasksInGroup(ctx context.Context, groupID string) ([]string, err
 func scanTask(row scanner) (tasks.Task, error) {
 	var rec tasks.Task
 	var assignments, created, updated string
+	var input []byte
 	var leaseMillis int64
-	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &assignments, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated, &rec.Version, &rec.OwnerNode, &leaseMillis); err != nil {
+	if err := row.Scan(&rec.ID, &rec.WorkflowID, &rec.GroupID, &assignments, &input, &rec.State, &rec.Status, &rec.Snapshot, &rec.Output, &created, &updated, &rec.Version, &rec.OwnerNode, &leaseMillis); err != nil {
 		return tasks.Task{}, err
 	}
+	rec.Input = input
 	rec.LeaseExpiresAt = parseMillis(leaseMillis)
 	var err error
 	if rec.Assignments, err = decodeAssignments(assignments); err != nil {

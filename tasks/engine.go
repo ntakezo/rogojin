@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -66,6 +67,34 @@ func newEngine(workflow workflows.Workflow, deps workflows.Deps, repo Repository
 // It refuses with ErrAlreadyStarted if the engine has already started.
 func (e *engine) Execute(ctx context.Context, input any) error {
 	instance, err := e.workflow.NewInstance(input, e.deps)
+	if err != nil {
+		return err
+	}
+	return e.run(ctx, instance, nil, false)
+}
+
+// ExecuteStored builds a fresh instance from the record's persisted input and
+// runs it from the graph's initial state — the dispatch path, where the node
+// running the task holds only the record, never the typed input value. The
+// workflow must be dispatchable, since only the module knows how to rebuild
+// an In from its marshaled form. The stored effect log is seeded the same way
+// recovery seeds it: a not-started record cannot normally have recorded
+// effects, but reading them costs one query and keeps even an improbable
+// history from re-firing one. It refuses with ErrAlreadyStarted if the engine
+// has already started.
+func (e *engine) ExecuteStored(ctx context.Context, input json.RawMessage) error {
+	dw, ok := e.workflow.(workflows.DispatchableWorkflow)
+	if !ok {
+		return fmt.Errorf("workflow %s is not dispatchable", e.workflow.ID())
+	}
+	if e.repo != nil {
+		effects, err := e.repo.ListEffects(ctx, e.deps.TaskID)
+		if err != nil {
+			return fmt.Errorf("list effects: %w", err)
+		}
+		e.deps.Effects = effects
+	}
+	instance, err := dw.NewStoredInstance(input, e.deps)
 	if err != nil {
 		return err
 	}

@@ -61,10 +61,12 @@ func WithLeaseTTL(d time.Duration) Option {
 
 // WithRecoverySweep runs RecoverClaimable every interval and starts what it
 // claims — the loop that picks up tasks a crashed node left behind once
-// their leases lapse. Losing a claim race, a terminal or never-checkpointed
-// record, and a task already running here are all normal and reported to no
-// one; every other failure goes to onErr (nil drops them) with the task id,
-// or "" when the sweep itself failed. Swept runs execute on background
+// their leases lapse, and begins created-but-never-started tasks from their
+// persisted input, which makes the sweep the fleet's dispatcher. Losing a
+// claim race, a terminal or input-less never-checkpointed record, and a task
+// already running here are all normal and reported to no one; every other
+// failure goes to onErr (nil drops them) with the task id, or "" when the
+// sweep itself failed. Swept runs execute on background
 // contexts and outlive Close. It panics on a non-positive interval.
 func WithRecoverySweep(interval time.Duration, onErr func(taskID string, err error)) Option {
 	return func(m *manager) {
@@ -124,8 +126,10 @@ type Manager interface {
 	// assignments, when none are given).
 	CreateTask(ctx context.Context, workflowID string, input any, opts ...CreateOption) (*Task, error)
 	// RecoverTask rehydrates a persisted task and returns it unstarted, or the
-	// live task if it is already running. A task that never checkpointed is
-	// returned but cannot be started; its Start fails with ErrNoCheckpoint.
+	// live task if it is already running. A task that never ran anywhere
+	// starts fresh from its record's persisted input — dispatch — except a
+	// record from before inputs were persisted, whose Start fails with
+	// ErrNoCheckpoint.
 	RecoverTask(ctx context.Context, id string) (*Task, error)
 	// RecoverAll rehydrates every persisted task and returns them unstarted,
 	// terminal ones included. It claims nothing — it is the listing surface,
